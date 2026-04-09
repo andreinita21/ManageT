@@ -1,26 +1,74 @@
 @import "tailwindcss";
-
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
+@config "../../tailwind.config.ts";
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-mg-bg: #0a0a0f;
+  --color-mg-bg-secondary: #12121a;
+  --color-mg-bg-tertiary: #1a1a2e;
+  --color-mg-bg-hover: #232340;
+  --color-mg-bg-active: #2a2a4a;
+  --color-mg-accent: #a855f7;
+  --color-mg-accent-bright: #c084fc;
+  --color-mg-accent-dim: #7c3aed;
+  --color-mg-text: #e4e4e7;
+  --color-mg-text-secondary: #a1a1aa;
+  --color-mg-text-tertiary: #71717a;
+  --color-mg-border: #27272a;
+  --color-mg-border-hover: #3f3f46;
+
+  --font-sans: var(--font-inter), system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains), "Fira Code", monospace;
+
+  --shadow-glow: 0 0 20px rgba(168, 85, 247, 0.15);
+  --shadow-glow-lg: 0 0 40px rgba(168, 85, 247, 0.2);
+  --shadow-glow-hover: 0 0 30px rgba(168, 85, 247, 0.3);
+
+  --animate-pulse-glow: pulse-glow 2s ease-in-out infinite;
+  --animate-fade-in: fade-in 0.2s ease-out;
+  --animate-slide-up: slide-up 0.3s ease-out;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 20px rgba(168, 85, 247, 0.15); }
+  50% { box-shadow: 0 0 30px rgba(168, 85, 247, 0.3); }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes slide-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+html {
+  background: #0a0a0f;
+  color: #e4e4e7;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: #0a0a0f;
+  color: #e4e4e7;
+  font-family: var(--font-sans);
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #12121a;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #3f3f46;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #a855f7;
 }
