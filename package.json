@@ -15,10 +15,13 @@
     "next-auth": "^5.0.0-beta.30",
     "react": "19.2.4",
     "react-dom": "19.2.4",
+    "recharts": "^3.8.1",
     "ssh2": "^1.17.0",
     "uuid": "^13.0.0",
     "ws": "^8.20.0",
     "xterm": "^5.3.0",
+    "xterm-addon-fit": "^0.8.0",
+    "xterm-addon-web-links": "^0.9.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {
