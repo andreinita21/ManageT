@@ -38,7 +38,7 @@ export async function POST(request: Request) {
   }
 
   const input = parsed.data;
-  const result = classifyCommand(input.command);
+  const result = await classifyCommand(input.command, input.serverId, input.sessionId);
 
   // Fetch all matching rules for reference
   const allRules = await db.select().from(restartRules);
