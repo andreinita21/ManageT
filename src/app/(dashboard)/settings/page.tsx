@@ -352,7 +352,7 @@ export default function SettingsPage() {
                 { value: "ask", label: "Ask First" },
                 { value: "never", label: "Never" },
               ]}
-              value="ask"
+              defaultValue="ask"
             />
             <Select
               label="Terminal Font Size"
@@ -362,7 +362,7 @@ export default function SettingsPage() {
                 { value: "16", label: "16px" },
                 { value: "18", label: "18px" },
               ]}
-              value="14"
+              defaultValue="14"
             />
             <div className="flex justify-end">
               <Button>Save Preferences</Button>

@@ -57,7 +57,7 @@ export default function ServerDetailPage() {
         key: "name",
         header: "Session",
         render: (s: Session) => (
-          <span className="font-mono text-xs">{s.tmuxSessionName}</span>
+          <span className="font-mono text-xs">{s.sessionName}</span>
         ),
       },
       {

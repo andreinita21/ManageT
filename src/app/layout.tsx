@@ -3,6 +3,7 @@ import { Inter, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 import { SidebarLayout } from "@/components/SidebarLayout";
 import { ToastProvider } from "@/components/ui/Toast";
+import { SessionProvider } from "@/components/SessionProvider";
 
 const inter = Inter({
   variable: "--font-inter",
@@ -30,9 +31,11 @@ export default function RootLayout({
       className={`dark ${inter.variable} ${jetbrains.variable} h-full antialiased`}
     >
       <body className="min-h-full bg-mg-bg text-mg-text font-sans">
-        <ToastProvider>
-          <SidebarLayout>{children}</SidebarLayout>
-        </ToastProvider>
+        <SessionProvider>
+          <ToastProvider>
+            <SidebarLayout>{children}</SidebarLayout>
+          </ToastProvider>
+        </SessionProvider>
       </body>
     </html>
   );

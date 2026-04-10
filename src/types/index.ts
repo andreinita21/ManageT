@@ -34,7 +34,7 @@ export interface Server {
 export interface Session {
   id: string;
   serverId: string;
-  tmuxSessionName: string;
+  sessionName: string;
   status: "active" | "disconnected" | "reconnecting" | "recovering" | "closed";
   cwd?: string;
   lastCommand?: string;
@@ -86,6 +86,60 @@ export interface MetricSnapshot {
   capturedAt: number;
 }
 
+export interface StackService {
+  id: string;
+  stackId: string;
+  name: string;
+  serverId: string;
+  cwd?: string;
+  command?: string;
+  orderIndex: number;
+}
+
+export interface Stack {
+  id: string;
+  name: string;
+  description?: string;
+  createdBy: string;
+  createdAt: number;
+  updatedAt: number;
+  services: StackService[];
+}
+
+export interface CreateStackServiceInput {
+  name: string;
+  serverId: string;
+  cwd?: string;
+  command?: string;
+}
+
+export interface CreateStackRequest {
+  name: string;
+  description?: string;
+  services: CreateStackServiceInput[];
+}
+
+export interface UpdateStackRequest {
+  name?: string;
+  description?: string;
+  services?: CreateStackServiceInput[];
+}
+
+export interface LaunchStackResponse {
+  stackId: string;
+  launched: Array<{
+    serviceId: string;
+    sessionId: string;
+    serverId: string;
+    sessionName: string;
+  }>;
+  failed: Array<{
+    serviceId: string;
+    serverId: string;
+    error: string;
+  }>;
+}
+
 export interface Alert {
   id: string;
   serverId: string;
@@ -101,7 +155,7 @@ export interface Alert {
 export interface SessionSnapshot {
   sessionId: string;
   serverId: string;
-  tmuxSession: string;
+  sessionName: string;
   cwd: string;
   lastCommand: string;
   env: Record<string, string>;

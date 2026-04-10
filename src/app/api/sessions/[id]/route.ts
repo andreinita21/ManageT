@@ -2,6 +2,7 @@
  * API routes for individual session operations.
  * GET /api/sessions/[id] — get session details
  * PUT /api/sessions/[id] — update session (restartPolicy, status)
+ * DELETE /api/sessions/[id] — kill the session and remove it
  */
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
@@ -9,6 +10,7 @@ import { db } from "@/lib/db";
 import { sessions } from "@/lib/db/schema";
 import { eq } from "drizzle-orm";
 import { z } from "zod";
+import { sessionManager } from "@/lib/ssh/session-manager";
 import type { Session } from "@/types";
 
 const updateSessionSchema = z.object({
@@ -105,4 +107,31 @@ export async function PUT(
     .where(eq(sessions.id, id))
     .limit(1);
   return NextResponse.json({ data: rowToSession(updated[0]) });
+}
+
+export async function DELETE(
+  _request: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const session = await auth();
+  if (!session?.user?.id) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const { id } = await params;
+
+  // killSession ends the SSH stream, drops the in-memory snapshot, and
+  // marks the row as "closed". Calling it on an unknown session is a no-op.
+  try {
+    await sessionManager.killSession(id);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return NextResponse.json({ error: msg }, { status: 500 });
+  }
+
+  // Drop the row entirely. The session is gone — no reason to keep a tombstone
+  // around to clutter the sessions list.
+  await db.delete(sessions).where(eq(sessions.id, id));
+
+  return NextResponse.json({ ok: true });
 }

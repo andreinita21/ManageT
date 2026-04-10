@@ -1,8 +1,8 @@
 /**
  * @fileoverview Session manager for ManageT.
- * Manages SSH terminal sessions with tmux integration, CWD tracking,
- * and reconnection support. This is the most critical module in the
- * SSH subsystem.
+ * Manages SSH terminal sessions using direct PTY shell channels,
+ * CWD tracking, and reconnection support. No tmux or other terminal
+ * multiplexer is required on the remote server.
  */
 import { EventEmitter } from "node:events";
 import { v4 as uuidv4 } from "uuid";
@@ -41,25 +41,26 @@ interface ActiveStream {
 }
 
 /**
- * Manages the lifecycle of SSH terminal sessions backed by tmux.
+ * Manages the lifecycle of SSH terminal sessions using direct PTY channels.
  * Handles creation, attachment, detachment, recovery, and cleanup.
+ * No tmux or terminal multiplexer required on the remote server.
  */
 export class SessionManager extends EventEmitter<SessionManagerEvents> {
   private readonly snapshots = new Map<string, SessionSnapshot>();
   private readonly activeStreams = new Map<string, ActiveStream>();
 
   /**
-   * Generate the tmux session name for a given session ID.
+   * Generate a human-readable session name for display.
    * @param sessionId - The session UUID
-   * @returns tmux session name in the form `managet_<first8>`
+   * @returns Session name in the form `session-<first8>`
    */
-  private tmuxName(sessionId: string): string {
-    return `managet_${sessionId.slice(0, 8)}`;
+  private generateSessionName(sessionId: string): string {
+    return `session-${sessionId.slice(0, 8)}`;
   }
 
   /**
    * Create a new terminal session on the specified server.
-   * Opens an SSH shell, creates a tmux session, optionally runs a command,
+   * Opens a direct SSH PTY shell, optionally runs a command,
    * and sets up CWD tracking.
    * @param serverId - Target server ID (must have an active connection)
    * @param command - Optional initial command to execute
@@ -71,13 +72,30 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     command?: string,
     cwd?: string
   ): Promise<SessionSnapshot> {
-    const client = connectionPool.getConnection(serverId);
+    let client = connectionPool.getConnection(serverId);
     if (!client) {
-      throw new Error(`[SESSION] No active connection for server ${serverId}`);
+      console.log(`[SESSION] No active connection for ${serverId}, connecting...`);
+      const { servers } = await import("@/lib/db/schema");
+      const rows = await db.select().from(servers).where(eq(servers.id, serverId)).limit(1);
+      const serverRow = rows[0];
+      if (!serverRow) {
+        throw new Error(`[SESSION] Server ${serverId} not found in database`);
+      }
+      const serverData: import("@/types").Server = {
+        ...serverRow,
+        labels: JSON.parse(serverRow.labels) as string[],
+        authMethod: serverRow.authMethod as "key" | "password",
+        status: serverRow.status as import("@/types").Server["status"],
+        lastConnectedAt: serverRow.lastConnectedAt ?? undefined,
+        privateKeyPath: serverRow.privateKeyPath ?? undefined,
+        passwordEncrypted: serverRow.passwordEncrypted ?? undefined,
+        groupName: serverRow.groupName ?? undefined,
+      };
+      client = await connectionPool.connect(serverData);
     }
 
     const sessionId = uuidv4();
-    const tmuxSession = this.tmuxName(sessionId);
+    const sessionName = this.generateSessionName(sessionId);
 
     const stream = await new Promise<ClientChannel>((resolve, reject) => {
       client.shell(
@@ -91,13 +109,6 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         }
       );
     });
-
-    // Create tmux session
-    const tmuxCmd = `tmux new-session -d -s ${tmuxSession} -x 120 -y 30 2>/dev/null; tmux attach-session -t ${tmuxSession}\n`;
-    this.writeToStream(stream, tmuxCmd);
-
-    // Wait briefly for tmux to start
-    await this.delay(500);
 
     // Change directory if specified
     if (cwd) {
@@ -117,7 +128,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     const snapshot: SessionSnapshot = {
       sessionId,
       serverId,
-      tmuxSession,
+      sessionName,
       cwd: cwd || "/",
       lastCommand: command || "",
       env: {},
@@ -136,7 +147,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     await this.persistSession(snapshot);
 
     console.log(
-      `[SESSION] Created session ${sessionId} on server ${serverId} (tmux: ${tmuxSession})`
+      `[SESSION] Created session ${sessionId} on server ${serverId} (${sessionName})`
     );
     this.emit("session:created", snapshot);
 
@@ -146,6 +157,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   /**
    * Attach to an existing session, returning the SSH stream.
    * If a stream is already active, it is returned directly.
+   * If the stream was lost but the snapshot exists, a new shell is opened.
    * @param sessionId - The session to attach to
    * @returns The SSH channel for the session
    */
@@ -167,6 +179,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       );
     }
 
+    // Open a new shell channel (previous one was lost)
     const stream = await new Promise<ClientChannel>((resolve, reject) => {
       client.shell(
         { term: "xterm-256color", cols: 120, rows: 30 },
@@ -182,9 +195,11 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       );
     });
 
-    // Reattach to existing tmux session
-    this.writeToStream(stream, `tmux attach-session -t ${snapshot.tmuxSession}\n`);
-    await this.delay(300);
+    // Restore working directory
+    if (snapshot.cwd && snapshot.cwd !== "/") {
+      this.writeToStream(stream, `cd ${this.escapeShellArg(snapshot.cwd)}\n`);
+      await this.delay(200);
+    }
 
     cwdTracker.injectPromptCommand(stream);
     this.activeStreams.set(sessionId, { stream, sessionId });
@@ -200,8 +215,9 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   }
 
   /**
-   * Detach from a session, closing the SSH stream but preserving
-   * the tmux session on the remote host.
+   * Detach from a session, closing the SSH stream.
+   * Without a terminal multiplexer, detaching ends the remote shell process.
+   * The session snapshot is preserved for potential recreation.
    * @param sessionId - The session to detach from
    */
   detachSession(sessionId: string): void {
@@ -220,7 +236,9 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   }
 
   /**
-   * Kill a session entirely, destroying the tmux session on the remote host.
+   * Kill a session entirely, closing the SSH channel and cleaning up state.
+   * If this was the last session for the server, also drop the pooled SSH
+   * client so the remote host stops showing a phantom login.
    * @param sessionId - The session to kill
    */
   async killSession(sessionId: string): Promise<void> {
@@ -228,24 +246,23 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     if (!snapshot) {
       return;
     }
+    const serverId = snapshot.serverId;
 
-    // Try to kill the remote tmux session
-    const client = connectionPool.getConnection(snapshot.serverId);
-    if (client) {
-      try {
-        await this.execOnClient(
-          client,
-          `tmux kill-session -t ${snapshot.tmuxSession} 2>/dev/null`
-        );
-      } catch {
-        // tmux session may already be gone
-      }
-    }
-
-    // Cleanup local state
+    // Cleanup local state and close SSH channel
     this.detachSession(sessionId);
     cwdTracker.stopPeriodicFallback(sessionId);
     this.snapshots.delete(sessionId);
+
+    // If no other in-memory sessions reference this server, drop the SSH
+    // client. Without this, every server we ever connected to leaks a
+    // long-lived ssh2 Client (and the corresponding `who` entry on the
+    // remote) for the lifetime of the Node process.
+    const stillInUse = Array.from(this.snapshots.values()).some(
+      (s) => s.serverId === serverId
+    );
+    if (!stillInUse) {
+      connectionPool.disconnect(serverId);
+    }
 
     // Update DB
     const now = Date.now();
@@ -310,6 +327,8 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
 
   /**
    * Handle a server disconnection by marking all sessions as disconnected.
+   * Without a terminal multiplexer, all remote processes are lost when
+   * the SSH connection drops.
    * @param serverId - The disconnected server ID
    */
   handleDisconnect(serverId: string): void {
@@ -344,8 +363,11 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   }
 
   /**
-   * Handle a server reconnection by attempting to reattach or recreate
-   * sessions that were previously active on that server.
+   * Handle a server reconnection by attempting to recreate sessions
+   * that were previously active on that server.
+   * Since there is no terminal multiplexer, remote processes do not survive
+   * SSH disconnection. Recovery always creates a new shell and optionally
+   * re-executes the last command based on the restart classification.
    * @param serverId - The reconnected server ID
    */
   async handleReconnect(serverId: string): Promise<void> {
@@ -354,113 +376,130 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       return;
     }
 
-    // List existing tmux sessions on the remote
-    let remoteSessions: string[] = [];
-    try {
-      const result = await this.execOnClient(
-        client,
-        "tmux list-sessions -F '#{session_name}' 2>/dev/null"
-      );
-      remoteSessions = result
-        .split("\n")
-        .map((s) => s.trim())
-        .filter((s) => s.startsWith("managet_"));
-    } catch {
-      // tmux may not have any sessions
-    }
+    const recoveryPromises: Promise<void>[] = [];
 
     for (const [sessionId, snapshot] of this.snapshots) {
       if (
         snapshot.serverId === serverId &&
         (snapshot.status === "disconnected" || snapshot.status === "reconnecting")
       ) {
-        snapshot.status = "recovering";
-        this.updateSnapshot(sessionId, { status: "recovering" });
+        recoveryPromises.push(this.recoverSession(sessionId, snapshot));
+      }
+    }
 
-        if (remoteSessions.includes(snapshot.tmuxSession)) {
-          // Tmux session still alive, reattach
-          try {
-            await this.attachSession(sessionId);
-            snapshot.status = "active";
-            snapshot.retryCount = 0;
-            this.updateSnapshot(sessionId, {
-              status: "active",
-              retryCount: 0,
-            });
-            console.log(
-              `[SESSION] Reattached session ${sessionId} to tmux ${snapshot.tmuxSession}`
-            );
-            this.emit(
-              "session:recovered",
-              sessionId,
-              "reattach",
-              undefined,
-              snapshot.cwd
-            );
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            console.error(
-              `[SESSION] Failed to reattach session ${sessionId}: ${msg}`
-            );
-            snapshot.status = "disconnected";
-            this.updateSnapshot(sessionId, { status: "disconnected" });
-          }
-        } else {
-          // Tmux session is gone, decide whether to recreate
-          const classification = await classifyCommand(snapshot.lastCommand);
-
-          if (classification.action === "auto") {
-            try {
-              await this.recreateSession(sessionId, snapshot);
-              console.log(
-                `[SESSION] Recreated session ${sessionId} with command: ${snapshot.lastCommand}`
-              );
-              this.emit(
-                "session:recovered",
-                sessionId,
-                "recreate",
-                snapshot.lastCommand,
-                snapshot.cwd
-              );
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              console.error(
-                `[SESSION] Failed to recreate session ${sessionId}: ${msg}`
-              );
-              snapshot.status = "disconnected";
-              this.updateSnapshot(sessionId, { status: "disconnected" });
-            }
-          } else if (classification.action === "never") {
-            snapshot.status = "closed";
-            this.updateSnapshot(sessionId, { status: "closed" });
-            console.log(
-              `[SESSION] Session ${sessionId} not recreated (policy: never) for command: ${snapshot.lastCommand}`
-            );
-          } else {
-            // action === "ask" — leave in disconnected state for user decision
-            snapshot.status = "disconnected";
-            this.updateSnapshot(sessionId, { status: "disconnected" });
-            console.log(
-              `[SESSION] Session ${sessionId} awaiting user decision for command: ${snapshot.lastCommand}`
-            );
-            this.emit(
-              "session:lost",
-              sessionId,
-              `Tmux session gone. Command "${snapshot.lastCommand}" classified as "${classification.action}". Awaiting user decision.`
-            );
-          }
+    if (recoveryPromises.length > 0) {
+      const results = await Promise.allSettled(recoveryPromises);
+      for (const result of results) {
+        if (result.status === "rejected") {
+          console.error(`[SESSION] Recovery failed: ${result.reason}`);
         }
       }
     }
   }
 
   /**
-   * Recreate a session that was lost by creating a new tmux session
-   * with the same working directory and command.
+   * Attempt to recover a single session after reconnection.
+   * Classifies the last command to decide whether to auto-restart, ask, or skip.
+   */
+  private async recoverSession(
+    sessionId: string,
+    snapshot: SessionSnapshot
+  ): Promise<void> {
+    snapshot.status = "recovering";
+    this.updateSnapshot(sessionId, { status: "recovering" });
+
+    // Without a terminal multiplexer, remote processes are always gone
+    // after SSH disconnect. Classify the last command to decide recovery action.
+    const lastCommand = snapshot.lastCommand;
+
+    if (!lastCommand) {
+      // No command was running — just recreate the shell
+      try {
+        await this.recreateSession(sessionId, snapshot, false);
+        console.log(`[SESSION] Recreated shell for session ${sessionId} (no previous command)`);
+        this.emit("session:recovered", sessionId, "recreate", undefined, snapshot.cwd);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[SESSION] Failed to recreate session ${sessionId}: ${msg}`);
+        snapshot.status = "disconnected";
+        this.updateSnapshot(sessionId, { status: "disconnected" });
+      }
+      return;
+    }
+
+    const classification = await classifyCommand(lastCommand);
+
+    if (classification.action === "auto") {
+      try {
+        await this.recreateSession(sessionId, snapshot, true);
+        console.log(
+          `[SESSION] Recreated session ${sessionId} with command: ${lastCommand}`
+        );
+        this.emit(
+          "session:recovered",
+          sessionId,
+          "recreate",
+          lastCommand,
+          snapshot.cwd
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(
+          `[SESSION] Failed to recreate session ${sessionId}: ${msg}`
+        );
+        snapshot.status = "disconnected";
+        this.updateSnapshot(sessionId, { status: "disconnected" });
+      }
+    } else if (classification.action === "never") {
+      // Recreate shell without the command
+      try {
+        await this.recreateSession(sessionId, snapshot, false);
+        console.log(
+          `[SESSION] Session ${sessionId} recreated without command (policy: never) for: ${lastCommand}`
+        );
+        this.emit("session:recovered", sessionId, "recreate", undefined, snapshot.cwd);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[SESSION] Failed to recreate session ${sessionId}: ${msg}`);
+        snapshot.status = "disconnected";
+        this.updateSnapshot(sessionId, { status: "disconnected" });
+      }
+    } else {
+      // action === "ask" — recreate shell but don't run command, notify user
+      try {
+        await this.recreateSession(sessionId, snapshot, false);
+        console.log(
+          `[SESSION] Session ${sessionId} awaiting user decision for command: ${lastCommand}`
+        );
+        this.emit(
+          "session:recovered",
+          sessionId,
+          "recreate",
+          lastCommand,
+          snapshot.cwd
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[SESSION] Failed to recreate session ${sessionId}: ${msg}`);
+        snapshot.status = "disconnected";
+        this.updateSnapshot(sessionId, { status: "disconnected" });
+        this.emit(
+          "session:lost",
+          sessionId,
+          `Recovery failed. Command "${lastCommand}" classified as "${classification.action}".`
+        );
+      }
+    }
+  }
+
+  /**
+   * Recreate a session by opening a new SSH shell,
+   * restoring the working directory, and optionally re-executing the command.
    */
   private async recreateSession(
     sessionId: string,
-    snapshot: SessionSnapshot
+    snapshot: SessionSnapshot,
+    executeCommand: boolean
   ): Promise<void> {
     const client = connectionPool.getConnection(snapshot.serverId);
     if (!client) {
@@ -482,11 +521,6 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       );
     });
 
-    // Create new tmux session with the same name
-    const tmuxCmd = `tmux new-session -d -s ${snapshot.tmuxSession} -x 120 -y 30 2>/dev/null; tmux attach-session -t ${snapshot.tmuxSession}\n`;
-    this.writeToStream(stream, tmuxCmd);
-    await this.delay(500);
-
     // Restore CWD
     if (snapshot.cwd && snapshot.cwd !== "/") {
       this.writeToStream(stream, `cd ${this.escapeShellArg(snapshot.cwd)}\n`);
@@ -496,8 +530,8 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     cwdTracker.injectPromptCommand(stream);
     await this.delay(200);
 
-    // Re-run the last command
-    if (snapshot.lastCommand) {
+    // Re-run the last command if allowed
+    if (executeCommand && snapshot.lastCommand) {
       this.writeToStream(stream, `${snapshot.lastCommand}\n`);
     }
 
@@ -554,33 +588,6 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   }
 
   /**
-   * Execute a single command on an SSH client and return the stdout.
-   */
-  private execOnClient(
-    client: import("ssh2").Client,
-    command: string
-  ): Promise<string> {
-    return new Promise((resolve, reject) => {
-      client.exec(command, (err, stream) => {
-        if (err) {
-          reject(err);
-          return;
-        }
-        let output = "";
-        stream.on("data", (data: Buffer) => {
-          output += data.toString("utf-8");
-        });
-        stream.stderr.on("data", () => {
-          // Ignore stderr for internal commands
-        });
-        stream.on("close", () => {
-          resolve(output);
-        });
-      });
-    });
-  }
-
-  /**
    * Write data to an SSH stream, handling backpressure.
    */
   private writeToStream(stream: ClientChannel, data: string): void {
@@ -606,7 +613,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     await db.insert(sessions).values({
       id: snapshot.sessionId,
       serverId: snapshot.serverId,
-      tmuxSessionName: snapshot.tmuxSession,
+      sessionName: snapshot.sessionName,
       status: snapshot.status,
       cwd: snapshot.cwd,
       lastCommand: snapshot.lastCommand,

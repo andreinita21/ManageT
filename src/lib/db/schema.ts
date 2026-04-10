@@ -44,7 +44,7 @@ export const sessions = sqliteTable("sessions", {
   serverId: text("server_id")
     .notNull()
     .references(() => servers.id, { onDelete: "cascade" }),
-  tmuxSessionName: text("tmux_session_name").notNull(),
+  sessionName: text("session_name").notNull(),
   status: text("status", {
     enum: ["active", "disconnected", "reconnecting", "recovering", "closed"],
   }).notNull(),
@@ -106,6 +106,31 @@ export const metricSnapshots = sqliteTable("metric_snapshots", {
   load15m: real("load_15m"),
   activeConnections: integer("active_connections"),
   capturedAt: integer("captured_at").notNull(),
+});
+
+export const stacks = sqliteTable("stacks", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull(),
+  description: text("description"),
+  createdBy: text("created_by")
+    .notNull()
+    .references(() => users.id),
+  createdAt: integer("created_at").notNull(),
+  updatedAt: integer("updated_at").notNull(),
+});
+
+export const stackServices = sqliteTable("stack_services", {
+  id: text("id").primaryKey(),
+  stackId: text("stack_id")
+    .notNull()
+    .references(() => stacks.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  serverId: text("server_id")
+    .notNull()
+    .references(() => servers.id, { onDelete: "cascade" }),
+  cwd: text("cwd"),
+  command: text("command"),
+  orderIndex: integer("order_index").notNull().default(0),
 });
 
 export const alerts = sqliteTable("alerts", {

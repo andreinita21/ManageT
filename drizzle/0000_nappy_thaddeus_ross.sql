@@ -74,7 +74,7 @@ CREATE TABLE `servers` (
 CREATE TABLE `sessions` (
 	`id` text PRIMARY KEY NOT NULL,
 	`server_id` text NOT NULL,
-	`tmux_session_name` text NOT NULL,
+	`session_name` text NOT NULL,
 	`status` text NOT NULL,
 	`cwd` text,
 	`last_command` text,

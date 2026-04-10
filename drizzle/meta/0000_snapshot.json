@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "cac11857-ad91-4741-a603-91222bccdd65",
+  "id": "0f2ab41b-979a-49ae-a287-44db505ff23b",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
     "alerts": {
@@ -524,8 +524,8 @@
           "notNull": true,
           "autoincrement": false
         },
-        "tmux_session_name": {
-          "name": "tmux_session_name",
+        "session_name": {
+          "name": "session_name",
           "type": "text",
           "primaryKey": false,
           "notNull": true,

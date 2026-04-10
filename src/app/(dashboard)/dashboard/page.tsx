@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState, useMemo } from "react";
-import { useServers } from "@/lib/hooks/useApi";
+import { useServers, useLatestMetrics } from "@/lib/hooks/useApi";
 import { ServerCard } from "@/components/dashboard/ServerCard";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -21,6 +21,7 @@ const statusFilters = [
 
 export default function DashboardPage() {
   const { data: servers, loading, error, refetch } = useServers();
+  const { data: latestMetrics } = useLatestMetrics();
   const { toast } = useToast();
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
@@ -163,9 +164,18 @@ export default function DashboardPage() {
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {filteredServers.map((server) => (
-            <ServerCard key={server.id} server={server} />
-          ))}
+          {filteredServers.map((server) => {
+            const m = latestMetrics[server.id];
+            return (
+              <ServerCard
+                key={server.id}
+                server={server}
+                cpuHistory={m?.cpuHistory ?? []}
+                memoryUsedMb={m?.memoryUsedMb}
+                memoryTotalMb={m?.memoryTotalMb}
+              />
+            );
+          })}
         </div>
       )}
 

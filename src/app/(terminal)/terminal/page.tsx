@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useCallback, useMemo } from "react";
+import React, { Suspense, useState, useCallback, useMemo, useEffect } from "react";
 import { useSearchParams } from "next/navigation";
 import { TerminalPane } from "@/components/terminal/TerminalPane";
 import { RecoveryBanner } from "@/components/terminal/RecoveryBanner";
@@ -9,7 +9,6 @@ import { Button } from "@/components/ui/Button";
 import { Select } from "@/components/ui/Select";
 import { Modal } from "@/components/ui/Modal";
 import { useServers, useSessions } from "@/lib/hooks/useApi";
-import { useWebSocket } from "@/lib/hooks/useWebSocket";
 import { useToast } from "@/components/ui/Toast";
 import type { ServerMessage } from "@/types";
 
@@ -27,9 +26,18 @@ interface RecoveryInfo {
   cwd?: string;
 }
 
-export default function TerminalPage() {
+export default function TerminalPageWrapper() {
+  return (
+    <Suspense fallback={<div className="flex items-center justify-center h-full bg-mg-bg text-mg-text-secondary">Loading terminal...</div>}>
+      <TerminalPage />
+    </Suspense>
+  );
+}
+
+function TerminalPage() {
   const searchParams = useSearchParams();
   const initialServer = searchParams.get("server") ?? "";
+  const initialSession = searchParams.get("session") ?? "";
   const { data: servers } = useServers();
   const { data: sessions } = useSessions();
   const { toast } = useToast();
@@ -41,38 +49,79 @@ export default function TerminalPage() {
   const [newSessionModal, setNewSessionModal] = useState(false);
   const [newSessionServer, setNewSessionServer] = useState(initialServer);
   const [recoveries, setRecoveries] = useState<RecoveryInfo[]>([]);
+  // Track whether we've already attempted the one-shot session restore on
+  // mount, so that subsequent re-fetches of `sessions` don't keep re-creating
+  // tabs the user explicitly closed.
+  const restoredRef = React.useRef(false);
 
-  const wsUrl = useMemo(() => {
-    const proto = typeof window !== "undefined" && window.location.protocol === "https:" ? "wss:" : "ws:";
-    const host = typeof window !== "undefined" ? window.location.host : "localhost:3000";
-    return `${proto}//${host}/api/ws`;
-  }, []);
+  // Auto-restore tabs for sessions that are still alive on the backend.
+  // The session manager keeps PTY streams resident in process memory across
+  // browser tab closures, and `server.ts` marks anything stale as
+  // "disconnected" on Node startup. So any session that lands here in
+  // "active" state has a real PTY ready to reattach to.
+  useEffect(() => {
+    if (restoredRef.current) return;
+    if (!sessions || !servers) return;
+    restoredRef.current = true;
 
-  const handleWsMessage = useCallback(
-    (msg: ServerMessage) => {
-      if (msg.type === "session:recovered") {
-        setRecoveries((prev) => [
-          ...prev,
-          {
-            sessionId: msg.sessionId,
-            method: msg.method,
-            command: msg.command,
-            cwd: msg.cwd,
-          },
-        ]);
-        toast(`Session recovered via ${msg.method}`, "success");
-      }
-      if (msg.type === "session:lost") {
-        toast(`Session lost: ${msg.reason}`, "error");
-      }
-    },
-    [toast]
-  );
+    const alive = sessions.filter((s) => s.status === "active");
+    if (alive.length === 0) return;
 
-  const { send, connected } = useWebSocket({
-    url: wsUrl,
-    onMessage: handleWsMessage,
-  });
+    const restored: TerminalTab[] = alive.map((s) => {
+      const server = servers.find((srv) => srv.id === s.serverId);
+      return {
+        id: crypto.randomUUID(),
+        sessionId: s.id,
+        serverId: s.serverId,
+        label: server?.name ?? s.sessionName,
+      };
+    });
+
+    setTabs(restored);
+    setActiveTabId(restored[0]?.id ?? null);
+  }, [sessions, servers]);
+
+  // Auto-open new session modal if server param is provided and no tabs exist
+  useEffect(() => {
+    if (initialServer && servers && servers.length > 0 && tabs.length === 0 && restoredRef.current) {
+      setNewSessionServer(initialServer);
+      setNewSessionModal(true);
+    }
+  }, [initialServer, servers, tabs.length]);
+
+  // If the URL carries `?session=<id>`, ensure that session has a tab and is
+  // focused. Runs after auto-restore so we can reuse an existing tab if
+  // restoration already created one for it.
+  useEffect(() => {
+    if (!initialSession || !restoredRef.current) return;
+    if (!sessions || !servers) return;
+
+    const existing = tabs.find((t) => t.sessionId === initialSession);
+    if (existing) {
+      setActiveTabId(existing.id);
+      return;
+    }
+
+    const session = sessions.find((s) => s.id === initialSession);
+    if (!session) return;
+    const server = servers.find((srv) => srv.id === session.serverId);
+
+    const tabId = crypto.randomUUID();
+    setTabs((prev) => [
+      ...prev,
+      {
+        id: tabId,
+        sessionId: session.id,
+        serverId: session.serverId,
+        label: server?.name ?? session.sessionName,
+      },
+    ]);
+    setActiveTabId(tabId);
+    // We intentionally only respond to changes in `initialSession` —
+    // re-runs from `tabs` mutating would either no-op (existing branch)
+    // or create duplicates.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialSession, sessions, servers]);
 
   const createTab = useCallback(
     (serverId: string) => {
@@ -80,12 +129,10 @@ export default function TerminalPage() {
       if (!server) return;
 
       const tabId = crypto.randomUUID();
-      // Request session creation via WebSocket
-      send({ type: "session:create", serverId });
 
       const newTab: TerminalTab = {
         id: tabId,
-        sessionId: null, // Will be set when session:state comes back
+        sessionId: null, // No session yet — TerminalPane will send session:create.
         serverId,
         label: server.name,
       };
@@ -94,15 +141,15 @@ export default function TerminalPage() {
       setActiveTabId(tabId);
       setNewSessionModal(false);
     },
-    [servers, send]
+    [servers]
   );
 
   const closeTab = useCallback(
     (tabId: string) => {
-      const tab = tabs.find((t) => t.id === tabId);
-      if (tab?.sessionId) {
-        send({ type: "session:detach", sessionId: tab.sessionId });
-      }
+      // Snapshot the closing tab so we can kill its server-side session.
+      // Closing a tab is an explicit "kill" — only browser-window close
+      // (which never runs this code path) preserves sessions.
+      const closing = tabs.find((t) => t.id === tabId);
 
       setTabs((prev) => {
         const next = prev.filter((t) => t.id !== tabId);
@@ -115,15 +162,20 @@ export default function TerminalPage() {
         }
         return next;
       });
+
+      if (closing?.sessionId) {
+        fetch(`/api/sessions/${closing.sessionId}`, { method: "DELETE" }).catch(
+          (err) => {
+            console.error("[terminal] Failed to delete session:", err);
+          }
+        );
+      }
     },
-    [tabs, activeTabId, splitTabId, send]
+    [tabs, activeTabId, splitTabId]
   );
 
-  const activeTab = tabs.find((t) => t.id === activeTabId);
-  const splitTab = tabs.find((t) => t.id === splitTabId);
-
   return (
-    <div className="h-full flex flex-col -m-6">
+    <div className="flex flex-col" style={{ height: "calc(100vh - 3.5rem)" }}>
       {/* Recovery banners */}
       {recoveries.length > 0 && (
         <div className="px-4 pt-3 space-y-2">
@@ -141,7 +193,7 @@ export default function TerminalPage() {
       )}
 
       {/* Tab bar */}
-      <div className="flex items-center border-b border-mg-border bg-mg-bg-secondary px-2">
+      <div className="flex items-center border-b border-mg-border bg-mg-bg-secondary px-2 flex-shrink-0">
         <div className="flex items-center flex-1 overflow-x-auto">
           {tabs.map((tab) => (
             <div
@@ -169,12 +221,7 @@ export default function TerminalPage() {
           ))}
         </div>
         <div className="flex items-center gap-1 px-2">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setNewSessionModal(true)}
-            title="New terminal"
-          >
+          <Button variant="ghost" size="sm" onClick={() => setNewSessionModal(true)} title="New terminal">
             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
             </svg>
@@ -199,15 +246,11 @@ export default function TerminalPage() {
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7" />
             </svg>
           </Button>
-          <div className="flex items-center gap-1.5 ml-2 px-2 border-l border-mg-border">
-            <div className={`w-1.5 h-1.5 rounded-full ${connected ? "bg-emerald-400" : "bg-red-400"}`} />
-            <span className="text-xs text-mg-text-tertiary">{connected ? "WS" : "..."}</span>
-          </div>
         </div>
       </div>
 
       {/* Terminal area */}
-      <div className="flex-1 flex overflow-hidden">
+      <div className="flex-1 flex overflow-hidden min-h-0 relative">
         {tabs.length === 0 ? (
           <div className="flex-1 flex flex-col items-center justify-center gap-4">
             <svg className="w-16 h-16 text-mg-text-tertiary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -221,7 +264,6 @@ export default function TerminalPage() {
               New Session
             </Button>
 
-            {/* Quick command runner */}
             {servers && servers.length > 0 && (
               <div className="w-full max-w-2xl mt-6">
                 <CommandRunner servers={servers} />
@@ -229,26 +271,41 @@ export default function TerminalPage() {
             )}
           </div>
         ) : (
-          <>
-            <div className={`${splitView ? "w-1/2 border-r border-mg-border" : "w-full"}`}>
-              {activeTab && (
+          // Render EVERY tab's TerminalPane at once, layered absolutely. We
+          // only toggle visibility/positioning instead of mounting/unmounting
+          // so that each tab's SSH session and WebSocket stay alive when the
+          // user switches tabs.
+          tabs.map((tab) => {
+            const isActive = tab.id === activeTabId;
+            const isSplit = splitView && tab.id === splitTabId;
+            const visible = isActive || isSplit;
+
+            let positionClass: string;
+            if (!visible) {
+              positionClass = "absolute inset-0 invisible pointer-events-none";
+            } else if (splitView && isActive) {
+              positionClass = "absolute top-0 bottom-0 left-0 w-1/2 border-r border-mg-border";
+            } else if (splitView && isSplit) {
+              positionClass = "absolute top-0 bottom-0 right-0 w-1/2";
+            } else {
+              positionClass = "absolute inset-0";
+            }
+
+            return (
+              <div key={tab.id} className={positionClass}>
                 <TerminalPane
-                  sessionId={activeTab.sessionId}
-                  wsUrl={wsUrl}
+                  serverId={tab.serverId}
+                  sessionId={tab.sessionId ?? undefined}
                   className="h-full"
-                />
-              )}
-            </div>
-            {splitView && splitTab && (
-              <div className="w-1/2">
-                <TerminalPane
-                  sessionId={splitTab.sessionId}
-                  wsUrl={wsUrl}
-                  className="h-full"
+                  onSessionReady={(sid) => {
+                    setTabs((prev) =>
+                      prev.map((t) => (t.id === tab.id ? { ...t, sessionId: sid } : t))
+                    );
+                  }}
                 />
               </div>
-            )}
-          </>
+            );
+          })
         )}
       </div>
 
@@ -299,15 +356,14 @@ export default function TerminalPage() {
                             id: tabId,
                             sessionId: session.id,
                             serverId: session.serverId,
-                            label: `${server?.name ?? "?"} - ${session.tmuxSessionName}`,
+                            label: `${server?.name ?? "?"} - ${session.sessionName}`,
                           },
                         ]);
                         setActiveTabId(tabId);
                         setNewSessionModal(false);
-                        send({ type: "session:attach", sessionId: session.id });
                       }}
                     >
-                      <span className="text-sm text-mg-text font-mono">{session.tmuxSessionName}</span>
+                      <span className="text-sm text-mg-text font-mono">{session.sessionName}</span>
                       <span className="text-xs text-mg-text-tertiary ml-2">({session.status})</span>
                     </button>
                   ))}
