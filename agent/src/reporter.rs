@@ -12,8 +12,11 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
+use std::sync::Arc;
+
 use crate::collector::{self, MetricSnapshot};
 use crate::config::AgentConfig;
+use crate::sessions::{run_server as run_session_server, socket_path as session_socket_path, SessionManager};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,6 +37,23 @@ pub async fn run_loop() -> Result<()> {
         cfg.api_url_normalized(),
         cfg.heartbeat_interval_secs
     );
+
+    // Start the session server alongside the heartbeat loop. PTYs live in
+    // this same process so any session created via `managet new` (or via
+    // a future dashboard tunnel) survives browser/dashboard disconnects
+    // for as long as this process keeps running. Failure to bind doesn't
+    // abort the agent — heartbeats are independent and we'd rather still
+    // report metrics than refuse to start over a missing /var/run.
+    let session_manager = Arc::new(SessionManager::new());
+    {
+        let sm = session_manager.clone();
+        let path = session_socket_path();
+        tokio::spawn(async move {
+            if let Err(e) = run_session_server(sm, &path).await {
+                warn!(%e, "session server exited");
+            }
+        });
+    }
 
     let client = Client::builder()
         .user_agent(format!("managet-agent/{}", env!("CARGO_PKG_VERSION")))

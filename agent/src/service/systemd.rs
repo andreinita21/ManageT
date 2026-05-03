@@ -32,6 +32,12 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=/etc/managet-agent
+# RuntimeDirectory creates /run/managet at service start (owned by User,
+# mode 0755) and removes it at stop. Without this, ProtectSystem=strict
+# blocks the agent from binding the local control socket at
+# /var/run/managet/agent.sock.
+RuntimeDirectory=managet
+RuntimeDirectoryMode=0755
 
 [Install]
 WantedBy=multi-user.target

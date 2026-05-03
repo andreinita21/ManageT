@@ -15,6 +15,7 @@ mod config;
 mod installer;
 mod reporter;
 mod service;
+mod sessions;
 
 use anyhow::Result;
 use clap::Parser;
@@ -40,5 +41,9 @@ async fn main() -> Result<()> {
         Command::Run => reporter::run_loop().await,
         Command::Uninstall => installer::run_uninstall().await,
         Command::Status => collector::print_status_snapshot(),
+        Command::Ls => sessions::client::run_ls().await,
+        Command::New { name, command } => sessions::client::run_new(name, command).await,
+        Command::Attach { id } => sessions::client::run_attach(id).await,
+        Command::Kill { id } => sessions::client::run_kill(id).await,
     }
 }

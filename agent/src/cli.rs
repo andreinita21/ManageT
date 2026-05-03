@@ -32,6 +32,30 @@ pub enum Command {
 
     /// Print the loaded config and one metric snapshot, then exit.
     Status,
+
+    /// List active terminal sessions managed by this host's agent.
+    Ls,
+
+    /// Spawn a new persistent terminal session.
+    New {
+        /// Friendly name for the session (default: `session-<short-id>`).
+        #[arg(short, long)]
+        name: Option<String>,
+        /// Command to run (default: `$SHELL`).
+        #[arg(short, long)]
+        command: Option<String>,
+    },
+
+    /// Attach to an existing session by id (or unique prefix / name).
+    /// Detach with Ctrl-A d.
+    Attach {
+        id: String,
+    },
+
+    /// Send SIGTERM to a session's child process.
+    Kill {
+        id: String,
+    },
 }
 
 #[derive(Debug, Args)]
