@@ -7,7 +7,10 @@ import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { servers } from "@/lib/db/schema";
+import { rowToServer } from "@/lib/db/transform";
 import { encryptPassword } from "@/lib/crypto";
+import { installAgent } from "@/lib/agent/installer";
+import { eq } from "drizzle-orm";
 import { v4 as uuidv4 } from "uuid";
 import { z } from "zod";
 import type { Server } from "@/types";
@@ -31,16 +34,7 @@ export async function GET() {
   }
 
   const rows = await db.select().from(servers);
-  const data: Server[] = rows.map((r) => ({
-    ...r,
-    labels: JSON.parse(r.labels) as string[],
-    authMethod: r.authMethod as Server["authMethod"],
-    status: r.status as Server["status"],
-    lastConnectedAt: r.lastConnectedAt ?? undefined,
-    privateKeyPath: r.privateKeyPath ?? undefined,
-    passwordEncrypted: r.passwordEncrypted ?? undefined,
-    groupName: r.groupName ?? undefined,
-  }));
+  const data: Server[] = rows.map(rowToServer);
 
   return NextResponse.json({ data });
 }
@@ -93,22 +87,19 @@ export async function POST(request: Request) {
     updatedAt: now,
   });
 
-  const server: Server = {
-    id,
-    name: input.name,
-    host: input.host,
-    port: input.port,
-    username: input.username,
-    authMethod: input.authMethod,
-    privateKeyPath: input.privateKeyPath,
-    passwordEncrypted: passwordEncrypted ?? undefined,
-    labels: input.labels,
-    groupName: input.groupName,
-    status: "unknown",
-    createdBy: session.user.id,
-    createdAt: now,
-    updatedAt: now,
-  };
+  // Read the freshly-inserted row so we return the exact shape the client
+  // will see on subsequent GETs — including the default agent_status.
+  const inserted = await db.select().from(servers).where(eq(servers.id, id)).limit(1);
+  const server: Server = rowToServer(inserted[0]);
+
+  // Fire the SSH-push agent install in the background. The client should poll
+  // GET /api/servers/:id and watch `agentStatus` / `agentInstallStage` to render
+  // a live progress panel. We intentionally don't await this — the installer
+  // updates the row itself as it progresses.
+  void installAgent(id).catch((err: unknown) => {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[agent] background install crashed for ${id}:`, message);
+  });
 
   return NextResponse.json({ data: server }, { status: 201 });
 }

@@ -8,6 +8,13 @@
       "when": 1775772915750,
       "tag": "0000_nappy_thaddeus_ross",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1775828154691,
+      "tag": "0001_wild_shooting_star",
+      "breakpoints": true
     }
   ]
 }

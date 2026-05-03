@@ -1,0 +1,26 @@
+[Unit]
+Description=ManageT dashboard (Next.js + custom server)
+Documentation=https://github.com/andreinita21/ManageT
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=andrei
+Group=andrei
+WorkingDirectory=/home/andrei/managet
+EnvironmentFile=/home/andrei/managet/.env.local
+Environment=NODE_ENV=production
+Environment=HOME=/home/andrei
+# tsx is fine in production: it just registers a TS loader in front of
+# Node so we can keep server.ts authored as TypeScript. The Next.js side
+# uses pre-built .next/ output because NODE_ENV=production.
+ExecStart=/usr/bin/npx tsx server.ts
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

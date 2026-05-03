@@ -1,0 +1,44 @@
+//! ManageT monitoring agent.
+//!
+//! Runs on a remote server, collects resource usage via `sysinfo`, and posts
+//! heartbeat + metrics to a ManageT dashboard on a configured interval.
+//!
+//! Subcommands:
+//!   install     — copy binary into place, write config, install service
+//!   run         — long-lived service entrypoint (called by systemd/launchd)
+//!   uninstall   — stop service, remove service file, config, and binary
+//!   status      — print config + a one-shot metric snapshot (debug)
+
+mod cli;
+mod collector;
+mod config;
+mod installer;
+mod reporter;
+mod service;
+
+use anyhow::Result;
+use clap::Parser;
+use cli::{Cli, Command};
+
+fn init_tracing() {
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(false)
+        .compact()
+        .init();
+}
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+async fn main() -> Result<()> {
+    init_tracing();
+    let cli = Cli::parse();
+
+    match cli.command {
+        Command::Install(args) => installer::run_install(args).await,
+        Command::Run => reporter::run_loop().await,
+        Command::Uninstall => installer::run_uninstall().await,
+        Command::Status => collector::print_status_snapshot(),
+    }
+}

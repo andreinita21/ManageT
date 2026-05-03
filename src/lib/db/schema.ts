@@ -32,6 +32,38 @@ export const servers = sqliteTable("servers", {
     .notNull()
     .default("unknown"),
   lastConnectedAt: integer("last_connected_at"),
+  // ---- Agent-based monitoring fields ----
+  // The Rust agent (installed on the remote server) is now the source of
+  // truth for status + resource metrics. See src/lib/agent/*.
+  agentStatus: text("agent_status", {
+    enum: [
+      "not_installed",
+      "installing",
+      "install_failed",
+      "healthy",
+      "unreachable",
+      "uninstalling",
+      "uninstall_failed",
+    ],
+  })
+    .notNull()
+    .default("not_installed"),
+  // sha256 hex of the bearer token the agent uses to authenticate.
+  agentTokenHash: text("agent_token_hash"),
+  // Populated from the first successful heartbeat.
+  agentVersion: text("agent_version"),
+  // e.g. "x86_64-unknown-linux-musl" — filled in by the installer.
+  agentArch: text("agent_arch"),
+  // Epoch-ms of the most recent heartbeat. Drives the "unreachable" flip.
+  agentLastHeartbeatAt: integer("agent_last_heartbeat_at"),
+  // Last error string from install attempts. Shown in the UI on failure.
+  agentInstallError: text("agent_install_error"),
+  // Human-readable stage string written by the installer as it progresses
+  // (e.g. "uploading binary", "starting service"). Used by the UI progress
+  // panel to show what's happening right now.
+  agentInstallStage: text("agent_install_stage"),
+  // 0 | 1 — when 1, the next heartbeat returns {directive:"uninstall"}.
+  pendingUninstall: integer("pending_uninstall").notNull().default(0),
   createdBy: text("created_by")
     .notNull()
     .references(() => users.id),

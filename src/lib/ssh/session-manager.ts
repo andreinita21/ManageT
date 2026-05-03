@@ -76,22 +76,13 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     if (!client) {
       console.log(`[SESSION] No active connection for ${serverId}, connecting...`);
       const { servers } = await import("@/lib/db/schema");
+      const { rowToServer } = await import("@/lib/db/transform");
       const rows = await db.select().from(servers).where(eq(servers.id, serverId)).limit(1);
       const serverRow = rows[0];
       if (!serverRow) {
         throw new Error(`[SESSION] Server ${serverId} not found in database`);
       }
-      const serverData: import("@/types").Server = {
-        ...serverRow,
-        labels: JSON.parse(serverRow.labels) as string[],
-        authMethod: serverRow.authMethod as "key" | "password",
-        status: serverRow.status as import("@/types").Server["status"],
-        lastConnectedAt: serverRow.lastConnectedAt ?? undefined,
-        privateKeyPath: serverRow.privateKeyPath ?? undefined,
-        passwordEncrypted: serverRow.passwordEncrypted ?? undefined,
-        groupName: serverRow.groupName ?? undefined,
-      };
-      client = await connectionPool.connect(serverData);
+      client = await connectionPool.connect(rowToServer(serverRow));
     }
 
     const sessionId = uuidv4();

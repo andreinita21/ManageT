@@ -70,6 +70,12 @@ export const { auth, signIn, signOut, handlers } = NextAuth({
       },
     }),
   ],
+  // Auth.js v5 refuses requests with an unfamiliar Host header in
+  // production by default. Our custom server.ts setup doesn't trip the
+  // Vercel-style auto-trust path, so login + every protected route
+  // crashes with UntrustedHost. Trust whatever host the proxy/server
+  // gives us — we're behind our own LAN.
+  trustHost: true,
   session: { strategy: "jwt" },
   callbacks: {
     jwt({ token, user }) {

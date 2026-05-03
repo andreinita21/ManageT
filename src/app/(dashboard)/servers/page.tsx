@@ -3,22 +3,15 @@
 import React, { useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useServers, createServer, deleteServer } from "@/lib/hooks/useApi";
-import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Table } from "@/components/ui/Table";
 import { Modal } from "@/components/ui/Modal";
 import { Input } from "@/components/ui/Input";
 import { Select } from "@/components/ui/Select";
 import { useToast } from "@/components/ui/Toast";
+import { AgentStatusBadge } from "@/components/server/AgentStatusBadge";
+import { InstallProgressPanel } from "@/components/server/InstallProgressPanel";
 import type { Server, CreateServerRequest } from "@/types";
-
-const statusVariant: Record<string, "success" | "danger" | "warning" | "default"> = {
-  connected: "success",
-  disconnected: "danger",
-  reconnecting: "warning",
-  unreachable: "danger",
-  unknown: "default",
-};
 
 interface FormState {
   name: string;
@@ -51,6 +44,12 @@ export default function ServersPage() {
   const [form, setForm] = useState<FormState>(EMPTY_FORM);
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  /** If set, the Add-Server modal swaps to the install-progress panel for this id. */
+  const [installingServerId, setInstallingServerId] = useState<string | null>(null);
+  /** Server currently being deleted (for the confirm modal). */
+  const [deleteTarget, setDeleteTarget] = useState<Server | null>(null);
+  const [forceDelete, setForceDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   const columns = useMemo(
     () => [
@@ -84,9 +83,14 @@ export default function ServersPage() {
       },
       {
         key: "status",
-        header: "Status",
+        header: "Agent",
         render: (s: Server) => (
-          <Badge variant={statusVariant[s.status] ?? "default"}>{s.status}</Badge>
+          <AgentStatusBadge
+            status={s.agentStatus}
+            lastHeartbeatAt={s.agentLastHeartbeatAt}
+            installStage={s.agentInstallStage}
+            installError={s.agentInstallError}
+          />
         ),
       },
       {
@@ -118,19 +122,10 @@ export default function ServersPage() {
             <Button
               size="sm"
               variant="ghost"
-              onClick={async (e) => {
+              onClick={(e) => {
                 e.stopPropagation();
-                if (!confirm(`Delete server "${s.name}"? This cannot be undone.`)) {
-                  return;
-                }
-                try {
-                  await deleteServer(s.id);
-                  toast(`Deleted ${s.name}`, "success");
-                  refetch();
-                } catch (err) {
-                  const msg = err instanceof Error ? err.message : "Delete failed";
-                  toast(msg, "error");
-                }
+                setForceDelete(false);
+                setDeleteTarget(s);
               }}
             >
               <span className="text-red-400">Delete</span>
@@ -178,16 +173,40 @@ export default function ServersPage() {
 
     try {
       setSubmitting(true);
-      await createServer(payload);
-      toast(`Created ${payload.name}`, "success");
+      const created = await createServer(payload);
+      toast(`Created ${payload.name} — installing agent`, "success");
+      // Swap the Add-Server modal into "install progress" mode. We keep the
+      // modal open so the user can watch the SSH-push install play out.
       setForm(EMPTY_FORM);
-      setCreateOpen(false);
+      setInstallingServerId(created.id);
       refetch();
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Create failed";
       setFormError(msg);
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const handleDeleteConfirm = async () => {
+    if (!deleteTarget) return;
+    try {
+      setDeleting(true);
+      await deleteServer(deleteTarget.id, { force: forceDelete });
+      toast(
+        forceDelete
+          ? `Force-deleted ${deleteTarget.name}`
+          : `Removing ${deleteTarget.name}…`,
+        "success"
+      );
+      setDeleteTarget(null);
+      setForceDelete(false);
+      refetch();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Delete failed";
+      toast(msg, "error");
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -227,27 +246,51 @@ export default function ServersPage() {
       <Modal
         open={createOpen}
         onClose={() => {
-          if (!submitting) {
-            setCreateOpen(false);
-            setFormError(null);
-          }
+          // Block close while the form is submitting or the install progress
+          // panel is active — the install is running in the background and
+          // we want the user to see the result.
+          if (submitting || installingServerId) return;
+          setCreateOpen(false);
+          setFormError(null);
         }}
-        title="Add Server"
+        title={installingServerId ? "Installing agent" : "Add Server"}
         footer={
-          <>
+          installingServerId ? (
             <Button
-              variant="secondary"
-              onClick={() => setCreateOpen(false)}
-              disabled={submitting}
+              onClick={() => {
+                setInstallingServerId(null);
+                setCreateOpen(false);
+                refetch();
+              }}
             >
-              Cancel
+              Done
             </Button>
-            <Button onClick={handleSubmit} disabled={submitting}>
-              {submitting ? "Saving..." : "Create"}
-            </Button>
-          </>
+          ) : (
+            <>
+              <Button
+                variant="secondary"
+                onClick={() => setCreateOpen(false)}
+                disabled={submitting}
+              >
+                Cancel
+              </Button>
+              <Button onClick={handleSubmit} disabled={submitting}>
+                {submitting ? "Saving..." : "Create"}
+              </Button>
+            </>
+          )
         }
       >
+        {installingServerId ? (
+          <InstallProgressPanel
+            serverId={installingServerId}
+            onDone={() => {
+              // Panel has reached a terminal state; refresh the list so the
+              // table reflects the final agent status.
+              refetch();
+            }}
+          />
+        ) : (
         <div className="space-y-3">
           <Input
             label="Name"
@@ -314,6 +357,62 @@ export default function ServersPage() {
               {formError}
             </div>
           )}
+        </div>
+        )}
+      </Modal>
+
+      <Modal
+        open={deleteTarget !== null}
+        onClose={() => {
+          if (!deleting) {
+            setDeleteTarget(null);
+            setForceDelete(false);
+          }
+        }}
+        title={`Delete ${deleteTarget?.name ?? "server"}?`}
+        footer={
+          <>
+            <Button
+              variant="secondary"
+              onClick={() => {
+                setDeleteTarget(null);
+                setForceDelete(false);
+              }}
+              disabled={deleting}
+            >
+              Cancel
+            </Button>
+            <Button onClick={handleDeleteConfirm} disabled={deleting}>
+              {deleting ? "Deleting..." : forceDelete ? "Force delete" : "Delete"}
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-3 text-sm text-mg-text-secondary">
+          <p>
+            This will send an uninstall signal to the monitoring agent on{" "}
+            <span className="text-mg-text font-medium">{deleteTarget?.name}</span>.
+            The agent will stop, remove its systemd/launchd service, delete its
+            config and binary, and then the server record will be removed from
+            the dashboard.
+          </p>
+          <p className="text-mg-text-tertiary text-xs">
+            This action is not reversible.
+          </p>
+          <label className="flex items-start gap-2 text-xs text-mg-text-secondary cursor-pointer pt-2">
+            <input
+              type="checkbox"
+              checked={forceDelete}
+              onChange={(e) => setForceDelete(e.target.checked)}
+              className="mt-0.5 accent-red-500"
+            />
+            <span>
+              <span className="font-medium text-mg-text">Force delete</span>{" "}
+              — skip the agent signal and remove the row immediately. Use this
+              if the agent is already gone or the remote host is permanently
+              unreachable.
+            </span>
+          </label>
         </div>
       </Modal>
     </div>

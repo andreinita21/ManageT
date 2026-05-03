@@ -13,6 +13,15 @@ export interface User {
   updatedAt: number;
 }
 
+export type AgentStatus =
+  | "not_installed"
+  | "installing"
+  | "install_failed"
+  | "healthy"
+  | "unreachable"
+  | "uninstalling"
+  | "uninstall_failed";
+
 export interface Server {
   id: string;
   name: string;
@@ -26,6 +35,15 @@ export interface Server {
   groupName?: string;
   status: "connected" | "disconnected" | "reconnecting" | "unreachable" | "unknown";
   lastConnectedAt?: number;
+  // --- Agent-based monitoring ---
+  agentStatus: AgentStatus;
+  agentTokenHash?: string;
+  agentVersion?: string;
+  agentArch?: string;
+  agentLastHeartbeatAt?: number;
+  agentInstallError?: string;
+  agentInstallStage?: string;
+  pendingUninstall: boolean;
   createdBy: string;
   createdAt: number;
   updatedAt: number;

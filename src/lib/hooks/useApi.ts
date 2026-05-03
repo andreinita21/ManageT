@@ -143,8 +143,32 @@ export async function createServer(data: CreateServerRequest): Promise<Server> {
   return (json.data ?? json) as Server;
 }
 
-export async function deleteServer(id: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/servers/${id}`, { method: "DELETE" });
+export async function deleteServer(
+  id: string,
+  opts: { force?: boolean } = {}
+): Promise<void> {
+  const qs = opts.force ? "?force=true" : "";
+  const res = await fetch(`${API_BASE}/servers/${id}${qs}`, { method: "DELETE" });
+  handleUnauthorized(res);
+  if (!res.ok) {
+    // Try to surface the server's error message so the user knows why the
+    // delete was rejected (e.g. agent unreachable + SSH fallback failed).
+    let detail: string | undefined;
+    try {
+      const body = await res.json();
+      detail = body?.error ?? body?.detail;
+    } catch {
+      /* non-JSON body — ignore */
+    }
+    throw new Error(detail ?? `HTTP ${res.status}`);
+  }
+}
+
+/** Kick off a background retry of the SSH-push agent install. */
+export async function retryAgentInstall(id: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/servers/${id}/agent/install-retry`, {
+    method: "POST",
+  });
   handleUnauthorized(res);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
 }

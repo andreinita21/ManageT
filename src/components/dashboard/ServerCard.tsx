@@ -6,6 +6,7 @@ import type { Server } from "@/types";
 import { MetricSparkline } from "./MetricSparkline";
 import { AlertBadge } from "./AlertBadge";
 import { Badge } from "@/components/ui/Badge";
+import { AgentStatusBadge } from "@/components/server/AgentStatusBadge";
 
 interface ServerCardProps {
   server: Server;
@@ -15,16 +16,44 @@ interface ServerCardProps {
   alertCount?: number;
 }
 
-const statusConfig: Record<Server["status"], { color: string; glow: string; label: string; variant: "success" | "danger" | "warning" | "default" }> = {
-  connected: { color: "bg-emerald-400", glow: "shadow-[0_0_8px_rgba(52,211,153,0.6)]", label: "Connected", variant: "success" },
-  disconnected: { color: "bg-red-400", glow: "shadow-[0_0_8px_rgba(248,113,113,0.6)]", label: "Disconnected", variant: "danger" },
-  reconnecting: { color: "bg-amber-400", glow: "shadow-[0_0_8px_rgba(251,191,36,0.6)]", label: "Reconnecting", variant: "warning" },
-  unreachable: { color: "bg-red-600", glow: "shadow-[0_0_8px_rgba(220,38,38,0.6)]", label: "Unreachable", variant: "danger" },
-  unknown: { color: "bg-zinc-500", glow: "shadow-[0_0_8px_rgba(113,113,122,0.4)]", label: "Unknown", variant: "default" },
+/**
+ * Map agent status to the status-dot colour used on the card header. The
+ * actual agent pill is rendered separately via <AgentStatusBadge/>; this
+ * mapping only controls the little glowing circle next to the name.
+ */
+const dotByAgentStatus: Record<Server["agentStatus"], { color: string; glow: string }> = {
+  healthy: {
+    color: "bg-emerald-400",
+    glow: "shadow-[0_0_8px_rgba(52,211,153,0.6)]",
+  },
+  installing: {
+    color: "bg-blue-400 animate-pulse",
+    glow: "shadow-[0_0_8px_rgba(96,165,250,0.5)]",
+  },
+  install_failed: {
+    color: "bg-red-500",
+    glow: "shadow-[0_0_8px_rgba(239,68,68,0.6)]",
+  },
+  unreachable: {
+    color: "bg-amber-400",
+    glow: "shadow-[0_0_8px_rgba(251,191,36,0.6)]",
+  },
+  uninstalling: {
+    color: "bg-zinc-400 animate-pulse",
+    glow: "shadow-[0_0_8px_rgba(161,161,170,0.4)]",
+  },
+  uninstall_failed: {
+    color: "bg-red-500",
+    glow: "shadow-[0_0_8px_rgba(239,68,68,0.6)]",
+  },
+  not_installed: {
+    color: "bg-zinc-500",
+    glow: "shadow-[0_0_8px_rgba(113,113,122,0.3)]",
+  },
 };
 
 export function ServerCard({ server, cpuHistory = [], memoryUsedMb, memoryTotalMb, alertCount = 0 }: ServerCardProps) {
-  const status = statusConfig[server.status];
+  const dot = dotByAgentStatus[server.agentStatus];
   const memoryPercent = memoryTotalMb && memoryTotalMb > 0 ? (memoryUsedMb ?? 0) / memoryTotalMb * 100 : 0;
 
   return (
@@ -33,7 +62,7 @@ export function ServerCard({ server, cpuHistory = [], memoryUsedMb, memoryTotalM
         {/* Header */}
         <div className="flex items-start justify-between mb-3">
           <div className="flex items-center gap-2.5">
-            <div className={`w-2 h-2 rounded-full ${status.color} ${status.glow}`} />
+            <div className={`w-2 h-2 rounded-full ${dot.color} ${dot.glow}`} />
             <div>
               <h3 className="text-sm font-semibold text-mg-text group-hover:text-mg-accent-bright transition-colors duration-200">
                 {server.name}
@@ -44,6 +73,16 @@ export function ServerCard({ server, cpuHistory = [], memoryUsedMb, memoryTotalM
             </div>
           </div>
           <AlertBadge count={alertCount} />
+        </div>
+
+        {/* Agent status pill */}
+        <div className="mb-3">
+          <AgentStatusBadge
+            status={server.agentStatus}
+            lastHeartbeatAt={server.agentLastHeartbeatAt}
+            installStage={server.agentInstallStage}
+            installError={server.agentInstallError}
+          />
         </div>
 
         {/* CPU Sparkline */}

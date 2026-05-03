@@ -8,10 +8,11 @@ import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { servers } from "@/lib/db/schema";
+import { rowToServer } from "@/lib/db/transform";
 import { eq } from "drizzle-orm";
 import { encryptPassword } from "@/lib/crypto";
+import { sshUninstallAgent } from "@/lib/agent/uninstaller";
 import { z } from "zod";
-import type { Server } from "@/types";
 
 const updateServerSchema = z.object({
   name: z.string().min(1).optional(),
@@ -27,19 +28,6 @@ const updateServerSchema = z.object({
     .enum(["connected", "disconnected", "reconnecting", "unreachable", "unknown"])
     .optional(),
 });
-
-function rowToServer(r: typeof servers.$inferSelect): Server {
-  return {
-    ...r,
-    labels: JSON.parse(r.labels) as string[],
-    authMethod: r.authMethod as Server["authMethod"],
-    status: r.status as Server["status"],
-    lastConnectedAt: r.lastConnectedAt ?? undefined,
-    privateKeyPath: r.privateKeyPath ?? undefined,
-    passwordEncrypted: r.passwordEncrypted ?? undefined,
-    groupName: r.groupName ?? undefined,
-  };
-}
 
 export async function GET(
   _request: Request,
@@ -112,8 +100,14 @@ export async function PUT(
   return NextResponse.json({ data: rowToServer(updated[0]) });
 }
 
+/**
+ * Heartbeats older than this are considered stale enough to skip the
+ * soft-delete round-trip and go straight to SSH-uninstall fallback.
+ */
+const STALE_HEARTBEAT_MS = 60_000;
+
 export async function DELETE(
-  _request: Request,
+  request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const session = await auth();
@@ -122,11 +116,108 @@ export async function DELETE(
   }
 
   const { id } = await params;
+  const url = new URL(request.url);
+  const force = url.searchParams.get("force") === "true";
+
   const existing = await db.select().from(servers).where(eq(servers.id, id)).limit(1);
   if (existing.length === 0) {
     return NextResponse.json({ error: "Server not found" }, { status: 404 });
   }
+  const row = existing[0];
 
-  await db.delete(servers).where(eq(servers.id, id));
-  return NextResponse.json({ data: { deleted: true } });
+  // --- Path 1: force-delete. The admin wants the row gone regardless of
+  // whether the remote agent is still alive. Do not attempt to contact the
+  // remote host.
+  if (force) {
+    await db.delete(servers).where(eq(servers.id, id));
+    return NextResponse.json({ data: { deleted: true, forced: true } });
+  }
+
+  // --- Path 2: nothing was ever installed, or the install blew up before
+  // the agent ever started. Safe to hard-delete immediately — there is no
+  // remote process to signal.
+  const agentStatus = row.agentStatus;
+  if (agentStatus === "not_installed" || agentStatus === "install_failed") {
+    await db.delete(servers).where(eq(servers.id, id));
+    return NextResponse.json({ data: { deleted: true } });
+  }
+
+  // --- Path 3: the agent is (or should be) alive. Normal soft-delete: set
+  // pendingUninstall so the next heartbeat gets a "uninstall" directive, and
+  // the server row is removed by POST /api/agent/uninstalled when the agent
+  // confirms it cleaned up.
+  const lastHb = row.agentLastHeartbeatAt ?? 0;
+  const hbAge = Date.now() - lastHb;
+  const hbFresh = lastHb > 0 && hbAge < STALE_HEARTBEAT_MS;
+
+  if (hbFresh) {
+    await db
+      .update(servers)
+      .set({
+        pendingUninstall: 1,
+        agentStatus: "uninstalling",
+        agentInstallStage: "waiting for agent to self-uninstall",
+        updatedAt: Date.now(),
+      })
+      .where(eq(servers.id, id));
+    return NextResponse.json({ data: { pendingUninstall: true } });
+  }
+
+  // --- Path 4: the agent hasn't phoned home recently. Try to reach the
+  // remote box over SSH and run `managet-agent uninstall` directly. If that
+  // works, hard-delete the row. If SSH also fails, surface a 502 and let the
+  // user retry with ?force=true.
+  try {
+    await db
+      .update(servers)
+      .set({
+        agentStatus: "uninstalling",
+        agentInstallStage: "agent unreachable — trying SSH fallback",
+        updatedAt: Date.now(),
+      })
+      .where(eq(servers.id, id));
+
+    const result = await sshUninstallAgent(id);
+    if (!result.ok) {
+      await db
+        .update(servers)
+        .set({
+          agentStatus: "uninstall_failed",
+          agentInstallError: result.error ?? "ssh uninstall failed",
+          agentInstallStage: null,
+          updatedAt: Date.now(),
+        })
+        .where(eq(servers.id, id));
+      return NextResponse.json(
+        {
+          error:
+            "Agent is unreachable and SSH fallback failed. Retry, or use ?force=true to skip the agent signal.",
+          detail: result.error,
+        },
+        { status: 502 }
+      );
+    }
+
+    await db.delete(servers).where(eq(servers.id, id));
+    return NextResponse.json({ data: { deleted: true, via: "ssh-fallback" } });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await db
+      .update(servers)
+      .set({
+        agentStatus: "uninstall_failed",
+        agentInstallError: message,
+        agentInstallStage: null,
+        updatedAt: Date.now(),
+      })
+      .where(eq(servers.id, id));
+    return NextResponse.json(
+      {
+        error:
+          "Agent uninstall failed. Retry, or use ?force=true to skip the agent signal.",
+        detail: message,
+      },
+      { status: 502 }
+    );
+  }
 }

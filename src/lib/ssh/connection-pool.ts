@@ -23,14 +23,30 @@ export class ConnectionPool extends EventEmitter<ConnectionPoolEvents> {
   private readonly connections = new Map<string, Client>();
 
   /**
-   * Create a new SSH connection for a server.
-   * If a connection already exists for the server, it is disconnected first.
+   * Ensure an SSH connection exists for a server, returning the existing
+   * client if one is already in the pool.
+   *
+   * **Idempotent.** Previously this method tore down any existing connection
+   * before creating a new one — that turned out to be hostile to long-lived
+   * consumers like the interactive terminal: when the SSH-push installer
+   * called `connect()` for the same server (e.g. on Retry install), the
+   * shell PTY stream the user was typing into was killed mid-session.
+   *
+   * Callers that genuinely need to drop and reopen a connection (e.g. after
+   * editing a server's host or credentials) should call `disconnect()`
+   * explicitly first.
+   *
+   * Dead connections clean themselves out of the pool via the `close`,
+   * `end`, and `error` event handlers below, so a stale entry here always
+   * means an actually-live ssh2 client.
+   *
    * @param server - The server entity containing connection details
    * @returns A connected ssh2 Client
    */
   connect(server: Server): Promise<Client> {
-    if (this.connections.has(server.id)) {
-      this.disconnect(server.id);
+    const existing = this.connections.get(server.id);
+    if (existing) {
+      return Promise.resolve(existing);
     }
 
     return new Promise<Client>((resolve, reject) => {

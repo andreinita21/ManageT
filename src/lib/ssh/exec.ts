@@ -15,12 +15,18 @@ const DEFAULT_TIMEOUT_MS = 30000;
  * @param command - The command string to execute
  * @param cwd - Optional working directory; the command is prefixed with `cd <cwd> &&`
  * @param timeout - Timeout in milliseconds (default 30s)
+ * @param stdin - Optional string written to the remote process's stdin before
+ *                the stream is closed. Intended for internal callers (e.g. the
+ *                agent installer piping a sudo password). Not surfaced on the
+ *                public `ExecCommandRequest` type on purpose — exposing stdin
+ *                via the HTTP `/exec` route would be a footgun.
  */
 export async function executeCommand(
   serverId: string,
   command: string,
   cwd?: string,
-  timeout?: number
+  timeout?: number,
+  stdin?: string
 ): Promise<ExecCommandResponse>;
 
 /**
@@ -43,11 +49,13 @@ export async function executeCommand(
   serverId: string,
   commandOrRequest: string | ExecCommandRequest,
   cwd?: string,
-  timeout?: number
+  timeout?: number,
+  stdin?: string
 ): Promise<ExecCommandResponse> {
   let command: string;
   let effectiveCwd: string | undefined;
   let effectiveTimeout: number;
+  const effectiveStdin: string | undefined = stdin;
 
   if (typeof commandOrRequest === "string") {
     command = commandOrRequest;
@@ -86,6 +94,14 @@ export async function executeCommand(
           new Error(`[SSH] exec failed on server ${serverId}: ${err.message}`)
         );
         return;
+      }
+
+      // If the caller supplied stdin (e.g. a sudo password), write it to the
+      // remote process before we close the stream. End() signals EOF so the
+      // command finishes reading instead of blocking forever.
+      if (effectiveStdin !== undefined) {
+        stream.write(effectiveStdin);
+        stream.end();
       }
 
       let stdout = "";

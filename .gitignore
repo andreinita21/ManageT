@@ -23,6 +23,9 @@
 # misc
 .DS_Store
 *.pem
+# macOS AppleDouble metadata files (created when copying files from a
+# macOS source onto a non-Apple filesystem, e.g. tar from macOS to Linux).
+._*
 
 # debug
 npm-debug.log*
@@ -46,3 +49,6 @@ next-env.d.ts
 *.db-journal
 *.sqlite
 *.sqlite3
+
+# rust agent build artifacts (Cargo.lock is committed for reproducible binary builds)
+/agent/target/

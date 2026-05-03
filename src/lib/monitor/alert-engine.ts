@@ -1,17 +1,17 @@
 /**
  * @file alert-engine.ts — Threshold-based alerting for ManageT.
  *
- * Listens to MetricCollector "metrics:collected" events, compares each
- * snapshot against configurable thresholds, and persists / emits alerts
- * when values are exceeded.
+ * Listens to `snapshotEvents` "metrics:collected" events (published by the
+ * agent heartbeat route), compares each snapshot against configurable
+ * thresholds, and persists / emits alerts when values are exceeded.
  */
 
 import { EventEmitter } from "events";
 import { v4 as uuid } from "uuid";
 import { eq } from "drizzle-orm";
 import { db } from "@/lib/db";
-import { alerts, servers } from "@/lib/db/schema";
-import { MetricCollector } from "./metric-collector";
+import { alerts } from "@/lib/db/schema";
+import { snapshotEvents } from "./snapshot-events";
 import type { Alert, MetricSnapshot } from "@/types";
 
 // ---------------------------------------------------------------------------
@@ -99,21 +99,19 @@ class AlertEngine extends EventEmitter {
   }
 
   /**
-   * Bind to MetricCollector events. Safe to call multiple times — the
-   * listener is only attached once.
+   * Bind to the shared snapshot event bus. Safe to call multiple times —
+   * the listener is only attached once.
    */
   start(): void {
     if (this.listening) return;
-    const collector = MetricCollector.getInstance();
-    collector.on("metrics:collected", this.handleSnapshot);
+    snapshotEvents.on("metrics:collected", this.handleSnapshot);
     this.listening = true;
   }
 
-  /** Unbind from MetricCollector events. */
+  /** Unbind from the snapshot event bus. */
   stop(): void {
     if (!this.listening) return;
-    const collector = MetricCollector.getInstance();
-    collector.off("metrics:collected", this.handleSnapshot);
+    snapshotEvents.off("metrics:collected", this.handleSnapshot);
     this.listening = false;
   }
 

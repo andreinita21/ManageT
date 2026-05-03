@@ -9,6 +9,7 @@ import { connectionPool } from "./connection-pool";
 import { sessionManager } from "./session-manager";
 import { db } from "@/lib/db";
 import { servers } from "@/lib/db/schema";
+import { rowToServer } from "@/lib/db/transform";
 import type { Server } from "@/types";
 
 /** Configuration for the backoff strategy */
@@ -233,14 +234,7 @@ export class ReconnectionEngine extends EventEmitter<ReconnectionEvents> {
     const row = rows[0];
     if (!row) return null;
 
-    const server: Server = {
-      ...row,
-      labels: JSON.parse(row.labels) as string[],
-      lastConnectedAt: row.lastConnectedAt ?? undefined,
-      privateKeyPath: row.privateKeyPath ?? undefined,
-      passwordEncrypted: row.passwordEncrypted ?? undefined,
-      groupName: row.groupName ?? undefined,
-    };
+    const server: Server = rowToServer(row);
 
     this.serverCache.set(serverId, server);
     return server;
