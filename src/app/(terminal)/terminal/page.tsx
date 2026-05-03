@@ -125,8 +125,25 @@ function TerminalPage() {
 
   const createTab = useCallback(
     (serverId: string) => {
-      const server = servers?.find((s) => s.id === serverId);
-      if (!server) return;
+      // Surface every failure mode rather than swallowing it. The Connect
+      // button used to silently noop if `servers` was still loading or if
+      // the dropdown's value didn't match anything in the list — both
+      // present to the user as "the button did nothing."
+      console.error("[terminal] createTab called with serverId=", serverId);
+      if (!serverId) {
+        toast("Pick a server before connecting.", "error");
+        return;
+      }
+      if (!servers) {
+        toast("Server list is still loading. Try again in a second.", "error");
+        return;
+      }
+      const server = servers.find((s) => s.id === serverId);
+      if (!server) {
+        console.error("[terminal] server not found in list", { serverId, servers });
+        toast(`Server ${serverId} not found in your server list.`, "error");
+        return;
+      }
 
       const tabId = crypto.randomUUID();
 
@@ -140,8 +157,9 @@ function TerminalPage() {
       setTabs((prev) => [...prev, newTab]);
       setActiveTabId(tabId);
       setNewSessionModal(false);
+      console.error("[terminal] tab created, modal closing", { tabId, serverId });
     },
-    [servers]
+    [servers, toast]
   );
 
   const closeTab = useCallback(

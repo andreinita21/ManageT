@@ -59,6 +59,7 @@ const TerminalPaneInner = ({
   const wsRef = useRef<WebSocket | null>(null);
   const fitAddonRef = useRef<InstanceType<typeof import("xterm-addon-fit").FitAddon> | null>(null);
   const [status, setStatus] = useState<"connecting" | "connected" | "disconnected">("connecting");
+  const [fatalError, setFatalError] = useState<string | null>(null);
   // We keep the session id ONLY in a ref (no state). Storing it in state and
   // referencing it from the main WS effect would either stale-close or cause
   // an infinite teardown/reconnect loop. The xterm input/resize handlers read
@@ -202,12 +203,22 @@ const TerminalPaneInner = ({
         }, 3000);
       };
 
-      ws.onerror = () => {
+      ws.onerror = (e) => {
+        console.error("[TerminalPane] WebSocket error", e);
         setStatus("disconnected");
       };
     };
 
-    init();
+    init().catch((err: unknown) => {
+      // Without this catch, a failure in any of the dynamic xterm imports
+      // becomes a silent unhandled rejection — the user sees a blank pane
+      // and no clue what went wrong. Surface it inline so they have
+      // something concrete to copy/paste.
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error("[TerminalPane] init failed:", err);
+      setFatalError(`Terminal failed to initialise: ${msg}`);
+      setStatus("disconnected");
+    });
 
     // Handle container resize
     const observer = new ResizeObserver(() => {
@@ -250,6 +261,19 @@ const TerminalPaneInner = ({
               <span className="text-xs text-red-400">Disconnected</span>
             </>
           )}
+        </div>
+      )}
+
+      {/* Fatal init error overlay — shown when the terminal couldn't even
+          set itself up (e.g. dynamic xterm import 404'd in production).
+          The xterm output area can't render anything in that state, so put
+          the error in a visible div instead. */}
+      {fatalError && (
+        <div className="absolute inset-0 z-20 flex items-center justify-center p-6 bg-mg-bg-secondary/95">
+          <div className="max-w-md text-center">
+            <div className="text-red-400 text-sm font-medium mb-2">Terminal failed to start</div>
+            <div className="text-xs text-mg-text-secondary font-mono break-all">{fatalError}</div>
+          </div>
         </div>
       )}
     </div>
