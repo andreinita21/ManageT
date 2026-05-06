@@ -4,9 +4,16 @@
 
 use std::path::PathBuf;
 
-/// Full path to the installed agent binary.
+/// Full path to the installed agent binary (the long-running service).
 pub fn binary_path() -> PathBuf {
     PathBuf::from("/usr/local/bin/managet-agent")
+}
+
+/// Full path to the user-facing `managet` CLI binary. Installed alongside
+/// the service binary so users on the box can run `managet new` /
+/// `managet attach` etc. without typing `managet-agent`.
+pub fn managet_cli_path() -> PathBuf {
+    PathBuf::from("/usr/local/bin/managet")
 }
 
 /// Directory holding the config file.

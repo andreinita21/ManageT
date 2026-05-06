@@ -14,7 +14,22 @@ use crate::installer::paths;
 const UNIT_NAME: &str = "managet-agent.service";
 
 /// systemd unit file body. References the installed binary path and the
-/// config directory. The hardening flags match the plan.
+/// config directory.
+///
+/// Note on hardening flags: a previous iteration of this template set
+/// `ProtectHome=true` and `ProtectSystem=strict`. Those are inherited
+/// by every PTY child the agent spawns — so when a user typed
+/// `managet new -c "python3 /home/andrei/foo.py"` (or launched a stack
+/// service whose script lived under `/home`), the child saw an empty
+/// `/home` namespace and the script silently failed to open. Same for
+/// scripts in `/opt`, `/srv`, `/usr/local/something`. Since the entire
+/// point of the agent is to host root-equivalent user shells, locking
+/// it down with these knobs broke its core function without adding
+/// meaningful defense (anyone who can reach the agent socket can spawn
+/// `bash` anyway). We keep `NoNewPrivileges` (suid won't help anyone
+/// who's already running as root) and `RuntimeDirectory=managet` (so
+/// `/var/run/managet` exists for the control socket) but drop the
+/// path-protection flags.
 const UNIT_TEMPLATE: &str = r#"[Unit]
 Description=ManageT monitoring agent
 Documentation=https://github.com/andrei/managet
@@ -28,14 +43,8 @@ Restart=on-failure
 RestartSec=5s
 User=root
 NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-ReadWritePaths=/etc/managet-agent
 # RuntimeDirectory creates /run/managet at service start (owned by User,
-# mode 0755) and removes it at stop. Without this, ProtectSystem=strict
-# blocks the agent from binding the local control socket at
-# /var/run/managet/agent.sock.
+# mode 0755) and removes it at stop. The control socket lives there.
 RuntimeDirectory=managet
 RuntimeDirectoryMode=0755
 

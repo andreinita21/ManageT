@@ -52,3 +52,6 @@ next-env.d.ts
 
 # rust agent build artifacts (Cargo.lock is committed for reproducible binary builds)
 /agent/target/
+
+# Claude Code per-project scratch (lock files for scheduled wakeups, etc.)
+/.claude/

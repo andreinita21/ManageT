@@ -1,137 +1,375 @@
 /**
- * @fileoverview WebSocket server for ManageT.
- * Handles terminal I/O, session lifecycle, and real-time event forwarding
- * between the browser and SSH sessions.
+ * WebSocket server.
+ *
+ * Acts as a thin byte-shovel between the browser's xterm and the remote
+ * agent's PTY. The dashboard process holds NO PTY state — everything
+ * lives in the per-host Rust agent. That means refreshing the browser
+ * or restarting the dashboard simply reattaches to the same PTY; running
+ * processes (npm run dev, vim, htop) survive untouched.
+ *
+ * Per-WS state we keep:
+ *   - `wsAttachments` : ws → Map<sessionId, attachedHandle>
+ *     Each attached session has its own forwarded SSH stream; closing
+ *     the WS or detaching closes that stream (the PTY keeps running on
+ *     the agent).
+ *   - `wsToUser`      : ws → userId (for auth)
+ *
+ * Browser protocol (unchanged from the previous implementation, so the
+ * xterm component didn't need rewriting):
+ *   client → server:
+ *     {type:"session:create", serverId, command?, name?}
+ *     {type:"session:attach", sessionId, serverId}
+ *     {type:"session:detach", sessionId}
+ *     {type:"session:kill",   sessionId}
+ *     {type:"terminal:input",  sessionId, data}
+ *     {type:"terminal:resize", sessionId, rows, cols}
+ *   server → client:
+ *     {type:"session:state", session: SessionSnapshot}
+ *     {type:"terminal:output", sessionId, data}
+ *     {type:"session:lost",   sessionId, reason}
+ *
+ * Note: `session:attach` carries an explicit `serverId` now. The previous
+ * code looked it up from an in-memory snapshot; with PTYs out of process,
+ * the dashboard needs to be told which agent to connect to.
  */
 import { WebSocketServer, WebSocket } from "ws";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { parse as parseUrl } from "node:url";
-import type { ClientMessage, ServerMessage } from "../../types";
+import { eq } from "drizzle-orm";
 
-/** WebSocket ready states */
+import { db } from "@/lib/db";
+import { sessions } from "@/lib/db/schema";
+import {
+  attachSession,
+  createSession,
+  killSession,
+  resizeSession,
+} from "@/lib/ssh/session-manager";
+import type { Session, SessionSnapshot } from "@/types";
+
 const WS_OPEN = WebSocket.OPEN;
 
-/** Map of userId to their connected WebSocket clients */
-const clientsByUser = new Map<string, Set<WebSocket>>();
+/** Per-WS state: which session(s) this client is currently piping. */
+interface AttachState {
+  sessionId: string;
+  serverId: string;
+  stream: Duplex;
+}
 
-/** Map of WebSocket to the sessions it is subscribed to */
-const subscriptions = new Map<WebSocket, Set<string>>();
-
-/** Map of WebSocket to userId */
+const wsAttachments = new Map<WebSocket, Map<string, AttachState>>();
 const wsToUser = new Map<WebSocket, string>();
 
-/** The shared WebSocket server instance */
 const wss = new WebSocketServer({ noServer: true });
 
-/** Lazy-loaded session manager to avoid circular imports */
-let _sessionManager: typeof import("../ssh/session-manager").sessionManager | null = null;
-let _sessionManagerWired = false;
+// ---------------------------------------------------------------------------
+// Browser-bound protocol types (kept in lockstep with src/types/index.ts)
+// ---------------------------------------------------------------------------
 
-async function getSessionManager() {
-  if (!_sessionManager) {
-    const mod = await import("../ssh/session-manager");
-    _sessionManager = mod.sessionManager;
+interface IncomingCreate {
+  type: "session:create";
+  serverId: string;
+  command?: string;
+  name?: string;
+  cwd?: string; // accepted but currently unused — agent doesn't honor it yet
+}
+interface IncomingAttach {
+  type: "session:attach";
+  sessionId: string;
+  serverId: string;
+}
+interface IncomingDetach {
+  type: "session:detach";
+  sessionId: string;
+}
+interface IncomingKill {
+  type: "session:kill";
+  sessionId: string;
+  serverId: string;
+}
+interface IncomingInput {
+  type: "terminal:input";
+  sessionId: string;
+  data: string;
+}
+interface IncomingResize {
+  type: "terminal:resize";
+  sessionId: string;
+  rows: number;
+  cols: number;
+  /** Optional — supplied by the new client; helps when the dashboard hasn't
+   * cached which server hosts the session yet. */
+  serverId?: string;
+}
+type IncomingMsg =
+  | IncomingCreate
+  | IncomingAttach
+  | IncomingDetach
+  | IncomingKill
+  | IncomingInput
+  | IncomingResize;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function sendJson(ws: WebSocket, msg: unknown): void {
+  if (ws.readyState === WS_OPEN) {
+    try {
+      ws.send(JSON.stringify(msg));
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e);
+      console.error(`[WS] send failed: ${m}`);
+    }
   }
-  return _sessionManager;
 }
 
-/**
- * Wire up SessionManager events to broadcast to WS clients.
- * Called once on first connection.
- */
-async function wireSessionManagerEvents() {
-  if (_sessionManagerWired) return;
-  _sessionManagerWired = true;
+function getAttachments(ws: WebSocket): Map<string, AttachState> {
+  let map = wsAttachments.get(ws);
+  if (!map) {
+    map = new Map();
+    wsAttachments.set(ws, map);
+  }
+  return map;
+}
 
-  const sm = await getSessionManager();
+/** Resolve the server id for a session. Tries the per-WS map first; falls
+ *  back to a DB lookup. */
+async function resolveServerId(
+  ws: WebSocket,
+  sessionId: string,
+  hint?: string
+): Promise<string | null> {
+  if (hint) return hint;
+  const attached = wsAttachments.get(ws)?.get(sessionId);
+  if (attached) return attached.serverId;
+  const rows = await db
+    .select({ serverId: sessions.serverId })
+    .from(sessions)
+    .where(eq(sessions.id, sessionId))
+    .limit(1);
+  return rows[0]?.serverId ?? null;
+}
 
-  sm.on("session:output", (sessionId: string, data: string) => {
-    broadcastToSession(sessionId, {
-      type: "terminal:output",
-      sessionId,
-      data,
-    });
-  });
+async function handleAttachLifecycle(
+  ws: WebSocket,
+  serverId: string,
+  sessionId: string,
+  rows?: number,
+  cols?: number
+): Promise<void> {
+  // Don't double-attach the same WS to the same session — produces double
+  // input. If a previous attach is open, close it first.
+  const map = getAttachments(ws);
+  const existing = map.get(sessionId);
+  if (existing) {
+    try {
+      existing.stream.destroy();
+    } catch {
+      /* ignore */
+    }
+    map.delete(sessionId);
+  }
 
-  sm.on("session:lost", (sessionId: string, reason: string) => {
-    broadcastToSession(sessionId, {
+  const handle = await attachSession(serverId, sessionId, rows, cols);
+  if (!handle) {
+    sendJson(ws, {
       type: "session:lost",
       sessionId,
-      reason,
+      reason: "Session no longer exists on the agent",
+    });
+    return;
+  }
+
+  const state: AttachState = {
+    sessionId,
+    serverId,
+    stream: handle.stream,
+  };
+  map.set(sessionId, state);
+
+  // Pipe agent output → browser as terminal:output messages.
+  handle.stream.on("data", (chunk: Buffer) => {
+    sendJson(ws, {
+      type: "terminal:output",
+      sessionId,
+      data: chunk.toString("utf-8"),
     });
   });
 
-  sm.on(
-    "session:recovered",
-    (
-      sessionId: string,
-      method: "reattach" | "recreate",
-      command?: string,
-      cwd?: string
-    ) => {
-      broadcastToSession(sessionId, {
-        type: "session:recovered",
+  handle.stream.on("close", () => {
+    const m = wsAttachments.get(ws);
+    if (m && m.get(sessionId) === state) {
+      m.delete(sessionId);
+    }
+    if (ws.readyState === WS_OPEN) {
+      sendJson(ws, {
+        type: "session:lost",
         sessionId,
-        method,
-        command,
-        cwd,
+        reason: "Agent stream closed",
       });
     }
-  );
+  });
 
-  // Note: `session:created` is intentionally NOT broadcast here.
-  // The creating client receives `session:state` directly from the
-  // `session:create` message handler below. Broadcasting to all clients
-  // caused every pane to latch onto every new session, which routed input
-  // to the wrong server.
+  handle.stream.on("error", (e: Error) => {
+    console.error(`[WS] agent stream error for ${sessionId}: ${e.message}`);
+  });
+
+  // Synthesise a SessionSnapshot for backwards compatibility with the
+  // existing browser code that expects this on attach/create.
+  const snapshot: SessionSnapshot = {
+    sessionId: handle.sessionId,
+    serverId,
+    sessionName: handle.sessionName,
+    cwd: "",
+    lastCommand: "",
+    env: {},
+    scrollBuffer: [],
+    status: "active",
+    retryCount: 0,
+  };
+  sendJson(ws, { type: "session:state", session: snapshot });
 }
 
-/**
- * Send a typed server message to a WebSocket client.
- */
-function sendMessage(ws: WebSocket, message: ServerMessage): void {
-  if (ws.readyState === WS_OPEN) {
-    ws.send(JSON.stringify(message));
+// ---------------------------------------------------------------------------
+// Top-level message handler
+// ---------------------------------------------------------------------------
+
+async function handleMessage(ws: WebSocket, raw: string): Promise<void> {
+  let msg: IncomingMsg;
+  try {
+    msg = JSON.parse(raw) as IncomingMsg;
+  } catch (err) {
+    const m = err instanceof Error ? err.message : String(err);
+    console.error(`[WS] bad JSON: ${m}`);
+    return;
   }
-}
 
-/**
- * Broadcast a server message to all connected clients subscribed to a session.
- */
-function broadcastToSession(sessionId: string, message: ServerMessage): void {
-  for (const [ws, subs] of subscriptions) {
-    if (subs.has(sessionId) && ws.readyState === WS_OPEN) {
-      sendMessage(ws, message);
+  switch (msg.type) {
+    case "session:create": {
+      try {
+        const created = await createSession(msg.serverId, {
+          command: msg.command,
+          name: msg.name,
+        });
+        // Immediately attach this WS to the new session.
+        await handleAttachLifecycle(ws, msg.serverId, created.sessionId);
+      } catch (err) {
+        const m = err instanceof Error ? err.message : String(err);
+        console.error(`[WS] create failed: ${m}`);
+        sendJson(ws, {
+          type: "session:lost",
+          sessionId: "",
+          reason: `Failed to create session: ${m}`,
+        });
+      }
+      break;
+    }
+    case "session:attach": {
+      try {
+        await handleAttachLifecycle(ws, msg.serverId, msg.sessionId);
+      } catch (err) {
+        const m = err instanceof Error ? err.message : String(err);
+        console.error(`[WS] attach failed: ${m}`);
+        sendJson(ws, {
+          type: "session:lost",
+          sessionId: msg.sessionId,
+          reason: `Failed to attach: ${m}`,
+        });
+      }
+      break;
+    }
+    case "session:detach": {
+      const map = wsAttachments.get(ws);
+      const state = map?.get(msg.sessionId);
+      if (state) {
+        try {
+          state.stream.destroy();
+        } catch {
+          /* ignore */
+        }
+        map!.delete(msg.sessionId);
+      }
+      break;
+    }
+    case "session:kill": {
+      try {
+        const map = wsAttachments.get(ws);
+        const existing = map?.get(msg.sessionId);
+        if (existing) {
+          try {
+            existing.stream.destroy();
+          } catch {
+            /* ignore */
+          }
+          map!.delete(msg.sessionId);
+        }
+        await killSession(msg.serverId, msg.sessionId);
+      } catch (err) {
+        const m = err instanceof Error ? err.message : String(err);
+        console.error(`[WS] kill failed: ${m}`);
+      }
+      break;
+    }
+    case "terminal:input": {
+      const state = wsAttachments.get(ws)?.get(msg.sessionId);
+      if (!state) {
+        // Not attached yet — drop input. Browser will retry once the
+        // attach completes.
+        return;
+      }
+      try {
+        state.stream.write(msg.data);
+      } catch (err) {
+        const m = err instanceof Error ? err.message : String(err);
+        console.error(`[WS] input write failed: ${m}`);
+      }
+      break;
+    }
+    case "terminal:resize": {
+      const serverId = await resolveServerId(ws, msg.sessionId, msg.serverId);
+      if (!serverId) {
+        return;
+      }
+      try {
+        await resizeSession(serverId, msg.sessionId, msg.rows, msg.cols);
+      } catch (err) {
+        const m = err instanceof Error ? err.message : String(err);
+        // Resize is best-effort — not worth disconnecting the client over.
+        console.warn(`[WS] resize failed for ${msg.sessionId}: ${m}`);
+      }
+      break;
     }
   }
 }
 
-/**
- * Broadcast a server message to all connected clients.
- */
-function broadcastToAll(message: ServerMessage): void {
-  for (const ws of subscriptions.keys()) {
-    sendMessage(ws, message);
+function handleDisconnect(ws: WebSocket): void {
+  const map = wsAttachments.get(ws);
+  if (map) {
+    for (const state of map.values()) {
+      try {
+        state.stream.destroy();
+      } catch {
+        /* ignore */
+      }
+    }
+    wsAttachments.delete(ws);
   }
+  wsToUser.delete(ws);
 }
 
-/**
- * Extract user ID from the upgrade request.
- * Checks for session cookie (authjs.session-token or next-auth.session-token).
- */
+// ---------------------------------------------------------------------------
+// Auth
+// ---------------------------------------------------------------------------
+
 function extractUserId(req: IncomingMessage): string | null {
-  // Check cookie for next-auth session
   const cookieHeader = req.headers.cookie;
   if (cookieHeader) {
-    // Parse cookies manually (simple key=value; key=value)
     const cookies: Record<string, string> = {};
     cookieHeader.split(";").forEach((part) => {
       const [key, ...rest] = part.trim().split("=");
       if (key) cookies[key.trim()] = rest.join("=");
     });
-
-    // NextAuth v5 uses authjs.session-token
     const sessionToken =
       cookies["authjs.session-token"] ||
       cookies["next-auth.session-token"] ||
@@ -140,191 +378,57 @@ function extractUserId(req: IncomingMessage): string | null {
       return sessionToken;
     }
   }
-
-  // Check query parameter as fallback
   const parsed = parseUrl(req.url || "", true);
   const token = parsed.query.token;
   if (typeof token === "string" && token.length > 0) {
     return token;
   }
-
   return null;
 }
 
-/**
- * Handle an incoming WebSocket message from a client.
- */
-async function handleMessage(ws: WebSocket, raw: string): Promise<void> {
-  let message: ClientMessage;
-  try {
-    message = JSON.parse(raw) as ClientMessage;
-  } catch {
-    console.error("[WS] Failed to parse client message");
-    return;
-  }
-
-  const sm = await getSessionManager();
-
-  switch (message.type) {
-    case "terminal:input": {
-      try {
-        const stream = await sm.attachSession(message.sessionId);
-        if (!stream.write(message.data)) {
-          stream.once("drain", () => {});
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[WS] Failed to write terminal input: ${msg}`);
-      }
-      break;
-    }
-    case "terminal:resize": {
-      try {
-        const stream = await sm.attachSession(message.sessionId);
-        stream.setWindow(message.rows, message.cols, message.rows * 16, message.cols * 8);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[WS] Failed to resize terminal: ${msg}`);
-      }
-      break;
-    }
-    case "session:create": {
-      try {
-        const snapshot = await sm.createSession(message.serverId, message.command, message.cwd);
-        subscribeToSession(ws, snapshot.sessionId);
-        sendMessage(ws, { type: "session:state", session: snapshot });
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[WS] Failed to create session: ${msg}`);
-        sendMessage(ws, {
-          type: "session:lost",
-          sessionId: "",
-          reason: `Failed to create session: ${msg}`,
-        });
-      }
-      break;
-    }
-    case "session:attach": {
-      try {
-        await sm.attachSession(message.sessionId);
-        subscribeToSession(ws, message.sessionId);
-        const snapshot = sm.getSnapshot(message.sessionId);
-        if (snapshot) {
-          sendMessage(ws, { type: "session:state", session: snapshot });
-          if (snapshot.scrollBuffer.length > 0) {
-            const recentOutput = snapshot.scrollBuffer.slice(-50).join("");
-            sendMessage(ws, { type: "terminal:output", sessionId: message.sessionId, data: recentOutput });
-          }
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[WS] Failed to attach session: ${msg}`);
-        sendMessage(ws, { type: "session:lost", sessionId: message.sessionId, reason: `Failed to attach: ${msg}` });
-      }
-      break;
-    }
-    case "session:detach": {
-      unsubscribeFromSession(ws, message.sessionId);
-      sm.detachSession(message.sessionId);
-      break;
-    }
-    case "session:kill": {
-      try {
-        await sm.killSession(message.sessionId);
-        unsubscribeFromSession(ws, message.sessionId);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[WS] Failed to kill session: ${msg}`);
-      }
-      break;
-    }
-  }
-}
-
-function subscribeToSession(ws: WebSocket, sessionId: string): void {
-  let subs = subscriptions.get(ws);
-  if (!subs) {
-    subs = new Set();
-    subscriptions.set(ws, subs);
-  }
-  subs.add(sessionId);
-}
-
-function unsubscribeFromSession(ws: WebSocket, sessionId: string): void {
-  const subs = subscriptions.get(ws);
-  if (subs) subs.delete(sessionId);
-}
-
-function handleDisconnect(ws: WebSocket): void {
-  const userId = wsToUser.get(ws);
-  if (userId) {
-    const userClients = clientsByUser.get(userId);
-    if (userClients) {
-      userClients.delete(ws);
-      if (userClients.size === 0) clientsByUser.delete(userId);
-    }
-    wsToUser.delete(ws);
-  }
-  subscriptions.delete(ws);
-}
-
-// --- WebSocket server connection handler ---
+// ---------------------------------------------------------------------------
+// Connection handler
+// ---------------------------------------------------------------------------
 
 wss.on("connection", (ws: WebSocket) => {
-  console.log("[WS] New client connected");
+  console.log("[WS] client connected");
 
   ws.on("message", (raw: Buffer | string) => {
     const data = typeof raw === "string" ? raw : raw.toString("utf-8");
     handleMessage(ws, data).catch((err: Error) => {
-      console.error(`[WS] Unhandled error: ${err.message}`);
+      console.error(`[WS] unhandled error: ${err.message}`);
     });
   });
 
   ws.on("close", () => {
-    console.log("[WS] Client disconnected");
+    console.log("[WS] client disconnected");
     handleDisconnect(ws);
   });
 
   ws.on("error", (err: Error) => {
-    console.error(`[WS] Client error: ${err.message}`);
+    console.error(`[WS] client error: ${err.message}`);
     handleDisconnect(ws);
   });
 });
 
-/**
- * Handle HTTP upgrade requests for WebSocket connections.
- */
+// Unused export kept for compatibility with any old import sites.
+export type _SessionForAttach = Session;
+
 export function handleUpgrade(
   req: IncomingMessage,
   socket: Duplex,
   head: Buffer
 ): void {
   const userId = extractUserId(req);
-
   if (!userId) {
-    console.log("[WS] Upgrade rejected: no valid auth token");
-    console.log("[WS] Cookies:", req.headers.cookie ? "present" : "none");
+    console.log("[WS] upgrade rejected: no auth token");
     socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
     socket.destroy();
     return;
   }
-
-  // Wire up session manager events on first connection
-  wireSessionManagerEvents().catch((err) => {
-    console.error("[WS] Failed to wire session manager:", err);
-  });
-
   wss.handleUpgrade(req, socket, head, (ws: WebSocket) => {
     wsToUser.set(ws, userId);
-    let userClients = clientsByUser.get(userId);
-    if (!userClients) {
-      userClients = new Set();
-      clientsByUser.set(userId, userClients);
-    }
-    userClients.add(ws);
-    subscriptions.set(ws, new Set());
-
-    console.log(`[WS] Client authenticated (cookie-based)`);
+    console.log("[WS] client authenticated");
     wss.emit("connection", ws, req);
   });
 }

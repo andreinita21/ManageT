@@ -190,7 +190,6 @@ impl SessionManager {
     ) -> Result<Arc<Session>> {
         let id = uuid::Uuid::new_v4().to_string();
         let name = name.unwrap_or_else(|| format!("session-{}", &id[..8]));
-        let command_str = command.unwrap_or_else(default_shell);
 
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -202,7 +201,38 @@ impl SessionManager {
             })
             .context("openpty")?;
 
-        let mut cmd = CommandBuilder::new(&command_str);
+        // Build the command. Three cases we need to support cleanly:
+        //   - No `command` given → just spawn a login shell. Browser
+        //     terminals + `managet new` with no `-c` land here.
+        //   - `command` given that is a single binary path / argv-able
+        //     string → run it directly. Not what most users type, but
+        //     supported.
+        //   - `command` given that contains shell syntax (`&&`, `|`, env
+        //     references, glob, etc.) → must be run via $SHELL -c '...'
+        //     or the kernel exec() will reject it. This is the common
+        //     case from `managet new -c "npm run dev"` and from stack
+        //     launches that wrap commands like `cd /srv && cargo run`.
+        //
+        // Heuristic: we *always* wrap user-supplied commands in `$SHELL
+        // -c` when present. Even simple commands work fine wrapped, and
+        // we get aliases/$PATH/builtins for free. Costs one extra fork
+        // per session, which is negligible.
+        let shell = default_shell();
+        let command_label = command.clone().unwrap_or_else(|| shell.clone());
+        let mut cmd = if let Some(cmd_str) = command {
+            // `<shell> -c "<cmd_str>; exec <shell>"` — run the command,
+            // then drop into an interactive shell so the user can keep
+            // working after the process exits (or debug a crash). For
+            // stack services where the user wants the session to follow
+            // the process, they can use `managet kill <name>` to end it.
+            let chained = format!("{}; exec {}", cmd_str, shell);
+            let mut c = CommandBuilder::new(&shell);
+            c.arg("-c");
+            c.arg(chained);
+            c
+        } else {
+            CommandBuilder::new(&shell)
+        };
         if let Ok(home) = std::env::var("HOME") {
             cmd.cwd(home);
         }
@@ -229,7 +259,7 @@ impl SessionManager {
         let session = Arc::new(Session {
             id: id.clone(),
             name: name.clone(),
-            command: command_str.clone(),
+            command: command_label.clone(),
             created_at_ms: now_ms(),
             scrollback: Mutex::new(VecDeque::new()),
             output_tx: output_tx.clone(),
@@ -314,7 +344,7 @@ impl SessionManager {
             });
         }
 
-        info!(id = %id, name = %name, command = %command_str, "session created");
+        info!(id = %id, name = %name, command = %command_label, "session created");
 
         self.sessions
             .lock()

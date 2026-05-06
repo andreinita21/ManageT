@@ -1,25 +1,14 @@
-//! ManageT monitoring agent.
+//! ManageT monitoring agent — the `managet-agent` binary.
 //!
-//! Runs on a remote server, collects resource usage via `sysinfo`, and posts
-//! heartbeat + metrics to a ManageT dashboard on a configured interval.
-//!
-//! Subcommands:
-//!   install     — copy binary into place, write config, install service
-//!   run         — long-lived service entrypoint (called by systemd/launchd)
-//!   uninstall   — stop service, remove service file, config, and binary
-//!   status      — print config + a one-shot metric snapshot (debug)
-
-mod cli;
-mod collector;
-mod config;
-mod installer;
-mod reporter;
-mod service;
-mod sessions;
+//! Long-running service entrypoint and install/uninstall driver. Also
+//! still exposes the session subcommands for backwards compatibility,
+//! but the dedicated `managet` binary is now the recommended way to
+//! drive sessions interactively.
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Command};
+use managet_agent::cli::{Cli, Command};
+use managet_agent::{collector, installer, reporter, sessions};
 
 fn init_tracing() {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()

@@ -152,8 +152,25 @@ impl ServiceManager for LaunchdManager {
         let target = format!("system/{LABEL}");
         self.launchctl_lenient(&["bootout", &target]);
 
+        // We've also seen `Bootstrap failed: 5: Input/output error` when
+        // bootstrap is called immediately after writing the plist on a
+        // re-install — racing launchd's own catalogue update. A short
+        // back-off + a single retry has cleared every reproducer we've
+        // tested without papering over a real config bug, because launchd
+        // returns a different error for those (e.g. exit 119 for invalid
+        // plist content).
         let path = paths::service_file();
-        self.launchctl(&["bootstrap", "system", path.to_str().unwrap()])
+        let plist_arg = path.to_str().context("plist path was not valid UTF-8")?;
+        match self.launchctl(&["bootstrap", "system", plist_arg]) {
+            Ok(()) => Ok(()),
+            Err(first) => {
+                warn!(error = %first, "first bootstrap failed, retrying after 1s");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                // Try one more bootout+bootstrap cycle.
+                self.launchctl_lenient(&["bootout", &target]);
+                self.launchctl(&["bootstrap", "system", plist_arg])
+            }
+        }
     }
 
     fn disable(&self) -> Result<()> {

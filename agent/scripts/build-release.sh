@@ -84,8 +84,13 @@ for target in "${REQUESTED[@]}"; do
     (cd "$AGENT_DIR" && cargo build --release --target "$target")
 
     bin_src="$AGENT_DIR/target/$target/release/managet-agent"
+    cli_src="$AGENT_DIR/target/$target/release/managet"
     if [[ ! -f "$bin_src" ]]; then
         echo "!!  expected $bin_src but it doesn't exist" >&2
+        exit 1
+    fi
+    if [[ ! -f "$cli_src" ]]; then
+        echo "!!  expected $cli_src but it doesn't exist" >&2
         exit 1
     fi
 
@@ -93,16 +98,19 @@ for target in "${REQUESTED[@]}"; do
     mkdir -p "$bin_dst_dir"
     cp "$bin_src" "$bin_dst_dir/managet-agent"
     chmod 755 "$bin_dst_dir/managet-agent"
+    cp "$cli_src" "$bin_dst_dir/managet"
+    chmod 755 "$bin_dst_dir/managet"
 
     # SHA256 — both macOS (shasum) and Linux (sha256sum) supported.
     if command -v sha256sum >/dev/null 2>&1; then
-        (cd "$bin_dst_dir" && sha256sum managet-agent > managet-agent.sha256)
+        (cd "$bin_dst_dir" && sha256sum managet-agent managet > checksums.sha256)
     elif command -v shasum >/dev/null 2>&1; then
-        (cd "$bin_dst_dir" && shasum -a 256 managet-agent > managet-agent.sha256)
+        (cd "$bin_dst_dir" && shasum -a 256 managet-agent managet > checksums.sha256)
     fi
 
-    size=$(wc -c < "$bin_dst_dir/managet-agent" | tr -d ' ')
-    echo "    ok: $bin_dst_dir/managet-agent ($size bytes)"
+    agent_size=$(wc -c < "$bin_dst_dir/managet-agent" | tr -d ' ')
+    cli_size=$(wc -c < "$bin_dst_dir/managet" | tr -d ' ')
+    echo "    ok: $bin_dst_dir/managet-agent ($agent_size bytes) + managet ($cli_size bytes)"
     built_any=1
 done
 

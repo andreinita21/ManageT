@@ -39,6 +39,8 @@ import { getAgentSourceTarball } from "./source-bundle";
 import {
   binaryExists,
   binaryPath,
+  cliBinaryExists,
+  cliBinaryPath,
   targetFromUname,
   type AgentTarget,
 } from "./targets";
@@ -118,20 +120,51 @@ export async function installAgent(serverId: string): Promise<InstallResult> {
       .set({ agentArch: target, updatedAt: Date.now() })
       .where(eq(servers.id, serverId));
 
-    // Step 4 — SFTP upload to /tmp.
-    const remotePath = `/tmp/managet-agent-${randomUUID()}`;
+    // Step 4 — SFTP upload to /tmp. Both binaries land in the same
+    // staging dir so the agent's own installer can find the `managet`
+    // CLI sibling and copy it into /usr/local/bin/managet.
+    const stageDir = `/tmp/managet-install-${randomUUID()}`;
+    const remotePath = `${stageDir}/managet-agent`;
+    const remoteCliPath = `${stageDir}/managet`;
     const localPath = binaryPath(target);
-    const localSize = (await stat(localPath)).size;
+    const localCliPath = cliBinaryPath(target);
+    const haveCli = cliBinaryExists(target);
+
+    const sizeMsg = haveCli
+      ? `${formatBytes((await stat(localPath)).size + (await stat(localCliPath)).size)}`
+      : `${formatBytes((await stat(localPath)).size)}`;
     await setStage(
       serverId,
       "installing",
-      `uploading agent binary (${formatBytes(localSize)})`
+      `uploading agent binaries (${sizeMsg})`
     );
+    const mkdirRes = await executeCommand(
+      serverId,
+      `mkdir -p ${shellEscape(stageDir)}`,
+      undefined,
+      5_000
+    );
+    if (mkdirRes.exitCode !== 0) {
+      throw new Error(`mkdir staging failed: ${mkdirRes.stderr || mkdirRes.stdout}`);
+    }
     await sftpUpload(client, localPath, remotePath);
+    if (haveCli) {
+      await sftpUpload(client, localCliPath, remoteCliPath);
+    }
+    // If the cached CLI binary is missing, the agent installer's
+    // fallback creates `/usr/local/bin/managet` as a symlink to the
+    // service binary — `managet ls`, `managet attach` etc. still work
+    // because the service binary's CLI tree includes those subcommands.
 
     // Step 5 — chmod + run install.
     await setStage(serverId, "installing", "installing service");
-    const chmodRes = await executeCommand(serverId, `chmod +x ${shellEscape(remotePath)}`, undefined, 10_000);
+    const chmodRes = await executeCommand(
+      serverId,
+      `chmod +x ${shellEscape(remotePath)}` +
+        (haveCli ? ` ${shellEscape(remoteCliPath)}` : ""),
+      undefined,
+      10_000
+    );
     if (chmodRes.exitCode !== 0) {
       throw new Error(`chmod failed: ${chmodRes.stderr || chmodRes.stdout}`);
     }
@@ -187,10 +220,10 @@ export async function installAgent(serverId: string): Promise<InstallResult> {
       );
     }
 
-    // Step 6 — clean up staging file.
+    // Step 6 — clean up staging dir.
     await executeCommand(
       serverId,
-      `${sudoPrefix}rm -f ${shellEscape(remotePath)}`,
+      `${sudoPrefix}rm -rf ${shellEscape(stageDir)}`,
       undefined,
       10_000,
       sudoStdin
@@ -495,12 +528,26 @@ async function buildAgentOnTarget(
       );
     }
 
-    await setStage(serverId, "installing", "caching compiled binary on dashboard");
+    await setStage(serverId, "installing", "caching compiled binaries on dashboard");
     const remoteBinary = `${stageDir}/target/release/managet-agent`;
+    const remoteCliBinary = `${stageDir}/target/release/managet`;
     const localDest = binaryPath(target);
+    const localCliDest = cliBinaryPath(target);
     mkdirSync(dirname(localDest), { recursive: true });
     await sftpDownload(client, remoteBinary, localDest);
     await chmod(localDest, 0o755);
+    // Best-effort download of the second binary. If `cargo build` didn't
+    // produce it (older source tree, missing [[bin]] entry, etc.), fall
+    // through silently — the agent's installer falls back to a symlink.
+    try {
+      await sftpDownload(client, remoteCliBinary, localCliDest);
+      await chmod(localCliDest, 0o755);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `[agent] no managet CLI in target/release (${msg}) — symlink fallback will be used`
+      );
+    }
   } finally {
     // Best-effort cleanup of the staging directory.
     await executeCommand(

@@ -75,15 +75,34 @@ export function binariesDir(): string {
   return join(process.cwd(), "data", "agent-binaries");
 }
 
-/** Full filesystem path for a given target's binary. */
+/** Full filesystem path for a given target's service binary (`managet-agent`). */
 export function binaryPath(target: AgentTarget): string {
   return join(binariesDir(), target, "managet-agent");
 }
 
-/** Returns true iff `npm run build:agent` has produced this target. */
+/** Full filesystem path for a given target's user-facing CLI binary (`managet`). */
+export function cliBinaryPath(target: AgentTarget): string {
+  return join(binariesDir(), target, "managet");
+}
+
+/**
+ * Returns true iff `npm run build:agent` has produced this target. We
+ * check the service binary only — the CLI binary is best-effort and
+ * the installer falls back to a symlink if it's missing.
+ */
 export function binaryExists(target: AgentTarget): boolean {
   try {
     return existsSync(binaryPath(target)) && statSync(binaryPath(target)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** Returns true iff a `managet` CLI binary is cached for this target. */
+export function cliBinaryExists(target: AgentTarget): boolean {
+  try {
+    const p = cliBinaryPath(target);
+    return existsSync(p) && statSync(p).isFile();
   } catch {
     return false;
   }

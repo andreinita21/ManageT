@@ -89,6 +89,9 @@ export const sessions = sqliteTable("sessions", {
     .default("ask"),
   disconnectedAt: integer("disconnected_at"),
   retryCount: integer("retry_count").notNull().default(0),
+  // When set, this session was launched as part of a stack and the column
+  // points at the row in `stacks` so we can group / co-kill them.
+  stackId: text("stack_id").references(() => stacks.id, { onDelete: "set null" }),
   createdAt: integer("created_at").notNull(),
   updatedAt: integer("updated_at").notNull(),
 });

@@ -61,6 +61,7 @@ export interface Session {
   restartPolicy: "auto" | "ask" | "never";
   disconnectedAt?: number;
   retryCount: number;
+  stackId?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -187,11 +188,11 @@ export interface SessionSnapshot {
 
 export type ClientMessage =
   | { type: "terminal:input"; sessionId: string; data: string }
-  | { type: "terminal:resize"; sessionId: string; cols: number; rows: number }
-  | { type: "session:create"; serverId: string; command?: string; cwd?: string }
-  | { type: "session:attach"; sessionId: string }
+  | { type: "terminal:resize"; sessionId: string; cols: number; rows: number; serverId?: string }
+  | { type: "session:create"; serverId: string; command?: string; name?: string; cwd?: string }
+  | { type: "session:attach"; sessionId: string; serverId: string }
   | { type: "session:detach"; sessionId: string }
-  | { type: "session:kill"; sessionId: string };
+  | { type: "session:kill"; sessionId: string; serverId: string };
 
 export type ServerMessage =
   | { type: "terminal:output"; sessionId: string; data: string }

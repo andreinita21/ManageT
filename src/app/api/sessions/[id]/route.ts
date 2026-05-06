@@ -10,7 +10,7 @@ import { db } from "@/lib/db";
 import { sessions } from "@/lib/db/schema";
 import { eq } from "drizzle-orm";
 import { z } from "zod";
-import { sessionManager } from "@/lib/ssh/session-manager";
+import { killSession } from "@/lib/ssh/session-manager";
 import type { Session } from "@/types";
 
 const updateSessionSchema = z.object({
@@ -32,6 +32,7 @@ function rowToSession(r: typeof sessions.$inferSelect): Session {
       : undefined,
     scrollBufferTail: r.scrollBufferTail ?? undefined,
     disconnectedAt: r.disconnectedAt ?? undefined,
+    stackId: r.stackId ?? undefined,
   };
 }
 
@@ -120,18 +121,20 @@ export async function DELETE(
 
   const { id } = await params;
 
-  // killSession ends the SSH stream, drops the in-memory snapshot, and
-  // marks the row as "closed". Calling it on an unknown session is a no-op.
+  // Look up the server id so we know which agent to talk to.
+  const rows = await db
+    .select({ serverId: sessions.serverId })
+    .from(sessions)
+    .where(eq(sessions.id, id))
+    .limit(1);
+  if (rows.length === 0) {
+    return NextResponse.json({ ok: true });
+  }
   try {
-    await sessionManager.killSession(id);
+    await killSession(rows[0].serverId, id);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return NextResponse.json({ error: msg }, { status: 500 });
   }
-
-  // Drop the row entirely. The session is gone — no reason to keep a tombstone
-  // around to clutter the sessions list.
-  await db.delete(sessions).where(eq(sessions.id, id));
-
   return NextResponse.json({ ok: true });
 }

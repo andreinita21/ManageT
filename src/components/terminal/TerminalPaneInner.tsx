@@ -112,7 +112,15 @@ export default function TerminalPaneInner({
       });
       term.onResize(({ cols, rows }) => {
         if (ws?.readyState === WebSocket.OPEN && sessionId) {
-          ws.send(JSON.stringify({ type: "terminal:resize", sessionId, cols, rows }));
+          ws.send(
+            JSON.stringify({
+              type: "terminal:resize",
+              sessionId,
+              cols,
+              rows,
+              serverId,
+            })
+          );
         }
       });
 
@@ -150,7 +158,13 @@ export default function TerminalPaneInner({
         setStatus("connected");
         term?.writeln("\x1b[1;32m● Connected\x1b[0m");
         if (initialSessionId) {
-          ws?.send(JSON.stringify({ type: "session:attach", sessionId: initialSessionId }));
+          ws?.send(
+            JSON.stringify({
+              type: "session:attach",
+              sessionId: initialSessionId,
+              serverId,
+            })
+          );
         } else {
           ws?.send(JSON.stringify({ type: "session:create", serverId }));
         }

@@ -21,6 +21,7 @@ function rowToSession(r: typeof sessions.$inferSelect): Session {
       : undefined,
     scrollBufferTail: r.scrollBufferTail ?? undefined,
     disconnectedAt: r.disconnectedAt ?? undefined,
+    stackId: r.stackId ?? undefined,
   };
 }
 

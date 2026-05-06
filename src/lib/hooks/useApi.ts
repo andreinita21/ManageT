@@ -6,10 +6,14 @@ import type {
   MetricSnapshot,
   Session,
   RestartRule,
+  Stack,
   CreateServerRequest,
   CreateRestartRuleRequest,
+  CreateStackRequest,
+  UpdateStackRequest,
   ExecCommandRequest,
   ExecCommandResponse,
+  LaunchStackResponse,
   TestRestartRuleRequest,
   TestRestartRuleResponse,
 } from "@/types";
@@ -222,6 +226,76 @@ export async function testRestartRule(data: TestRestartRuleRequest): Promise<Tes
   handleUnauthorized(res);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json() as Promise<TestRestartRuleResponse>;
+}
+
+// --- Command execution ---
+
+// --- Stack hooks ---
+
+export function useStacks() {
+  return useFetch<Stack[]>("/stacks");
+}
+
+export function useStack(id: string) {
+  return useFetch<Stack>(`/stacks/${id}`);
+}
+
+export async function createStack(data: CreateStackRequest): Promise<Stack> {
+  const res = await fetch(`${API_BASE}/stacks`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  handleUnauthorized(res);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error ?? `HTTP ${res.status}`);
+  }
+  const json = await res.json();
+  return (json.data ?? json) as Stack;
+}
+
+export async function updateStack(id: string, data: UpdateStackRequest): Promise<Stack> {
+  const res = await fetch(`${API_BASE}/stacks/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  handleUnauthorized(res);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error ?? `HTTP ${res.status}`);
+  }
+  const json = await res.json();
+  return (json.data ?? json) as Stack;
+}
+
+export async function deleteStack(id: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/stacks/${id}`, { method: "DELETE" });
+  handleUnauthorized(res);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+}
+
+export async function launchStack(id: string): Promise<LaunchStackResponse> {
+  const res = await fetch(`${API_BASE}/stacks/${id}/launch`, { method: "POST" });
+  handleUnauthorized(res);
+  // 207 = partial — some services failed. We return the body either way.
+  const json = await res.json();
+  if (!res.ok && res.status !== 207) {
+    throw new Error(json.error ?? `HTTP ${res.status}`);
+  }
+  return (json.data ?? json) as LaunchStackResponse;
+}
+
+export async function stopStack(id: string): Promise<{ stopped: number }> {
+  const res = await fetch(`${API_BASE}/stacks/${id}/stop`, { method: "POST" });
+  handleUnauthorized(res);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error ?? `HTTP ${res.status}`);
+  }
+  const json = await res.json();
+  return (json.data ?? json) as { stopped: number };
 }
 
 // --- Command execution ---

@@ -1,0 +1,1 @@
+ALTER TABLE `sessions` ADD `stack_id` text REFERENCES stacks(id);

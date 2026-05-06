@@ -9,7 +9,7 @@ pub mod tui;
 
 use anyhow::{anyhow, Context, Result};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 use crate::cli::InstallArgs;
@@ -63,6 +63,20 @@ pub async fn run_uninstall() -> Result<()> {
         }
     }
 
+    // Remove the user-facing `managet` CLI before the service binary. On
+    // Linux, fs::remove_file works even on a running executable (dentry
+    // is unlinked, inode kept alive by the open fd). On macOS we'd hit
+    // ETXTBSY only if it were the currently-running executable, which it
+    // isn't here.
+    let cli = paths::managet_cli_path();
+    if cli.exists() {
+        if let Err(e) = fs::remove_file(&cli) {
+            warn!(%e, "removing managet CLI failed");
+        } else {
+            info!("removed {}", cli.display());
+        }
+    }
+
     // Remove binary last. On Linux, self-deletion of /usr/local/bin/managet-agent
     // works because the kernel keeps the inode alive while the process holds
     // the file descriptor; the dentry is unlinked immediately.
@@ -76,6 +90,71 @@ pub async fn run_uninstall() -> Result<()> {
     }
 
     info!("uninstall complete");
+    Ok(())
+}
+
+/// Install the user-facing `managet` CLI alongside the service binary.
+///
+/// Strategy:
+///   1. If a `managet` binary sits next to the source we're installing from
+///      (dashboard SSH-push uploads both files into the same staging dir;
+///      `cargo build` produces both binaries side-by-side in
+///      `target/release/`), copy that into `/usr/local/bin/managet`.
+///   2. Otherwise (e.g. a manual install where the user only has the
+///      service binary on disk), drop a symlink from
+///      `/usr/local/bin/managet` to `managet-agent`. The service binary
+///      already accepts the same subcommands, so the symlink works.
+///
+/// Atomic-rename trick mirrors `install_binary` for the same ETXTBSY reasons.
+fn install_managet_cli(service_binary_source: &Path) -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let target = paths::managet_cli_path();
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+
+    // Look for a `managet` binary next to the source service binary.
+    let dir = service_binary_source
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let candidate = dir.join("managet");
+
+    if candidate.exists() && candidate != target {
+        // Stage + atomic-rename to handle ETXTBSY if a previous install
+        // left a running `managet attach` process. Same trick as the
+        // service binary install above.
+        let staging = target.with_extension(format!("new-{}", std::process::id()));
+        let _ = fs::remove_file(&staging);
+        fs::copy(&candidate, &staging)
+            .with_context(|| format!("staging {} -> {}", candidate.display(), staging.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&staging)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&staging, perms)?;
+        }
+        // If `target` is currently a symlink, fs::rename replaces it
+        // atomically; if it's a regular file, same.
+        fs::rename(&staging, &target)
+            .with_context(|| format!("renaming {} -> {}", staging.display(), target.display()))?;
+        info!("installed managet CLI at {}", target.display());
+        return Ok(());
+    }
+
+    // Fallback: symlink. Remove anything already at the target path so
+    // `symlink` doesn't fail with EEXIST.
+    if target.exists() || target.is_symlink() {
+        let _ = fs::remove_file(&target);
+    }
+    if let Err(e) = symlink(paths::binary_path(), &target) {
+        warn!(%e, "could not symlink managet CLI (continuing without it)");
+    } else {
+        info!("symlinked managet -> managet-agent at {}", target.display());
+    }
     Ok(())
 }
 
@@ -125,6 +204,14 @@ pub(crate) async fn do_install(cfg: &AgentConfig) -> Result<()> {
     let current_exe = std::env::current_exe().context("reading current executable path")?;
     let target = paths::binary_path();
     install_binary(&current_exe, &target)?;
+
+    // 2b. Install the user-facing `managet` CLI alongside the service binary.
+    //     We look for it in the same directory as the service binary we just
+    //     installed from (typical layout: dashboard's SSH-push uploads both
+    //     binaries to /tmp; manual installs run from a directory that has
+    //     both). Falls back to a symlink onto the service binary so the
+    //     subcommand interface still works.
+    install_managet_cli(&current_exe)?;
 
     // 3. Write config.
     cfg.save().context("writing agent config")?;

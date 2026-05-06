@@ -1,0 +1,59 @@
+/**
+ * One-off: rename the existing admin user and reset their password.
+ *
+ *   npx tsx scripts/update-admin-creds.ts
+ *
+ * Hardcodes the new credentials per the user's request. Idempotent —
+ * re-running just rewrites the row.
+ */
+import { eq } from "drizzle-orm";
+import { hashPassword } from "../src/lib/auth/index.js";
+import { db } from "../src/lib/db/index.js";
+import { users } from "../src/lib/db/schema.js";
+
+const NEW_EMAIL = "andrei@test.com";
+const NEW_PASSWORD = "2006";
+
+async function main() {
+  // Find the existing admin row (by role first, falling back to the seed
+  // email so this script keeps working even after a fresh seed).
+  const adminRows = await db
+    .select()
+    .from(users)
+    .where(eq(users.role, "admin"))
+    .limit(1);
+  const seedRows =
+    adminRows.length === 0
+      ? await db
+          .select()
+          .from(users)
+          .where(eq(users.email, "admin@managet.local"))
+          .limit(1)
+      : [];
+  const target = adminRows[0] ?? seedRows[0];
+  if (!target) {
+    throw new Error(
+      "no admin user found in the database. Run `npx tsx scripts/seed.ts` first."
+    );
+  }
+
+  await db
+    .update(users)
+    .set({
+      email: NEW_EMAIL,
+      passwordHash: hashPassword(NEW_PASSWORD),
+      updatedAt: Date.now(),
+    })
+    .where(eq(users.id, target.id));
+
+  console.log(
+    `Updated admin user ${target.id.slice(0, 8)}: email=${NEW_EMAIL}, password=${NEW_PASSWORD}`
+  );
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });

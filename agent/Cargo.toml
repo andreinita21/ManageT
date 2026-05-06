@@ -5,9 +5,22 @@ edition = "2021"
 description = "ManageT monitoring agent — reports resource usage and heartbeat to a ManageT dashboard"
 license = "MIT"
 
+# Library crate so both binaries can share the session client, config,
+# installer, etc. without duplicating the modules.
+[lib]
+name = "managet_agent"
+path = "src/lib.rs"
+
+# Long-running service binary + install/uninstall/status driver.
 [[bin]]
 name = "managet-agent"
 path = "src/main.rs"
+
+# Thin user-facing CLI — lists/creates/attaches/kills sessions through
+# the locally running agent's Unix socket. Drop-in tmux-style UX.
+[[bin]]
+name = "managet"
+path = "src/bin/managet.rs"
 
 [dependencies]
 anyhow = "1.0"
