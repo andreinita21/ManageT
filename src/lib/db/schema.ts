@@ -147,6 +147,11 @@ export const stacks = sqliteTable("stacks", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
   description: text("description"),
+  // Soft-delete timestamp. When non-null the stack is in the Trash and
+  // hidden from the active list, but its services + sessions still
+  // resolve so an accidental delete can be restored without losing any
+  // launched workloads.
+  deletedAt: integer("deleted_at"),
   createdBy: text("created_by")
     .notNull()
     .references(() => users.id),

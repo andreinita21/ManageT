@@ -119,6 +119,8 @@ export interface Stack {
   id: string;
   name: string;
   description?: string;
+  /** Set when the stack has been soft-deleted (in Trash). */
+  deletedAt?: number;
   createdBy: string;
   createdAt: number;
   updatedAt: number;

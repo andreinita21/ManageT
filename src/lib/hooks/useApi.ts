@@ -236,6 +236,11 @@ export function useStacks() {
   return useFetch<Stack[]>("/stacks");
 }
 
+/** Soft-deleted stacks (the Trash view). */
+export function useTrashedStacks() {
+  return useFetch<Stack[]>("/stacks?trashed=1");
+}
+
 export function useStack(id: string) {
   return useFetch<Stack>(`/stacks/${id}`);
 }
@@ -270,10 +275,34 @@ export async function updateStack(id: string, data: UpdateStackRequest): Promise
   return (json.data ?? json) as Stack;
 }
 
-export async function deleteStack(id: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/stacks/${id}`, { method: "DELETE" });
+/**
+ * Default behaviour is a soft delete: the row stays around in the Trash
+ * view and can be restored with `restoreStack(id)`. Pass `force: true`
+ * to permanently remove it (no recovery).
+ */
+export async function deleteStack(
+  id: string,
+  opts: { force?: boolean } = {}
+): Promise<void> {
+  const qs = opts.force ? "?force=true" : "";
+  const res = await fetch(`${API_BASE}/stacks/${id}${qs}`, {
+    method: "DELETE",
+  });
   handleUnauthorized(res);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
+}
+
+export async function restoreStack(id: string): Promise<Stack> {
+  const res = await fetch(`${API_BASE}/stacks/${id}/restore`, {
+    method: "POST",
+  });
+  handleUnauthorized(res);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error ?? `HTTP ${res.status}`);
+  }
+  const json = await res.json();
+  return (json.data ?? json) as Stack;
 }
 
 export async function launchStack(id: string): Promise<LaunchStackResponse> {

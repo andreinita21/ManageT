@@ -11,6 +11,10 @@
  * The PTYs live inside the per-host agent (see
  * `src/lib/ssh/agent-socket.ts`), so the dashboard isn't holding open
  * any state — closing this page does nothing to the running services.
+ *
+ * Trash: deleting a stack soft-deletes it (sets `deletedAt`). The Trash
+ * view lists those rows with Restore and Delete-forever actions, so an
+ * accidental click on Delete doesn't lose a multi-host config.
  */
 
 import React, { useMemo, useState } from "react";
@@ -20,10 +24,12 @@ import {
   createStack,
   deleteStack,
   launchStack,
+  restoreStack,
   stopStack,
   updateStack,
   useServers,
   useStacks,
+  useTrashedStacks,
 } from "@/lib/hooks/useApi";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
@@ -33,6 +39,8 @@ import { Select } from "@/components/ui/Select";
 import { Table } from "@/components/ui/Table";
 import { useToast } from "@/components/ui/Toast";
 import type { CreateStackServiceInput, Server, Stack } from "@/types";
+
+type View = "active" | "trash";
 
 interface DraftService extends CreateStackServiceInput {
   /** Local key for React; stripped before submit. */
@@ -63,13 +71,20 @@ function newKey(): string {
 
 export default function StacksPage() {
   const router = useRouter();
-  const { data: stacks, refetch, loading } = useStacks();
+  const { data: activeStacks, refetch: refetchActive, loading: loadingActive } = useStacks();
+  const { data: trashedStacks, refetch: refetchTrash, loading: loadingTrash } = useTrashedStacks();
   const { data: servers } = useServers();
   const { toast } = useToast();
 
+  const [view, setView] = useState<View>("active");
   const [editorOpen, setEditorOpen] = useState(false);
   const [draft, setDraft] = useState<DraftStack>(EMPTY_DRAFT);
   const [submitting, setSubmitting] = useState(false);
+
+  const refetch = () => {
+    refetchActive();
+    refetchTrash();
+  };
 
   const serversById = useMemo(() => {
     const m = new Map<string, Server>();
@@ -164,7 +179,6 @@ export default function StacksPage() {
         );
       }
       refetch();
-      // Bring the user to the sessions view so they can see what's running.
       router.push("/sessions");
     } catch (err) {
       const m = err instanceof Error ? err.message : "Launch failed";
@@ -184,13 +198,17 @@ export default function StacksPage() {
     }
   };
 
-  const handleDelete = async (stack: Stack) => {
-    if (!confirm(`Delete stack "${stack.name}"? Running sessions will not be stopped.`)) {
+  const handleSoftDelete = async (stack: Stack) => {
+    if (
+      !confirm(
+        `Move stack "${stack.name}" to Trash? Running sessions are NOT stopped — recover from the Trash tab.`
+      )
+    ) {
       return;
     }
     try {
       await deleteStack(stack.id);
-      toast("Stack deleted", "success");
+      toast(`Moved to Trash`, "success");
       refetch();
     } catch (err) {
       const m = err instanceof Error ? err.message : "Delete failed";
@@ -198,7 +216,38 @@ export default function StacksPage() {
     }
   };
 
-  const columns = useMemo(
+  const handleRestore = async (stack: Stack) => {
+    try {
+      await restoreStack(stack.id);
+      toast(`Restored "${stack.name}"`, "success");
+      refetch();
+    } catch (err) {
+      const m = err instanceof Error ? err.message : "Restore failed";
+      toast(m, "error");
+    }
+  };
+
+  const handleHardDelete = async (stack: Stack) => {
+    if (
+      !confirm(
+        `Permanently delete "${stack.name}"? This cannot be undone. Already-running sessions will keep running but won't be linked to a stack.`
+      )
+    ) {
+      return;
+    }
+    try {
+      await deleteStack(stack.id, { force: true });
+      toast(`Deleted "${stack.name}" permanently`, "success");
+      refetch();
+    } catch (err) {
+      const m = err instanceof Error ? err.message : "Delete failed";
+      toast(m, "error");
+    }
+  };
+
+  // ----- columns -----
+
+  const activeColumns = useMemo(
     () => [
       {
         key: "name",
@@ -236,10 +285,13 @@ export default function StacksPage() {
         className: "text-right",
         render: (s: Stack) => (
           <div className="flex items-center justify-end gap-2">
-            <Button size="sm" onClick={(e) => {
-              e.stopPropagation();
-              handleLaunch(s);
-            }}>
+            <Button
+              size="sm"
+              onClick={(e) => {
+                e.stopPropagation();
+                handleLaunch(s);
+              }}
+            >
               Launch
             </Button>
             <Button
@@ -267,7 +319,7 @@ export default function StacksPage() {
               variant="ghost"
               onClick={(e) => {
                 e.stopPropagation();
-                handleDelete(s);
+                handleSoftDelete(s);
               }}
             >
               <span className="text-red-400">Delete</span>
@@ -278,6 +330,73 @@ export default function StacksPage() {
     ],
     [serversById]
   );
+
+  const trashColumns = useMemo(
+    () => [
+      {
+        key: "name",
+        header: "Stack",
+        render: (s: Stack) => (
+          <div className="flex flex-col">
+            <span className="text-mg-text font-medium">{s.name}</span>
+            {s.description && (
+              <span className="text-xs text-mg-text-tertiary">{s.description}</span>
+            )}
+          </div>
+        ),
+      },
+      {
+        key: "deletedAt",
+        header: "Trashed",
+        render: (s: Stack) => (
+          <span className="text-xs text-mg-text-secondary">
+            {s.deletedAt ? new Date(s.deletedAt).toLocaleString() : "—"}
+          </span>
+        ),
+      },
+      {
+        key: "services",
+        header: "Services",
+        render: (s: Stack) => (
+          <span className="text-xs text-mg-text-tertiary">
+            {s.services.length} service{s.services.length === 1 ? "" : "s"}
+          </span>
+        ),
+      },
+      {
+        key: "actions",
+        header: "",
+        className: "text-right",
+        render: (s: Stack) => (
+          <div className="flex items-center justify-end gap-2">
+            <Button
+              size="sm"
+              onClick={(e) => {
+                e.stopPropagation();
+                handleRestore(s);
+              }}
+            >
+              Restore
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={(e) => {
+                e.stopPropagation();
+                handleHardDelete(s);
+              }}
+            >
+              <span className="text-red-400">Delete forever</span>
+            </Button>
+          </div>
+        ),
+      },
+    ],
+    []
+  );
+
+  const trashCount = trashedStacks?.length ?? 0;
+  const showingActive = view === "active";
 
   return (
     <div className="space-y-6">
@@ -290,22 +409,66 @@ export default function StacksPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Button variant="secondary" onClick={refetch}>Refresh</Button>
-          <Button onClick={openCreate}>New Stack</Button>
+          <Button variant="secondary" onClick={refetch}>
+            Refresh
+          </Button>
+          {showingActive && <Button onClick={openCreate}>New Stack</Button>}
         </div>
       </div>
 
+      {/* View tabs */}
+      <div className="inline-flex rounded-lg border border-mg-border bg-mg-bg-secondary p-0.5">
+        <button
+          type="button"
+          className={`px-3 py-1.5 text-sm rounded-md transition ${
+            showingActive
+              ? "bg-mg-bg-active text-mg-accent"
+              : "text-mg-text-secondary hover:text-mg-text"
+          }`}
+          onClick={() => setView("active")}
+        >
+          Active{" "}
+          <span className="text-xs text-mg-text-tertiary">
+            ({activeStacks?.length ?? 0})
+          </span>
+        </button>
+        <button
+          type="button"
+          className={`px-3 py-1.5 text-sm rounded-md transition ${
+            !showingActive
+              ? "bg-mg-bg-active text-mg-accent"
+              : "text-mg-text-secondary hover:text-mg-text"
+          }`}
+          onClick={() => setView("trash")}
+        >
+          Trash <span className="text-xs text-mg-text-tertiary">({trashCount})</span>
+        </button>
+      </div>
+
       <div className="bg-mg-bg-secondary border border-mg-border rounded-lg">
-        {loading ? (
+        {showingActive ? (
+          loadingActive ? (
+            <div className="flex items-center justify-center py-12 text-mg-text-tertiary text-sm">
+              Loading stacks...
+            </div>
+          ) : (
+            <Table
+              columns={activeColumns}
+              data={activeStacks ?? []}
+              keyExtractor={(s) => s.id}
+              emptyMessage="No stacks yet. Create one to launch commands across multiple servers in parallel."
+            />
+          )
+        ) : loadingTrash ? (
           <div className="flex items-center justify-center py-12 text-mg-text-tertiary text-sm">
-            Loading stacks...
+            Loading trash...
           </div>
         ) : (
           <Table
-            columns={columns}
-            data={stacks ?? []}
+            columns={trashColumns}
+            data={trashedStacks ?? []}
             keyExtractor={(s) => s.id}
-            emptyMessage="No stacks yet. Create one to launch commands across multiple servers in parallel."
+            emptyMessage="Trash is empty."
           />
         )}
       </div>
@@ -376,6 +539,7 @@ function StackEditor({
       open={open}
       onClose={onClose}
       title={draft.id ? "Edit Stack" : "New Stack"}
+      size="3xl"
       footer={
         <>
           <Button variant="secondary" onClick={onClose} disabled={submitting}>
@@ -387,8 +551,8 @@ function StackEditor({
         </>
       }
     >
-      <div className="space-y-5">
-        <div className="space-y-3">
+      <div className="space-y-6">
+        <div className="grid grid-cols-2 gap-3">
           <Input
             label="Name"
             value={draft.name}
@@ -403,9 +567,14 @@ function StackEditor({
           />
         </div>
 
-        <div className="space-y-2">
+        <div className="space-y-3">
           <div className="flex items-center justify-between">
-            <h3 className="text-sm font-medium text-mg-text">Services</h3>
+            <h3 className="text-sm font-medium text-mg-text">
+              Services{" "}
+              <span className="text-xs text-mg-text-tertiary">
+                ({draft.services.length})
+              </span>
+            </h3>
             <Button size="sm" variant="ghost" onClick={addService}>
               + Add service
             </Button>
@@ -414,7 +583,7 @@ function StackEditor({
           {draft.services.map((svc, idx) => (
             <div
               key={svc.key}
-              className="bg-mg-bg-tertiary border border-mg-border rounded-lg p-3 space-y-2"
+              className="bg-mg-bg-tertiary border border-mg-border rounded-lg p-4 space-y-3"
             >
               <div className="flex items-center justify-between">
                 <span className="text-xs text-mg-text-tertiary uppercase tracking-wider">
@@ -431,7 +600,7 @@ function StackEditor({
                 )}
               </div>
 
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-2 gap-3">
                 <Input
                   label="Name"
                   value={svc.name}

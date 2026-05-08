@@ -10,6 +10,7 @@
 import { NextResponse } from "next/server";
 import { v4 as uuidv4 } from "uuid";
 import { z } from "zod";
+import { isNull, isNotNull } from "drizzle-orm";
 import { auth } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { stacks, stackServices } from "@/lib/db/schema";
@@ -28,13 +29,29 @@ const createStackSchema = z.object({
   services: z.array(serviceInputSchema).min(1),
 });
 
-export async function GET() {
+export async function GET(request: Request) {
   const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const stackRows = await db.select().from(stacks);
+  // ?trashed=1 returns only soft-deleted stacks (the Trash view). Default
+  // returns only live stacks. Pass ?all=1 if a caller really needs both
+  // (currently unused, but cheap to support).
+  const url = new URL(request.url);
+  const wantTrashed = url.searchParams.get("trashed") === "1";
+  const wantAll = url.searchParams.get("all") === "1";
+
+  const stackRows = await db
+    .select()
+    .from(stacks)
+    .where(
+      wantAll
+        ? undefined
+        : wantTrashed
+          ? isNotNull(stacks.deletedAt)
+          : isNull(stacks.deletedAt)
+    );
   const serviceRows = await db.select().from(stackServices);
   const byStack = new Map<string, StackService[]>();
   for (const row of serviceRows) {
@@ -54,6 +71,7 @@ export async function GET() {
     id: s.id,
     name: s.name,
     description: s.description ?? undefined,
+    deletedAt: s.deletedAt ?? undefined,
     createdBy: s.createdBy,
     createdAt: s.createdAt,
     updatedAt: s.updatedAt,

@@ -1,9 +1,16 @@
 /**
- * GET    /api/stacks/[id] — fetch one stack with services.
- * PUT    /api/stacks/[id] — update name/description and/or replace services.
- * DELETE /api/stacks/[id] — drop the stack (associated `sessions` rows
- *                           keep their `stackId` set to NULL via the
- *                           ON DELETE SET NULL FK).
+ * GET    /api/stacks/[id]              — fetch one stack with services.
+ * PUT    /api/stacks/[id]              — update name/description and/or replace services.
+ * DELETE /api/stacks/[id]              — soft-delete (Trash). Sets
+ *                                         `deletedAt = now`. The row + its
+ *                                         services + any launched sessions
+ *                                         survive so a Restore can bring
+ *                                         them back.
+ * DELETE /api/stacks/[id]?force=true   — hard-delete (no recovery). The FK
+ *                                         on `sessions.stackId` is
+ *                                         `ON DELETE SET NULL` so launched
+ *                                         sessions keep running but lose
+ *                                         their stack link.
  */
 import { NextResponse } from "next/server";
 import { z } from "zod";
@@ -90,7 +97,7 @@ export async function PUT(
 }
 
 export async function DELETE(
-  _request: Request,
+  request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const session = await auth();
@@ -98,6 +105,15 @@ export async function DELETE(
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
   const { id } = await params;
-  await db.delete(stacks).where(eq(stacks.id, id));
-  return NextResponse.json({ ok: true });
+  const force = new URL(request.url).searchParams.get("force") === "true";
+  if (force) {
+    await db.delete(stacks).where(eq(stacks.id, id));
+  } else {
+    const now = Date.now();
+    await db
+      .update(stacks)
+      .set({ deletedAt: now, updatedAt: now })
+      .where(eq(stacks.id, id));
+  }
+  return NextResponse.json({ ok: true, force });
 }

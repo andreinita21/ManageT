@@ -84,6 +84,7 @@ export async function getStack(stackId: string): Promise<Stack | null> {
     id: s.id,
     name: s.name,
     description: s.description ?? undefined,
+    deletedAt: s.deletedAt ?? undefined,
     createdBy: s.createdBy,
     createdAt: s.createdAt,
     updatedAt: s.updatedAt,
@@ -103,6 +104,11 @@ export async function launchStack(stackId: string): Promise<LaunchStackResponse>
   const stack = await getStack(stackId);
   if (!stack) {
     throw new Error(`stack ${stackId} not found`);
+  }
+  if (stack.deletedAt) {
+    throw new Error(
+      `stack "${stack.name}" is in the trash — restore it first`
+    );
   }
 
   const launched: LaunchStackResponse["launched"] = [];
