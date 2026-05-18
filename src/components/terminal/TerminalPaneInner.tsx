@@ -88,6 +88,31 @@ export default function TerminalPaneInner({
   // through `onSessionReady` without yanking us around.
   const [mountInitialSessionId] = useState(initialSessionId);
 
+  // Final line of defense against the xterm 5.x renderer-init race.
+  // If the instance/prototype patch misses (e.g. the internal field
+  // name changed in a future xterm version), this window listener
+  // catches the unhandled error event and prevents it from reaching
+  // Next.js's dev overlay. We match on both the message text and a
+  // hint of `Viewport` in the stack so unrelated TypeErrors still
+  // surface normally. Capture phase + stopImmediatePropagation gives
+  // us the best chance of suppressing before the overlay's own
+  // listener sees the event.
+  useEffect(() => {
+    const handler = (e: ErrorEvent) => {
+      const msg = e.error?.message ?? e.message ?? "";
+      const stack = (e.error?.stack ?? "") + " " + (e.filename ?? "");
+      const isDimensions =
+        typeof msg === "string" && msg.includes("dimensions");
+      const isXterm = stack.includes("Viewport") || stack.includes("xterm");
+      if (isDimensions && isXterm) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+      }
+    };
+    window.addEventListener("error", handler, true);
+    return () => window.removeEventListener("error", handler, true);
+  }, []);
+
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -125,35 +150,58 @@ export default function TerminalPaneInner({
       // xterm 5.x has a renderer-init race: Viewport schedules an
       // _innerRefresh via an internal setTimeout(0), and if that
       // callback fires before the render-service's `dimensions` are
-      // computed, the `dimensions` getter throws "Cannot read
+      // computed (or after the renderer is disposed by StrictMode
+      // remount), the `dimensions` getter throws "Cannot read
       // properties of undefined (reading 'dimensions')". Subsequent
-      // refreshes succeed once the renderer initializes, but Next.js's
-      // dev overlay treats that single throw as a runtime error.
-      // Wrap _innerRefresh on the instance to swallow only that
-      // specific error type. Internals aren't a public API, so the
-      // whole block is best-effort behind a try/catch — if xterm
-      // restructures, we just lose the suppression but keep working.
+      // refreshes succeed, but Next.js's dev overlay still flags the
+      // one-off throw as a runtime error.
+      //
+      // Patch _innerRefresh on the instance AND on its prototype, so
+      // any other Viewport instance created during xterm's lifecycle
+      // also inherits the safety wrap. Internals aren't a public API,
+      // so each access is best-effort behind try/catch — if xterm
+      // restructures we lose the suppression but keep working.
+      const wrapInnerRefresh = (target: {
+        _innerRefresh?: () => unknown;
+      }) => {
+        if (typeof target._innerRefresh !== "function") return;
+        // Don't double-wrap if we (or a prior mount) already patched it.
+        const patched = target._innerRefresh as {
+          __managetPatched?: boolean;
+        };
+        if (patched.__managetPatched) return;
+        const original = target._innerRefresh;
+        const wrapped = function (this: unknown, ...args: unknown[]) {
+          try {
+            return (original as (...a: unknown[]) => unknown).apply(
+              this,
+              args
+            );
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (msg.includes("dimensions")) return;
+            throw err;
+          }
+        };
+        (wrapped as { __managetPatched?: boolean }).__managetPatched = true;
+        target._innerRefresh = wrapped;
+      };
       try {
         const internal = term as unknown as {
-          _core?: {
-            viewport?: { _innerRefresh?: () => unknown };
-            _viewport?: { _innerRefresh?: () => unknown };
-          };
+          _core?: Record<string, { _innerRefresh?: () => unknown } | undefined>;
         };
-        const viewport =
-          internal._core?.viewport ?? internal._core?._viewport;
-        if (viewport && typeof viewport._innerRefresh === "function") {
-          const original = viewport._innerRefresh.bind(viewport);
-          viewport._innerRefresh = function patchedInnerRefresh() {
-            try {
-              return original();
-            } catch (err) {
-              const msg =
-                err instanceof Error ? err.message : String(err);
-              if (msg.includes("dimensions")) return;
-              throw err;
-            }
-          };
+        const candidates = [
+          internal._core?.viewport,
+          internal._core?._viewport,
+          internal._core?.viewportElement,
+        ].filter(Boolean) as { _innerRefresh?: () => unknown }[];
+        for (const c of candidates) {
+          wrapInnerRefresh(c);
+          // Patch the prototype too so any future instance inherits.
+          const proto = Object.getPrototypeOf(c) as {
+            _innerRefresh?: () => unknown;
+          } | null;
+          if (proto) wrapInnerRefresh(proto);
         }
       } catch {
         /* best-effort patch — silently skip if internals moved */
