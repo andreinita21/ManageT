@@ -15,11 +15,12 @@
  * during local development. Static imports go through the bundler's regular
  * import-of-CJS path which always exposes the named exports correctly.
  */
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Terminal } from "xterm";
 import { FitAddon } from "xterm-addon-fit";
 import { WebLinksAddon } from "xterm-addon-web-links";
 import "xterm/css/xterm.css";
+import { useAppearance } from "@/lib/themes/provider";
 
 interface TerminalPaneProps {
   serverId: string;
@@ -30,30 +31,6 @@ interface TerminalPaneProps {
   onSessionReady?: (sessionId: string) => void;
 }
 
-const THEME = {
-  background: "#0d0d14",
-  foreground: "#e4e4e7",
-  cursor: "#a855f7",
-  cursorAccent: "#0d0d14",
-  selectionBackground: "rgba(168, 85, 247, 0.3)",
-  black: "#27272a",
-  red: "#ef4444",
-  green: "#22c55e",
-  yellow: "#eab308",
-  blue: "#3b82f6",
-  magenta: "#a855f7",
-  cyan: "#06b6d4",
-  white: "#e4e4e7",
-  brightBlack: "#71717a",
-  brightRed: "#f87171",
-  brightGreen: "#4ade80",
-  brightYellow: "#facc15",
-  brightBlue: "#60a5fa",
-  brightMagenta: "#c084fc",
-  brightCyan: "#22d3ee",
-  brightWhite: "#ffffff",
-};
-
 export default function TerminalPaneInner({
   serverId,
   sessionId: initialSessionId,
@@ -61,6 +38,43 @@ export default function TerminalPaneInner({
   onSessionReady,
 }: TerminalPaneProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  // Appearance (theme + font) is shared via context so user preference
+  // changes in Settings propagate live. We capture the live values via
+  // refs so the long-lived useEffect closure always reads the latest
+  // ones without needing to be re-run when prefs change.
+  const appearance = useAppearance();
+  const termRef = useRef<Terminal | null>(null);
+  const termThemeRef = useRef(appearance.colors.terminal);
+  const fontFamilyRef = useRef(appearance.prefs.terminalFontFamily);
+  const fontSizeRef = useRef(appearance.prefs.terminalFontSize);
+  termThemeRef.current = appearance.colors.terminal;
+  fontFamilyRef.current = appearance.prefs.terminalFontFamily;
+  fontSizeRef.current = appearance.prefs.terminalFontSize;
+  // Container background mirrors the terminal palette so the small
+  // padding strip around the canvas matches the active theme instead
+  // of staying on the launch purple.
+  const containerStyle = useMemo(
+    () => ({ backgroundColor: appearance.colors.terminal.background, padding: "4px" }),
+    [appearance.colors.terminal.background]
+  );
+
+  // Live-apply theme + font changes to the running xterm instance so
+  // the user gets immediate feedback without tearing the WS down.
+  useEffect(() => {
+    const t = termRef.current;
+    if (!t) return;
+    try {
+      t.options.theme = appearance.colors.terminal;
+      t.options.fontFamily = `'${appearance.prefs.terminalFontFamily}', monospace`;
+      t.options.fontSize = appearance.prefs.terminalFontSize;
+    } catch {
+      /* if options aren't writable on this xterm version, ignore */
+    }
+  }, [
+    appearance.colors.terminal,
+    appearance.prefs.terminalFontFamily,
+    appearance.prefs.terminalFontSize,
+  ]);
   const [status, setStatus] = useState<
     "connecting" | "connected" | "reconnecting" | "disconnected" | "error" | "lost"
   >("connecting");
@@ -133,15 +147,16 @@ export default function TerminalPaneInner({
 
     try {
       term = new Terminal({
-        theme: THEME,
-        fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
-        fontSize: 14,
+        theme: termThemeRef.current,
+        fontFamily: `'${fontFamilyRef.current}', monospace`,
+        fontSize: fontSizeRef.current,
         lineHeight: 1.2,
         cursorBlink: true,
         cursorStyle: "bar",
         scrollback: 10000,
         allowProposedApi: true,
       });
+      termRef.current = term;
       fit = new FitAddon();
       term.loadAddon(fit);
       term.loadAddon(new WebLinksAddon());
@@ -367,6 +382,7 @@ export default function TerminalPaneInner({
       observer?.disconnect();
       ws?.close();
       term?.dispose();
+      termRef.current = null;
     };
     // We intentionally depend on serverId + the *frozen-at-mount*
     // session id (via useState above). The prop `initialSessionId` is
@@ -385,7 +401,7 @@ export default function TerminalPaneInner({
       <div
         ref={containerRef}
         className="absolute inset-0"
-        style={{ backgroundColor: "#0d0d14", padding: "4px" }}
+        style={containerStyle}
       />
 
       {/* Status pill — only shown when not connected. All transient

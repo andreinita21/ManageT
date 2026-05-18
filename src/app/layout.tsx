@@ -4,6 +4,7 @@ import "./globals.css";
 import { SidebarLayout } from "@/components/SidebarLayout";
 import { ToastProvider } from "@/components/ui/Toast";
 import { SessionProvider } from "@/components/SessionProvider";
+import { ThemeProvider } from "@/lib/themes/provider";
 
 const inter = Inter({
   variable: "--font-inter",
@@ -32,9 +33,11 @@ export default function RootLayout({
     >
       <body className="min-h-full bg-mg-bg text-mg-text font-sans">
         <SessionProvider>
-          <ToastProvider>
-            <SidebarLayout>{children}</SidebarLayout>
-          </ToastProvider>
+          <ThemeProvider>
+            <ToastProvider>
+              <SidebarLayout>{children}</SidebarLayout>
+            </ToastProvider>
+          </ThemeProvider>
         </SessionProvider>
       </body>
     </html>

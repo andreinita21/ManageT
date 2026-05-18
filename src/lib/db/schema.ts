@@ -190,6 +190,30 @@ export const stackServices = sqliteTable("stack_services", {
   orderIndex: integer("order_index").notNull().default(0),
 });
 
+/**
+ * Per-user appearance preferences. One row per user; absent row means
+ * "all defaults" (the legacy purple theme + JetBrains Mono 14px).
+ *
+ *  - `themeKey` selects a preset or "custom" — the canonical list lives
+ *    in src/lib/themes/presets.ts.
+ *  - `customTheme` is a JSON-serialised ThemeColors payload, used when
+ *    themeKey === "custom"; ignored otherwise.
+ *  - Font settings apply to the terminal only (xterm config). The rest
+ *    of the UI uses the inter/jetbrains pair from globals.css.
+ */
+export const userPreferences = sqliteTable("user_preferences", {
+  userId: text("user_id")
+    .primaryKey()
+    .references(() => users.id, { onDelete: "cascade" }),
+  themeKey: text("theme_key").notNull().default("mg-default"),
+  terminalFontFamily: text("terminal_font_family")
+    .notNull()
+    .default("JetBrains Mono"),
+  terminalFontSize: integer("terminal_font_size").notNull().default(14),
+  customTheme: text("custom_theme"),
+  updatedAt: integer("updated_at").notNull(),
+});
+
 export const alerts = sqliteTable("alerts", {
   id: text("id").primaryKey(),
   serverId: text("server_id")

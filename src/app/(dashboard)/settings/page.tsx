@@ -11,6 +11,7 @@ import { Tabs } from "@/components/ui/Tabs";
 import { Table } from "@/components/ui/Table";
 import { Badge } from "@/components/ui/Badge";
 import { useToast } from "@/components/ui/Toast";
+import { AppearanceTab } from "@/components/settings/AppearanceTab";
 import type { RestartRule, CreateRestartRuleRequest, TestRestartRuleResponse } from "@/types";
 
 export default function SettingsPage() {
@@ -139,11 +140,14 @@ export default function SettingsPage() {
         tabs={[
           { id: "rules", label: "Restart Rules", count: rules?.length ?? 0 },
           { id: "test", label: "Test Command" },
+          { id: "appearance", label: "Appearance" },
           { id: "profile", label: "Profile" },
         ]}
         activeTab={activeTab}
         onChange={setActiveTab}
       />
+
+      {activeTab === "appearance" && <AppearanceTab />}
 
       {/* Restart Rules Tab */}
       {activeTab === "rules" && (
