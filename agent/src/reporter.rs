@@ -73,7 +73,12 @@ pub async fn run_loop() -> Result<()> {
             _ = sleep(Duration::from_secs(cfg.heartbeat_interval_secs)) => {}
         }
 
-        let snapshot = tokio::task::spawn_blocking(collector::collect)
+        // Snapshot the live PID list on the async side, then move it into
+        // the blocking collector. The collector returns once it's measured
+        // a CPU delta (~250ms), so there's no point holding a longer view
+        // of the session table across the sleep.
+        let session_pids = session_manager.live_root_pids();
+        let snapshot = tokio::task::spawn_blocking(move || collector::collect(&session_pids))
             .await
             .context("collector task panicked")?;
 

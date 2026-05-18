@@ -8,7 +8,7 @@ import { auth } from "@/lib/auth";
 import { launchStack } from "@/lib/stacks";
 
 export async function POST(
-  _request: Request,
+  request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const session = await auth();
@@ -16,8 +16,13 @@ export async function POST(
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
   const { id } = await params;
+  // ?missingOnly=1 — used by the "Launch missing" UI on a partially-running
+  // stack so we don't double-launch services that already have an active
+  // session. Default false preserves the original behavior.
+  const url = new URL(request.url);
+  const missingOnly = url.searchParams.get("missingOnly") === "1";
   try {
-    const result = await launchStack(id);
+    const result = await launchStack(id, { missingOnly });
     const status = result.failed.length === 0 ? 200 : 207;
     return NextResponse.json({ data: result }, { status });
   } catch (err) {

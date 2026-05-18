@@ -7,6 +7,7 @@ import type {
   Session,
   RestartRule,
   Stack,
+  StackRuntime,
   CreateServerRequest,
   CreateRestartRuleRequest,
   CreateStackRequest,
@@ -245,6 +246,51 @@ export function useStack(id: string) {
   return useFetch<Stack>(`/stacks/${id}`);
 }
 
+/**
+ * Live runtime view across all non-trash stacks. Polled on an interval so
+ * the running/idle pill, button states, and per-service CPU/RAM in the
+ * expanded row stay current without a page refresh. Lookup is by stack id.
+ */
+export function useStackRuntimes(intervalMs = 10000) {
+  const [data, setData] = useState<Record<string, StackRuntime>>({});
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const tick = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/stacks/runtime`);
+      if (res.status === 401) {
+        setError("Unauthorized");
+        return;
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      const list = (json.data ?? []) as StackRuntime[];
+      const map: Record<string, StackRuntime> = {};
+      for (const r of list) map[r.stackId] = r;
+      setData(map);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Fetch failed");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void tick();
+    timerRef.current = setInterval(() => {
+      void tick();
+    }, intervalMs);
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, [tick, intervalMs]);
+
+  return { data, loading, error, refetch: tick };
+}
+
 export async function createStack(data: CreateStackRequest): Promise<Stack> {
   const res = await fetch(`${API_BASE}/stacks`, {
     method: "POST",
@@ -305,8 +351,14 @@ export async function restoreStack(id: string): Promise<Stack> {
   return (json.data ?? json) as Stack;
 }
 
-export async function launchStack(id: string): Promise<LaunchStackResponse> {
-  const res = await fetch(`${API_BASE}/stacks/${id}/launch`, { method: "POST" });
+export async function launchStack(
+  id: string,
+  opts: { missingOnly?: boolean } = {}
+): Promise<LaunchStackResponse> {
+  const qs = opts.missingOnly ? "?missingOnly=1" : "";
+  const res = await fetch(`${API_BASE}/stacks/${id}/launch${qs}`, {
+    method: "POST",
+  });
   handleUnauthorized(res);
   // 207 = partial — some services failed. We return the body either way.
   const json = await res.json();

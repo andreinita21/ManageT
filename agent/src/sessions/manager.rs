@@ -70,6 +70,12 @@ pub struct Session {
 
     /// `false` once the shell has exited (`waitpid` returned).
     pub running: AtomicBool,
+
+    /// PID of the shell process that backs this session's PTY, captured at
+    /// spawn. `None` only if the platform's `Child::process_id()` returned
+    /// `None` (rare). The collector walks descendants from this root each
+    /// heartbeat to attribute CPU/RSS to the session.
+    pub root_pid: Option<u32>,
 }
 
 impl Session {
@@ -135,6 +141,18 @@ impl SessionManager {
         let mut v: Vec<_> = s.values().map(|sess| sess.info()).collect();
         v.sort_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms));
         v
+    }
+
+    /// `(session_id, root_pid)` for every session whose shell is still
+    /// running and whose PID is known. Used by the collector to attribute
+    /// per-session CPU/RAM. Excludes dead sessions so we don't waste the
+    /// process-tree walk on sessions that have already exited.
+    pub fn live_root_pids(&self) -> Vec<(String, u32)> {
+        let s = self.sessions.lock().unwrap();
+        s.values()
+            .filter(|sess| sess.running.load(Ordering::SeqCst))
+            .filter_map(|sess| sess.root_pid.map(|pid| (sess.id.clone(), pid)))
+            .collect()
     }
 
     #[allow(dead_code)]
@@ -251,6 +269,10 @@ impl SessionManager {
         drop(pair.slave);
 
         let kill_handle: Box<dyn ChildKiller + Send> = child.clone_killer();
+        // Capture the shell's PID before `child` gets moved into the waiter
+        // task below — once moved we lose the handle. The collector uses
+        // this as the root of the per-session process tree.
+        let root_pid = child.process_id();
 
         let (output_tx, _) = broadcast::channel::<Bytes>(OUTPUT_CHAN_CAP);
         let (input_tx, mut input_rx) = mpsc::channel::<Bytes>(INPUT_CHAN_CAP);
@@ -268,6 +290,7 @@ impl SessionManager {
             kill_handle: Mutex::new(Some(kill_handle)),
             attached: AtomicUsize::new(0),
             running: AtomicBool::new(true),
+            root_pid,
         });
 
         // Reader: blocking read on master, fan out to subscribers + scrollback.

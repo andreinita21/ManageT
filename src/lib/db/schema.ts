@@ -89,6 +89,14 @@ export const sessions = sqliteTable("sessions", {
     .default("ask"),
   disconnectedAt: integer("disconnected_at"),
   retryCount: integer("retry_count").notNull().default(0),
+  // ---- Per-session live resource stats ----
+  // Reported by the agent on every heartbeat for sessions whose root PID
+  // it owns. NULL means "agent didn't report" (older agent, session not
+  // owned by this agent, or shell already exited). All three are written
+  // together; statsUpdatedAt drives the "stale" indicator in the UI.
+  cpuPercent: real("cpu_percent"),
+  memoryMb: integer("memory_mb"),
+  statsUpdatedAt: integer("stats_updated_at"),
   // When set, this session was launched as part of a stack and the column
   // points at the row in `stacks` so we can group / co-kill them.
   stackId: text("stack_id").references(() => stacks.id, { onDelete: "set null" }),

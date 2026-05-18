@@ -146,6 +146,41 @@ export interface UpdateStackRequest {
   services?: CreateStackServiceInput[];
 }
 
+/**
+ * Aggregate state of a stack across all of its services. Derived from the
+ * `sessions` table — see `getStackRuntime` in `src/lib/stacks/index.ts`.
+ *
+ *   - `idle`     — zero services have an active session.
+ *   - `partial`  — some services are active, some are not.
+ *   - `running`  — every service in the stack has an active session.
+ */
+export type StackRunState = "idle" | "partial" | "running";
+
+export interface StackServiceRuntime {
+  serviceId: string;
+  serverId: string;
+  /** id of the agent session backing this service, or null when none. */
+  sessionId: string | null;
+  /** "active" if a session row exists with status='active'; "inactive" otherwise. */
+  status: "active" | "inactive";
+  /** Live CPU% from the agent (sum across the process tree). null if the
+   *  agent hasn't reported stats yet (older agent or no live PID). */
+  cpuPercent: number | null;
+  memoryMb: number | null;
+  /** Milliseconds since the last stats update. null when never reported. */
+  statsAgeMs: number | null;
+  /** Number of processes summed for this service (root + descendants). */
+  pidCount: number | null;
+}
+
+export interface StackRuntime {
+  stackId: string;
+  state: StackRunState;
+  activeCount: number;
+  totalCount: number;
+  services: StackServiceRuntime[];
+}
+
 export interface LaunchStackResponse {
   stackId: string;
   launched: Array<{

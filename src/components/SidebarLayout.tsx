@@ -165,7 +165,15 @@ export function SidebarLayout({ children }: { children: React.ReactNode }) {
         </header>
 
         {/* Page content */}
-        <main className={`flex-1 overflow-auto ${pathname.startsWith("/terminal") ? "" : "p-6"}`}>
+        {/* /stacks owns its own padding because it can split into a table +
+            terminal layout that needs to fill the full content height. */}
+        <main
+          className={`flex-1 overflow-auto ${
+            pathname.startsWith("/terminal") || pathname.startsWith("/stacks")
+              ? ""
+              : "p-6"
+          }`}
+        >
           {children}
         </main>
       </div>

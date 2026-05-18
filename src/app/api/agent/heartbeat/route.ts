@@ -16,12 +16,19 @@ import { z } from "zod";
 import { eq } from "drizzle-orm";
 
 import { db } from "@/lib/db";
-import { metricSnapshots, servers } from "@/lib/db/schema";
+import { metricSnapshots, servers, sessions } from "@/lib/db/schema";
 import { authenticateAgent } from "@/lib/agent/auth";
 import { snapshotEvents } from "@/lib/monitor/snapshot-events";
 import type { MetricSnapshot } from "@/types";
 
 // Matches the JSON the Rust agent emits (src/collector.rs).
+const sessionStatsSchema = z.object({
+  sessionId: z.string().min(1),
+  cpuPercent: z.number().nonnegative(),
+  memoryMb: z.number().int().nonnegative(),
+  pidCount: z.number().int().nonnegative().optional(),
+});
+
 const heartbeatSchema = z.object({
   cpuPercent: z.number().nullable().optional(),
   memoryUsedMb: z.number().int().nonnegative().nullable().optional(),
@@ -33,6 +40,8 @@ const heartbeatSchema = z.object({
   uptimeSecs: z.number().int().nonnegative().optional(),
   agentVersion: z.string().optional(),
   hostname: z.string().optional(),
+  // Per-session resource stats — agents on v0.2.0+. Older agents omit it.
+  sessions: z.array(sessionStatsSchema).optional(),
 });
 
 export async function POST(request: Request) {
@@ -97,6 +106,11 @@ export async function POST(request: Request) {
   // directive — but we do NOT flip agent_status to "healthy" in that case.
   const wasPendingUninstall = server.pendingUninstall === 1;
   if (!wasPendingUninstall) {
+    // Healthy heartbeat — also wipe any leftover install_error /
+    // install_stage from a prior failed attempt. Without this, the detail
+    // view keeps surfacing a stale red banner forever (e.g. an old
+    // launchctl bootstrap error from a previous install) even though the
+    // agent is currently fine.
     await db
       .update(servers)
       .set({
@@ -104,6 +118,8 @@ export async function POST(request: Request) {
         status: "connected",
         agentLastHeartbeatAt: now,
         agentVersion: snap.agentVersion ?? server.agentVersion ?? null,
+        agentInstallError: null,
+        agentInstallStage: null,
         lastConnectedAt: now,
         updatedAt: now,
       })
@@ -115,6 +131,23 @@ export async function POST(request: Request) {
       .update(servers)
       .set({ agentLastHeartbeatAt: now, updatedAt: now })
       .where(eq(servers.id, server.id));
+  }
+
+  // Upsert per-session stats. We only update existing rows — the agent
+  // only knows about its own running PIDs, and dashboard-side rows for
+  // closed sessions should not be revived. Each row update is bounded
+  // by the number of *live* sessions on this server, which is small.
+  if (snap.sessions && snap.sessions.length > 0) {
+    for (const s of snap.sessions) {
+      await db
+        .update(sessions)
+        .set({
+          cpuPercent: s.cpuPercent,
+          memoryMb: s.memoryMb,
+          statsUpdatedAt: now,
+        })
+        .where(eq(sessions.id, s.sessionId));
+    }
   }
 
   return NextResponse.json({
