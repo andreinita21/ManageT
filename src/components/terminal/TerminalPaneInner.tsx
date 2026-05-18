@@ -236,13 +236,17 @@ export default function TerminalPaneInner({
         }
       };
 
-      ws.onerror = (e) => {
-        // After unmount the component is torn down and any error event
-        // is part of the cleanup — logging it as a Next.js dev console
-        // error is noise (the event object is empty `{}` anyway).
-        if (!mounted) return;
-        console.error("[TerminalPane] WebSocket error", e);
-        setStatus("error");
+      ws.onerror = () => {
+        // No-op by design. The browser's WebSocket 'error' event carries
+        // no diagnostic payload — it stringifies as `{}`, which makes
+        // it useless to log and noisy in the Next.js dev overlay. The
+        // close event that follows has the real close code/reason and
+        // is handled by ws.onclose, which already sets status and
+        // schedules a reconnect. The most common source of this event
+        // is React StrictMode's mount/unmount/mount cycle in dev: the
+        // first mount opens a WebSocket, cleanup immediately aborts it
+        // while still CONNECTING, and the browser raises this empty
+        // error event. None of it is actionable.
       };
 
       ws.onclose = () => {
