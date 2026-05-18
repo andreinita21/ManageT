@@ -96,21 +96,29 @@ export async function getStack(stackId: string): Promise<Stack | null> {
 }
 
 /**
- * Launch every service in a stack in parallel. Each service becomes a new
- * agent session on its target server, with the command (if any) executed
- * inside the new shell. Failures are isolated — one server being down
- * doesn't block the others.
+ * Launch every service in a stack. Idempotent by default: if a service
+ * already has an active session (matched by `stackId` + `serverId` +
+ * `sessionName`, same predicate as `getStackRuntime`), Launch reuses that
+ * session id instead of forking a new PTY. This preserves the existing
+ * terminal scrollback and avoids orphaning a still-running agent process
+ * behind the UI.
  *
- * When `missingOnly` is true, services that already have an active session
- * (matched by `serverId` + service name) are skipped — used by the
- * "Launch missing" path on a partially-running stack so we don't fork
- * duplicates.
+ * Failure isolation: each missing service is created in parallel via
+ * `Promise.allSettled` — one server being down doesn't block the others.
+ *
+ * Options:
+ *   - `force`: for each service, if an active session is found, kill it
+ *     first and then create a fresh one. The explicit "really respawn"
+ *     path.
+ *   - `missingOnly`: legacy flag kept for API compatibility. Under the new
+ *     idempotent default it's a no-op (the default already skips
+ *     already-active services), but old clients passing it still work.
  *
  * Returns per-service success/failure so the UI can show partial results.
  */
 export async function launchStack(
   stackId: string,
-  opts: { missingOnly?: boolean } = {}
+  opts: { missingOnly?: boolean; force?: boolean } = {}
 ): Promise<LaunchStackResponse> {
   const stack = await getStack(stackId);
   if (!stack) {
@@ -122,19 +130,73 @@ export async function launchStack(
     );
   }
 
-  let toLaunch: StackService[] = stack.services;
-  if (opts.missingOnly) {
-    const runtime = await getStackRuntime(stackId);
-    const activeServiceIds = new Set(
-      runtime.services.filter((s) => s.status === "active").map((s) => s.serviceId)
-    );
-    toLaunch = stack.services.filter((svc) => !activeServiceIds.has(svc.id));
+  // Pull the existing active sessions for this stack once, then index by
+  // (serverId, sessionName) — the same key `getStackRuntime` uses. Keep
+  // the freshest row per key so we agree with what the UI is showing.
+  const existingRows = await db
+    .select()
+    .from(sessions)
+    .where(eq(sessions.stackId, stackId));
+  type SessRow = (typeof existingRows)[number];
+  const activeByKey = new Map<string, SessRow>();
+  for (const s of existingRows) {
+    if (s.status !== "active") continue;
+    const key = `${s.serverId}::${s.sessionName}`;
+    const existing = activeByKey.get(key);
+    if (!existing || s.updatedAt > existing.updatedAt) {
+      activeByKey.set(key, s);
+    }
   }
 
   const launched: LaunchStackResponse["launched"] = [];
   const failed: LaunchStackResponse["failed"] = [];
 
-  if (toLaunch.length === 0) {
+  // Partition services: those with a reusable active session (default
+  // idempotent path) vs. those we need to create. `force` short-circuits
+  // reuse and kills first.
+  const reusable: { svc: StackService; row: SessRow }[] = [];
+  const toCreate: StackService[] = [];
+  const toKillThenCreate: { svc: StackService; row: SessRow }[] = [];
+
+  for (const svc of stack.services) {
+    const key = `${svc.serverId}::${svc.name}`;
+    const row = activeByKey.get(key);
+    if (!row) {
+      toCreate.push(svc);
+    } else if (opts.force) {
+      toKillThenCreate.push({ svc, row });
+    } else {
+      reusable.push({ svc, row });
+    }
+  }
+
+  // Reuse path — no agent round-trip, just report the existing ids.
+  for (const { svc, row } of reusable) {
+    launched.push({
+      serviceId: svc.id,
+      sessionId: row.id,
+      serverId: svc.serverId,
+      sessionName: row.sessionName,
+    });
+  }
+
+  // Force path — kill the existing row first, then fall through to create.
+  if (toKillThenCreate.length > 0) {
+    await Promise.allSettled(
+      toKillThenCreate.map(({ row }) =>
+        killSession(row.serverId, row.id).catch((err) => {
+          console.warn(
+            `[stacks] force-launch killSession ${row.id} failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          );
+        })
+      )
+    );
+    for (const { svc } of toKillThenCreate) toCreate.push(svc);
+  }
+
+  if (toCreate.length === 0) {
     return { stackId: stack.id, launched, failed };
   }
 
@@ -142,7 +204,7 @@ export async function launchStack(
   // there's no contention. allSettled because we want the slowest one
   // not to block reporting the others.
   const results = await Promise.allSettled(
-    toLaunch.map((svc) =>
+    toCreate.map((svc) =>
       createSession(svc.serverId, {
         name: svc.name,
         command: svc.command,
@@ -153,7 +215,7 @@ export async function launchStack(
 
   for (let i = 0; i < results.length; i += 1) {
     const r = results[i];
-    const svc = toLaunch[i];
+    const svc = toCreate[i];
     if (r.status === "fulfilled") {
       launched.push({
         serviceId: svc.id,
@@ -170,6 +232,11 @@ export async function launchStack(
       });
     }
   }
+
+  // `missingOnly` is intentionally ignored under the idempotent default;
+  // the default already skips already-active services. Keeping the option
+  // in the signature preserves API compatibility for old callers.
+  void opts.missingOnly;
 
   return {
     stackId: stack.id,

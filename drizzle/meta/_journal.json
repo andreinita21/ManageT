@@ -36,6 +36,13 @@
       "when": 1778223469393,
       "tag": "0004_regular_namorita",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1779130009239,
+      "tag": "0005_calm_invaders",
+      "breakpoints": true
     }
   ]
 }

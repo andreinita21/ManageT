@@ -12,7 +12,7 @@
  * running)" → live-attached automatically when you Launch the stack on
  * the other tab.
  */
-import React, { use, useMemo } from "react";
+import React, { use, useEffect, useMemo, useRef } from "react";
 import Link from "next/link";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 
@@ -138,6 +138,26 @@ function TerminalPanel({
 }) {
   const isActive = runtime?.status === "active" && runtime.sessionId !== null;
 
+  // Sticky session id: once we've seen a live sessionId for this service,
+  // keep the TerminalPane mounted on that id even if the next runtime poll
+  // briefly shows "inactive" (network blip, agent heartbeat lag). The
+  // agent keeps the PTY + scrollback alive regardless of our DB row's
+  // current status, so an unnecessary unmount throws away the in-xterm
+  // scrollback buffer and forces a re-attach (with another scrollback
+  // replay) which the user perceives as the terminal "blinking" and
+  // forgetting state. We only swap the pinned id when runtime hands us a
+  // genuinely different sessionId — that's the "session was respawned"
+  // case where a fresh xterm is correct.
+  const pinnedSessionIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (runtime?.sessionId && runtime.sessionId !== pinnedSessionIdRef.current) {
+      pinnedSessionIdRef.current = runtime.sessionId;
+    }
+  }, [runtime?.sessionId]);
+  const effectiveSessionId =
+    runtime?.sessionId ?? pinnedSessionIdRef.current ?? null;
+  const showTerminal = effectiveSessionId !== null;
+
   return (
     <div className="h-full flex flex-col bg-[#0d0d14]">
       <div className="flex items-center justify-between px-3 py-1.5 border-b border-mg-border bg-mg-bg-secondary flex-shrink-0 text-xs">
@@ -160,11 +180,11 @@ function TerminalPanel({
         )}
       </div>
       <div className="flex-1 min-h-0">
-        {isActive && runtime?.sessionId ? (
+        {showTerminal && effectiveSessionId ? (
           <TerminalPane
-            key={runtime.sessionId}
+            key={effectiveSessionId}
             serverId={svc.serverId}
-            sessionId={runtime.sessionId}
+            sessionId={effectiveSessionId}
             className="h-full"
           />
         ) : (

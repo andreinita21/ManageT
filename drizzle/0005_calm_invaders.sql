@@ -1,0 +1,1 @@
+CREATE INDEX `metric_snapshots_server_captured_idx` ON `metric_snapshots` (`server_id`,`captured_at`);

@@ -36,8 +36,19 @@ interface FetchState<T> {
 }
 
 function useFetch<T>(url: string): FetchState<T> {
-  const [data, setData] = useState<T | null>(null);
-  const [loading, setLoading] = useState(true);
+  return useFetchWithInitial<T>(url, null);
+}
+
+/**
+ * Variant of useFetch that accepts a seed value (typically passed from a
+ * server component) so the first render already has data and the empty
+ * state never flashes. The hook still kicks off a background refetch to
+ * keep things live, but `data` only flips to `null` again on hard error.
+ */
+export function useFetchWithInitial<T>(url: string, initial: T | null): FetchState<T> {
+  const [data, setData] = useState<T | null>(initial);
+  // Skip the loading skeleton when we already have data from SSR.
+  const [loading, setLoading] = useState(initial === null);
   const [error, setError] = useState<string | null>(null);
 
   const fetchData = useCallback(async () => {
@@ -76,12 +87,15 @@ export function useServers() {
   return useFetch<Server[]>("/servers");
 }
 
-export function useServer(id: string) {
-  return useFetch<Server>(`/servers/${id}`);
+export function useServer(id: string, initial: Server | null = null) {
+  return useFetchWithInitial<Server>(`/servers/${id}`, initial);
 }
 
-export function useServerMetrics(serverId: string) {
-  return useFetch<MetricSnapshot[]>(`/servers/${serverId}/metrics`);
+export function useServerMetrics(
+  serverId: string,
+  initial: MetricSnapshot[] | null = null
+) {
+  return useFetchWithInitial<MetricSnapshot[]>(`/servers/${serverId}/metrics`, initial);
 }
 
 export interface LatestMetricsEntry {
@@ -180,9 +194,9 @@ export async function retryAgentInstall(id: string): Promise<void> {
 
 // --- Session hooks ---
 
-export function useSessions(serverId?: string) {
+export function useSessions(serverId?: string, initial: Session[] | null = null) {
   const url = serverId ? `/sessions?serverId=${serverId}` : "/sessions";
-  return useFetch<Session[]>(url);
+  return useFetchWithInitial<Session[]>(url, initial);
 }
 
 export async function deleteSession(id: string): Promise<void> {

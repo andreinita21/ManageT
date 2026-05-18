@@ -64,6 +64,11 @@ pub async fn run_new(name: Option<String>, command: Option<String>) -> Result<()
         command,
         rows: Some(rows),
         cols: Some(cols),
+        // Local `managet new` keeps the legacy behaviour: spawn as
+        // whatever user the agent is running as (root on installed
+        // hosts). The dashboard-side path supplies a real user via the
+        // session:create flow.
+        user: None,
     })
     .await?;
     match resp {

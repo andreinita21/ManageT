@@ -35,7 +35,7 @@ use tracing::{debug, info};
 use super::protocol::SessionInfo;
 
 /// Hold the most recent N bytes of output for replay on attach.
-const SCROLLBACK_BYTES: usize = 64 * 1024;
+const SCROLLBACK_BYTES: usize = 4 * 1024 * 1024;
 /// Backpressure on the live broadcast channel before we start dropping.
 const OUTPUT_CHAN_CAP: usize = 256;
 /// Backpressure on the per-session input channel.
@@ -205,6 +205,7 @@ impl SessionManager {
         command: Option<String>,
         rows: u16,
         cols: u16,
+        user: Option<String>,
     ) -> Result<Arc<Session>> {
         let id = uuid::Uuid::new_v4().to_string();
         let name = name.unwrap_or_else(|| format!("session-{}", &id[..8]));
@@ -218,6 +219,23 @@ impl SessionManager {
                 pixel_height: 0,
             })
             .context("openpty")?;
+
+        // If a target user was requested, validate it exists on the host
+        // *before* spawning anything. `nix::unistd::User::from_name`
+        // wraps getpwnam(3); `Ok(None)` means "no such user". Returning
+        // an error here gives the dashboard a clean failure message
+        // instead of silently falling back to a root shell.
+        let resolved_user: Option<nix::unistd::User> = match user.as_deref() {
+            Some(name) => {
+                let entry = nix::unistd::User::from_name(name)
+                    .with_context(|| format!("looking up user '{name}'"))?;
+                let entry = entry.ok_or_else(|| {
+                    anyhow::anyhow!("user '{name}' does not exist on this host")
+                })?;
+                Some(entry)
+            }
+            None => None,
+        };
 
         // Build the command. Three cases we need to support cleanly:
         //   - No `command` given → just spawn a login shell. Browser
@@ -235,23 +253,84 @@ impl SessionManager {
         // -c` when present. Even simple commands work fine wrapped, and
         // we get aliases/$PATH/builtins for free. Costs one extra fork
         // per session, which is negligible.
+        //
+        // User switching: portable-pty's `CommandBuilder` doesn't expose
+        // any `pre_exec`/uid hook, so we can't `setuid()` ourselves
+        // between fork and exec. Instead we exec `su -l <user> [-c ...]`,
+        // which (when invoked as root) does the UID/GID drop + login
+        // environment setup for us. `-l` makes it a login shell that
+        // sources .bash_profile/.profile, sets HOME/USER/LOGNAME/SHELL,
+        // and starts in $HOME. This avoids the previous behaviour where
+        // every Mac PTY came up as `sh-3.2#` because root had no
+        // configured login shell.
         let shell = default_shell();
         let command_label = command.clone().unwrap_or_else(|| shell.clone());
-        let mut cmd = if let Some(cmd_str) = command {
-            // `<shell> -c "<cmd_str>; exec <shell>"` — run the command,
-            // then drop into an interactive shell so the user can keep
-            // working after the process exits (or debug a crash). For
-            // stack services where the user wants the session to follow
-            // the process, they can use `managet kill <name>` to end it.
-            let chained = format!("{}; exec {}", cmd_str, shell);
-            let mut c = CommandBuilder::new(&shell);
-            c.arg("-c");
-            c.arg(chained);
-            c
-        } else {
-            CommandBuilder::new(&shell)
+        let mut cmd = match (resolved_user.as_ref(), command.as_deref()) {
+            (Some(u), Some(cmd_str)) => {
+                // Run the user-supplied command as the target user, then
+                // drop into their login shell so the session stays alive
+                // after the command exits.
+                let user_shell = if u.shell.as_os_str().is_empty() {
+                    "/bin/sh".to_string()
+                } else {
+                    u.shell.to_string_lossy().into_owned()
+                };
+                let chained = format!("{}; exec {} -l", cmd_str, user_shell);
+                let mut c = CommandBuilder::new("su");
+                c.arg("-l");
+                c.arg(&u.name);
+                c.arg("-c");
+                c.arg(chained);
+                c
+            }
+            (Some(u), None) => {
+                // Plain interactive login shell as the target user.
+                let mut c = CommandBuilder::new("su");
+                c.arg("-l");
+                c.arg(&u.name);
+                c
+            }
+            (None, Some(cmd_str)) => {
+                // `<shell> -c "<cmd_str>; exec <shell>"` — run the command,
+                // then drop into an interactive shell so the user can keep
+                // working after the process exits (or debug a crash). For
+                // stack services where the user wants the session to follow
+                // the process, they can use `managet kill <name>` to end it.
+                let chained = format!("{}; exec {}", cmd_str, shell);
+                let mut c = CommandBuilder::new(&shell);
+                c.arg("-c");
+                c.arg(chained);
+                c
+            }
+            (None, None) => {
+                // No user override: spawn the agent's $SHELL as a login
+                // shell so .bash_profile etc. get sourced even when the
+                // agent itself wasn't started from a login context.
+                let mut c = CommandBuilder::new(&shell);
+                c.arg("-l");
+                c
+            }
         };
-        if let Ok(home) = std::env::var("HOME") {
+
+        // Working directory + base env. When switching to a target user,
+        // `su -l` overwrites HOME/USER/LOGNAME/SHELL itself; but we set
+        // them here anyway so they're sane during the brief window before
+        // exec(), and so the cwd is the target user's $HOME rather than
+        // root's. When there's no user override, fall back to the agent's
+        // own $HOME.
+        if let Some(u) = resolved_user.as_ref() {
+            let home = u.dir.to_string_lossy().into_owned();
+            let user_shell = if u.shell.as_os_str().is_empty() {
+                "/bin/sh".to_string()
+            } else {
+                u.shell.to_string_lossy().into_owned()
+            };
+            cmd.cwd(&home);
+            cmd.env("HOME", &home);
+            cmd.env("USER", &u.name);
+            cmd.env("LOGNAME", &u.name);
+            cmd.env("SHELL", &user_shell);
+        } else if let Ok(home) = std::env::var("HOME") {
             cmd.cwd(home);
         }
         // TERM matters — without one, programs like vim/htop misbehave.
@@ -264,6 +343,20 @@ impl SessionManager {
             .slave
             .spawn_command(cmd)
             .context("spawn shell on pty slave")?;
+
+        // Force an initial WINSZ on the master. Without this some shells
+        // (notably bash with PROMPT_COMMAND/PS1 that queries the terminal
+        // shape) won't print their first prompt until SIGWINCH arrives,
+        // which used to require the user to press Enter manually after
+        // attach. We set it to the requested size so the first repaint
+        // is already at the right shape; subsequent attaches will resize
+        // again as their own terminal dimensions arrive.
+        let _ = pair.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
         // Drop the parent's copy of the slave fd so EOF on the master
         // properly propagates after the child exits.
         drop(pair.slave);

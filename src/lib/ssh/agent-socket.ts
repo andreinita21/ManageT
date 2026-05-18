@@ -42,7 +42,18 @@ const AGENT_SOCKET_PATH = "/var/run/managet/agent.sock";
 
 export type AgentRequest =
   | { op: "list" }
-  | { op: "new"; name?: string; command?: string; rows?: number; cols?: number }
+  | {
+      op: "new";
+      name?: string;
+      command?: string;
+      rows?: number;
+      cols?: number;
+      /** Optional Unix user the agent should drop privileges to before
+       *  spawning the PTY. When omitted, the shell inherits the agent's
+       *  identity (root on installed hosts) — kept for backwards compat
+       *  with the old wire format. */
+      user?: string;
+    }
   | { op: "attach"; id: string; rows?: number; cols?: number }
   | { op: "kill"; id: string }
   | { op: "resize"; id: string; rows: number; cols: number };
@@ -182,8 +193,26 @@ export interface AttachedHandle {
   sessionId: string;
   /** Friendly name reported by the agent. */
   sessionName: string;
-  /** Raw byte stream — write keystrokes in, read terminal output out. */
+  /**
+   * Raw byte stream — write keystrokes in, read terminal output out.
+   * The stream is returned in *paused* mode (no `data` listener
+   * attached). The caller is expected to flush `initialBytes` to its
+   * consumer first, then wire its own `data` listener, which will
+   * auto-resume the stream and deliver any subsequent live output.
+   */
   stream: Duplex;
+  /**
+   * Bytes that arrived in the same TCP segment as the handshake JSON —
+   * the agent writes `{"result":"attached",…}\n` and then immediately
+   * dumps the scrollback ring, so both routinely land in a single read.
+   * Those bytes are extracted here so the consumer can deliver the
+   * replay to xterm deterministically *before* it starts piping live
+   * output. Forwarding `initialBytes` after wiring the `data` listener
+   * still works (any leftover sits in the readable buffer until then),
+   * but doing it first keeps the "scrollback, then live" ordering
+   * unambiguous.
+   */
+  initialBytes: Buffer;
 }
 
 /**
@@ -215,9 +244,14 @@ export async function openAgentAttach(
     } satisfies AgentRequest) + "\n"
   );
 
-  // Read exactly one newline-delimited JSON response, then leave the rest
-  // of the buffered bytes (if any) prepended to subsequent reads.
-  const handshake = await readHandshake(stream);
+  // Read exactly one newline-delimited JSON response. Anything that
+  // arrived in the same chunk after the `\n` is the agent's scrollback
+  // replay — capture it as `initialBytes` and hand it to the caller
+  // instead of pushing it back onto the stream. (`stream.unshift()`
+  // worked in theory but had a real-world timing issue on Node 22 +
+  // ssh2's forwarded Unix sockets where the very first attach
+  // occasionally lost the replay.)
+  const { parsed: handshake, leftover } = await readHandshake(stream);
   if (handshake.result === "error") {
     try {
       stream.destroy();
@@ -241,33 +275,41 @@ export async function openAgentAttach(
     sessionId: handshake.id,
     sessionName: handshake.name,
     stream,
+    initialBytes: leftover,
   };
 }
 
 /**
  * Read until the first newline, parse the prefix as a JSON `AgentResponse`,
- * and re-prepend any leftover bytes onto the stream so the next `data`
- * event sees them. Implemented by buffering chunks until we see `\n`,
- * splitting once, and `unshift`-ing the remainder back via `pause/resume`.
+ * and return the trailing bytes (if any) verbatim. Pauses the stream after
+ * the handshake so any further bytes that arrive before the caller wires
+ * its own `data` listener stay buffered on the readable side (Node's
+ * internal buffer holds them until the next listener auto-resumes flow).
  */
-function readHandshake(stream: Duplex): Promise<AgentResponse> {
-  return new Promise<AgentResponse>((resolve, reject) => {
+function readHandshake(
+  stream: Duplex
+): Promise<{ parsed: AgentResponse; leftover: Buffer }> {
+  return new Promise<{ parsed: AgentResponse; leftover: Buffer }>((resolve, reject) => {
     const chunks: Buffer[] = [];
+    const cleanup = () => {
+      stream.removeListener("data", onData);
+      stream.removeListener("error", onError);
+      stream.removeListener("close", onClose);
+    };
     const onData = (chunk: Buffer) => {
       chunks.push(chunk);
       const joined = Buffer.concat(chunks);
       const nl = joined.indexOf(0x0a);
       if (nl === -1) return;
-      stream.removeListener("data", onData);
-      stream.removeListener("error", onError);
-      stream.removeListener("close", onClose);
+      cleanup();
+      // Pause so further chunks wait in the readable buffer for the
+      // caller's listener instead of being silently dropped.
+      stream.pause();
       const line = joined.subarray(0, nl).toString("utf-8");
-      const rest = joined.subarray(nl + 1);
-      // Push leftover bytes back onto the stream so attach output that
-      // arrived in the same TCP segment as the handshake is preserved.
-      if (rest.length > 0) {
-        stream.unshift(rest);
-      }
+      // `Buffer.from(...)` copies — `joined.subarray` would share the
+      // underlying memory with the concat buffer, which is fine in
+      // practice but easier to reason about as an independent buffer.
+      const leftover = Buffer.from(joined.subarray(nl + 1));
       let parsed: AgentResponse;
       try {
         parsed = JSON.parse(line) as AgentResponse;
@@ -276,14 +318,14 @@ function readHandshake(stream: Duplex): Promise<AgentResponse> {
         reject(new Error(`agent-socket: bad handshake JSON: ${m}: ${line}`));
         return;
       }
-      resolve(parsed);
+      resolve({ parsed, leftover });
     };
     const onError = (e: Error) => {
-      stream.removeListener("data", onData);
+      cleanup();
       reject(new Error(`agent-socket: handshake stream error: ${e.message}`));
     };
     const onClose = () => {
-      stream.removeListener("data", onData);
+      cleanup();
       reject(new Error("agent-socket: stream closed during handshake"));
     };
     stream.on("data", onData);

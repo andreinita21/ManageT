@@ -39,7 +39,7 @@ import { parse as parseUrl } from "node:url";
 import { eq } from "drizzle-orm";
 
 import { db } from "@/lib/db";
-import { sessions } from "@/lib/db/schema";
+import { servers, sessions } from "@/lib/db/schema";
 import {
   attachSession,
   createSession,
@@ -188,7 +188,25 @@ async function handleAttachLifecycle(
   };
   map.set(sessionId, state);
 
-  // Pipe agent output → browser as terminal:output messages.
+  // Flush the agent's scrollback replay first. The agent sends the
+  // `Attached` JSON line and then immediately dumps the session's
+  // scrollback ring — both usually land in the same TCP read.
+  // `openAgentAttach` already split the handshake newline off and gave
+  // us the trailing bytes as `initialBytes`. Forwarding them BEFORE we
+  // attach the live `data` listener keeps the ordering deterministic
+  // ("scrollback first, then live output") and matches what the user
+  // expects when they re-open a tab on an existing session.
+  if (handle.initialBytes.length > 0) {
+    sendJson(ws, {
+      type: "terminal:output",
+      sessionId,
+      data: handle.initialBytes.toString("utf-8"),
+    });
+  }
+
+  // Pipe live agent output → browser. Attaching the listener auto-
+  // resumes the stream (paused during handshake) so anything that
+  // arrived in between sits in the internal buffer and now flows.
   handle.stream.on("data", (chunk: Buffer) => {
     sendJson(ws, {
       type: "terminal:output",
@@ -248,9 +266,24 @@ async function handleMessage(ws: WebSocket, raw: string): Promise<void> {
   switch (msg.type) {
     case "session:create": {
       try {
+        // Resolve the configured Unix user for this server so the agent
+        // can spawn the shell as that user instead of as root. We look
+        // it up here (not in the agent) because the dashboard is the
+        // source of truth for per-server credentials — the agent only
+        // sees what the wire protocol carries. Missing row → leave
+        // `user` undefined and the agent keeps the legacy root-shell
+        // behaviour rather than failing the create.
+        const serverRows = await db
+          .select({ username: servers.username })
+          .from(servers)
+          .where(eq(servers.id, msg.serverId))
+          .limit(1);
+        const username = serverRows[0]?.username;
+
         const created = await createSession(msg.serverId, {
           command: msg.command,
           name: msg.name,
+          user: username,
         });
         // Immediately attach this WS to the new session.
         await handleAttachLifecycle(ws, msg.serverId, created.sessionId);

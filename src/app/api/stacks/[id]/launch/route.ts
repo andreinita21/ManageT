@@ -16,13 +16,20 @@ export async function POST(
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
   const { id } = await params;
-  // ?missingOnly=1 — used by the "Launch missing" UI on a partially-running
-  // stack so we don't double-launch services that already have an active
-  // session. Default false preserves the original behavior.
+  // Launch is idempotent by default — services with an active session
+  // (matched by stackId+serverId+sessionName) are reused instead of
+  // respawned, preserving terminal scrollback.
+  //
+  //  - ?missingOnly=1 — legacy flag from the "Launch missing" UI. Now a
+  //    no-op against the new default (which already behaves this way),
+  //    but accepted so old clients don't break.
+  //  - ?force=1       — opt out of reuse: kill the existing active
+  //    sessions first, then create fresh ones. Use sparingly.
   const url = new URL(request.url);
   const missingOnly = url.searchParams.get("missingOnly") === "1";
+  const force = url.searchParams.get("force") === "1";
   try {
-    const result = await launchStack(id, { missingOnly });
+    const result = await launchStack(id, { missingOnly, force });
     const status = result.failed.length === 0 ? 200 : 207;
     return NextResponse.json({ data: result }, { status });
   } catch (err) {

@@ -2,7 +2,7 @@
  * Drizzle ORM schema definitions for ManageT.
  * All tables for the application database.
  */
-import { sqliteTable, text, integer, real } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, integer, real, index } from "drizzle-orm/sqlite-core";
 
 export const users = sqliteTable("users", {
   id: text("id").primaryKey(),
@@ -135,21 +135,30 @@ export const commandHistory = sqliteTable("command_history", {
   executedAt: integer("executed_at").notNull(),
 });
 
-export const metricSnapshots = sqliteTable("metric_snapshots", {
-  id: text("id").primaryKey(),
-  serverId: text("server_id")
-    .notNull()
-    .references(() => servers.id, { onDelete: "cascade" }),
-  cpuPercent: real("cpu_percent"),
-  memoryUsedMb: integer("memory_used_mb"),
-  memoryTotalMb: integer("memory_total_mb"),
-  diskUsedPercent: real("disk_used_percent"),
-  load1m: real("load_1m"),
-  load5m: real("load_5m"),
-  load15m: real("load_15m"),
-  activeConnections: integer("active_connections"),
-  capturedAt: integer("captured_at").notNull(),
-});
+export const metricSnapshots = sqliteTable(
+  "metric_snapshots",
+  {
+    id: text("id").primaryKey(),
+    serverId: text("server_id")
+      .notNull()
+      .references(() => servers.id, { onDelete: "cascade" }),
+    cpuPercent: real("cpu_percent"),
+    memoryUsedMb: integer("memory_used_mb"),
+    memoryTotalMb: integer("memory_total_mb"),
+    diskUsedPercent: real("disk_used_percent"),
+    load1m: real("load_1m"),
+    load5m: real("load_5m"),
+    load15m: real("load_15m"),
+    activeConnections: integer("active_connections"),
+    capturedAt: integer("captured_at").notNull(),
+  },
+  (t) => [
+    // Composite index for the dashboard graph query, which filters by
+    // serverId + a captured_at range. Without it, the route does a full
+    // scan + per-row filter, which gets slow as the table grows.
+    index("metric_snapshots_server_captured_idx").on(t.serverId, t.capturedAt),
+  ]
+);
 
 export const stacks = sqliteTable("stacks", {
   id: text("id").primaryKey(),

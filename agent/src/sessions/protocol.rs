@@ -30,6 +30,15 @@ pub enum Request {
         /// Initial PTY cols. Defaults to 80 if omitted.
         #[serde(default)]
         cols: Option<u16>,
+        /// Optional Unix user name to run the shell as. When `Some(name)`,
+        /// the agent (which runs as root) drops to that user via `su -l`
+        /// so the PTY inherits a normal login environment ($HOME, $USER,
+        /// .bash_profile, etc.). When `None`, the shell inherits the
+        /// agent's identity (root, in our deployment) — preserved for
+        /// backwards compatibility with older clients that don't know
+        /// about this field.
+        #[serde(default)]
+        user: Option<String>,
     },
     /// Begin streaming a session's input/output over this connection.
     /// After the agent replies with `Response::Attached`, both sides

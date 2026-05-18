@@ -61,9 +61,10 @@ export default function TerminalPaneInner({
   onSessionReady,
 }: TerminalPaneProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [status, setStatus] = useState<"connecting" | "connected" | "disconnected" | "error">(
-    "connecting"
-  );
+  const [status, setStatus] = useState<
+    "connecting" | "connected" | "reconnecting" | "disconnected" | "error" | "lost"
+  >("connecting");
+  const [statusDetail, setStatusDetail] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   // Keep a ref to the latest callback so the main effect doesn't re-run when
@@ -102,7 +103,6 @@ export default function TerminalPaneInner({
       term.loadAddon(fit);
       term.loadAddon(new WebLinksAddon());
       term.open(container);
-      term.writeln("\x1b[1;35m● Connecting to server...\x1b[0m");
 
       // Forward keystrokes + resizes once we have a session id.
       term.onData((data) => {
@@ -125,12 +125,24 @@ export default function TerminalPaneInner({
       });
 
       // Fit after the next paint so the container has real dimensions.
-      requestAnimationFrame(() => {
-        if (mounted) {
+      // Wrapped in try/retry because xterm's Viewport can throw
+      // "dimensions undefined" if the renderer hasn't fully initialized
+      // — common under Turbopack dev mode with the legacy xterm@5
+      // package. Each retry waits one frame before trying again.
+      const tryFit = (attemptsLeft: number) => {
+        if (!mounted) return;
+        try {
           fit?.fit();
           term?.focus();
+        } catch (err) {
+          if (attemptsLeft > 0) {
+            requestAnimationFrame(() => tryFit(attemptsLeft - 1));
+          } else {
+            console.warn("[TerminalPane] fit gave up after retries:", err);
+          }
         }
-      });
+      };
+      requestAnimationFrame(() => tryFit(10));
     } catch (err) {
       const m = err instanceof Error ? err.message : String(err);
       console.error("[TerminalPane] xterm init failed:", err);
@@ -156,7 +168,9 @@ export default function TerminalPaneInner({
       ws.onopen = () => {
         if (!mounted) return;
         setStatus("connected");
-        term?.writeln("\x1b[1;32m● Connected\x1b[0m");
+        setStatusDetail(null);
+        // No "Connected" line written into the xterm grid — see comment
+        // at term.open(). The corner pill handles user-visible state.
         if (initialSessionId) {
           ws?.send(
             JSON.stringify({
@@ -180,13 +194,18 @@ export default function TerminalPaneInner({
             // double-subscribe that would cross-route input to the wrong PTY.
             if (sessionId) return;
             sessionId = msg.session.sessionId as string;
-            term?.writeln(`\x1b[1;35m● Session ready: ${msg.session.sessionName}\x1b[0m`);
-            fit?.fit();
+            // Deliberately NOT writing "Session ready" into the xterm
+            // grid — it would push the agent's scrollback replay (or a
+            // fresh shell's first prompt) down by one line and confuse
+            // users who think their history vanished.
+            try { fit?.fit(); } catch {}
             term?.focus();
             onSessionReadyRef.current?.(sessionId);
           } else if (msg.type === "session:lost") {
-            term?.writeln(`\x1b[1;31m● Session lost: ${msg.reason ?? "unknown"}\x1b[0m`);
-            if (mounted) setStatus("disconnected");
+            if (mounted) {
+              setStatus("lost");
+              setStatusDetail(msg.reason ?? "unknown");
+            }
           }
         } catch (err) {
           console.error("[TerminalPane] message parse error:", err);
@@ -209,7 +228,7 @@ export default function TerminalPaneInner({
         if (reconnectTimer) clearTimeout(reconnectTimer);
         reconnectTimer = setTimeout(() => {
           if (mounted) {
-            term?.writeln("\x1b[1;33m● Reconnecting...\x1b[0m");
+            setStatus("reconnecting");
             connect();
           }
         }, 3000);
@@ -219,7 +238,9 @@ export default function TerminalPaneInner({
     connect();
 
     observer = new ResizeObserver(() => {
-      if (mounted && fit) fit.fit();
+      if (mounted && fit) {
+        try { fit.fit(); } catch {}
+      }
     });
     observer.observe(container);
 
@@ -244,13 +265,25 @@ export default function TerminalPaneInner({
         style={{ backgroundColor: "#0d0d14", padding: "4px" }}
       />
 
-      {/* Status pill — only shown when not connected. */}
+      {/* Status pill — only shown when not connected. All transient
+          terminal-state messaging lives here so we never write a line
+          into the xterm grid that would visually displace the agent's
+          scrollback replay. */}
       {status !== "connected" && !errorMessage && (
         <div className="absolute top-2 right-2 z-10 flex items-center gap-2 bg-mg-bg-secondary/90 border border-mg-border rounded-md px-3 py-1.5">
-          {status === "connecting" ? (
+          {status === "connecting" || status === "reconnecting" ? (
             <>
               <div className="w-3 h-3 border-2 border-mg-accent border-t-transparent rounded-full animate-spin" />
-              <span className="text-xs text-mg-text-secondary">Connecting...</span>
+              <span className="text-xs text-mg-text-secondary">
+                {status === "reconnecting" ? "Reconnecting..." : "Connecting..."}
+              </span>
+            </>
+          ) : status === "lost" ? (
+            <>
+              <div className="w-2 h-2 rounded-full bg-yellow-400" />
+              <span className="text-xs text-yellow-400">
+                Session lost{statusDetail ? `: ${statusDetail}` : ""}
+              </span>
             </>
           ) : (
             <>

@@ -53,6 +53,11 @@ export interface CreateOptions {
   cols?: number;
   /** If set, link the new session to a stack launch for grouping. */
   stackId?: string;
+  /** Unix user on the target host to spawn the shell as. The agent runs
+   *  as root and uses `su -l <user>` to drop privileges and establish a
+   *  proper login environment (HOME/USER/.bash_profile/etc.). Omit to
+   *  keep the legacy "shell runs as the agent's identity" behaviour. */
+  user?: string;
 }
 
 export interface CreatedSession {
@@ -72,6 +77,7 @@ export async function createSession(
     command: opts.command,
     rows: opts.rows,
     cols: opts.cols,
+    user: opts.user,
   });
   if (resp.result !== "created") {
     throw new Error(

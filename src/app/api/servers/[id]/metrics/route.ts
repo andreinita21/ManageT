@@ -1,12 +1,26 @@
 /**
  * API route for server metric snapshots.
- * GET /api/servers/[id]/metrics — query metrics with optional ?from=&to= filters
+ * GET /api/servers/[id]/metrics — bucket-aggregated graph data for the
+ * server detail page.
+ *
+ * Query params:
+ *   range = 1h | 6h | 24h        (default: 1h)
+ *   from, to = epoch-ms          (override range; for ad-hoc zooms)
+ *
+ * The actual bucket-aggregation SQL lives in
+ * `src/lib/monitor/metrics-buckets.ts` so the server-rendered detail
+ * page can call it directly without a round-trip through this route.
  */
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { db } from "@/lib/db";
-import { metricSnapshots, servers } from "@/lib/db/schema";
-import { eq, and, gte, lte } from "drizzle-orm";
+import { servers } from "@/lib/db/schema";
+import { eq } from "drizzle-orm";
+import {
+  defaultMetricsWindow,
+  fetchMetricBuckets,
+  parseMetricsRange,
+} from "@/lib/monitor/metrics-buckets";
 
 export async function GET(
   request: Request,
@@ -20,7 +34,7 @@ export async function GET(
   const { id } = await params;
 
   const serverRows = await db
-    .select()
+    .select({ id: servers.id })
     .from(servers)
     .where(eq(servers.id, id))
     .limit(1);
@@ -29,29 +43,28 @@ export async function GET(
   }
 
   const url = new URL(request.url);
+  const range = parseMetricsRange(url.searchParams.get("range"));
   const fromParam = url.searchParams.get("from");
   const toParam = url.searchParams.get("to");
 
-  const conditions = [eq(metricSnapshots.serverId, id)];
-
+  let { from, to } = defaultMetricsWindow(range);
   if (fromParam) {
-    const fromTs = parseInt(fromParam, 10);
-    if (!isNaN(fromTs)) {
-      conditions.push(gte(metricSnapshots.capturedAt, fromTs));
-    }
+    const parsed = parseInt(fromParam, 10);
+    if (!isNaN(parsed)) from = parsed;
   }
-
   if (toParam) {
-    const toTs = parseInt(toParam, 10);
-    if (!isNaN(toTs)) {
-      conditions.push(lte(metricSnapshots.capturedAt, toTs));
-    }
+    const parsed = parseInt(toParam, 10);
+    if (!isNaN(parsed)) to = parsed;
   }
 
-  const rows = await db
-    .select()
-    .from(metricSnapshots)
-    .where(and(...conditions));
+  const rows = await fetchMetricBuckets(id, range, from, to);
 
-  return NextResponse.json({ data: rows });
+  return NextResponse.json(
+    { data: rows },
+    {
+      headers: {
+        "Cache-Control": "private, max-age=10, stale-while-revalidate=30",
+      },
+    }
+  );
 }
