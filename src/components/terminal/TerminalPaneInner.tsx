@@ -74,6 +74,20 @@ export default function TerminalPaneInner({
     onSessionReadyRef.current = onSessionReady;
   }, [onSessionReady]);
 
+  // Freeze `initialSessionId` at mount. Without this, the create flow
+  // tears itself down: we send `session:create`, the server replies with
+  // `session:state {sessionId: U}`, we call `onSessionReady(U)`, the
+  // parent updates `tab.sessionId = U`, we re-render with `initialSessionId
+  // = U`, and the effect's `[serverId, initialSessionId]` dep changes
+  // (`undefined → U`) — so React tears down the freshly-working xterm +
+  // WebSocket and rebuilds them. The teardown emits a stray
+  // `ws.onerror {}` and the rebuilt WS attaches a stream that, for
+  // brand-new sessions with empty scrollback, used to leave the user
+  // typing into a void. Capturing the prop into state pins the effect
+  // to the mount-time value; the parent can keep its own bookkeeping
+  // through `onSessionReady` without yanking us around.
+  const [mountInitialSessionId] = useState(initialSessionId);
+
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -82,9 +96,13 @@ export default function TerminalPaneInner({
     let term: Terminal | null = null;
     let fit: FitAddon | null = null;
     let ws: WebSocket | null = null;
-    // Mutable session id: starts as `initialSessionId` if attaching, otherwise
-    // null until the server replies with `session:state` to our `session:create`.
-    let sessionId: string | null = initialSessionId ?? null;
+    // Mutable session id: starts as the mount-time `initialSessionId` if
+    // we're attaching, otherwise null until the server replies with
+    // `session:state` to our `session:create`. Reconnect logic reads
+    // this same variable, so a session we created earlier in this
+    // mount's lifetime is re-attached (not re-created) when the WS
+    // drops and we try again.
+    let sessionId: string | null = mountInitialSessionId ?? null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let observer: ResizeObserver | null = null;
 
@@ -171,11 +189,17 @@ export default function TerminalPaneInner({
         setStatusDetail(null);
         // No "Connected" line written into the xterm grid — see comment
         // at term.open(). The corner pill handles user-visible state.
-        if (initialSessionId) {
+        //
+        // Use the mutable local `sessionId`, not `mountInitialSessionId`:
+        // on a reconnect after a successful `session:create`, sessionId
+        // is set to the id the server returned, and we want to attach
+        // to that — re-sending `session:create` would orphan the live
+        // PTY and spawn a new one on every reconnect.
+        if (sessionId) {
           ws?.send(
             JSON.stringify({
               type: "session:attach",
-              sessionId: initialSessionId,
+              sessionId,
               serverId,
             })
           );
@@ -213,8 +237,12 @@ export default function TerminalPaneInner({
       };
 
       ws.onerror = (e) => {
+        // After unmount the component is torn down and any error event
+        // is part of the cleanup — logging it as a Next.js dev console
+        // error is noise (the event object is empty `{}` anyway).
+        if (!mounted) return;
         console.error("[TerminalPane] WebSocket error", e);
-        if (mounted) setStatus("error");
+        setStatus("error");
       };
 
       ws.onclose = () => {
@@ -251,11 +279,17 @@ export default function TerminalPaneInner({
       ws?.close();
       term?.dispose();
     };
-    // We intentionally only depend on serverId + initialSessionId. The
-    // onSessionReady callback is read through a ref so the parent can pass
-    // a fresh lambda each render without tearing the WS down.
+    // We intentionally depend on serverId + the *frozen-at-mount*
+    // session id (via useState above). The prop `initialSessionId` is
+    // deliberately not in the dep list — the parent updates it after we
+    // tell it our newly-created session id via onSessionReady, and we
+    // don't want that update to rebuild the WS + xterm we just got
+    // working. Reconnects within the same mount reuse the live
+    // `sessionId` closure variable; a genuine session swap is handled
+    // by the parent giving us a different React key (which remounts us
+    // cleanly).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [serverId, initialSessionId]);
+  }, [serverId, mountInitialSessionId]);
 
   return (
     <div className={`relative ${className}`} style={{ minHeight: 0 }}>

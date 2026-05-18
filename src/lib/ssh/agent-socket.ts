@@ -195,10 +195,11 @@ export interface AttachedHandle {
   sessionName: string;
   /**
    * Raw byte stream — write keystrokes in, read terminal output out.
-   * The stream is returned in *paused* mode (no `data` listener
-   * attached). The caller is expected to flush `initialBytes` to its
-   * consumer first, then wire its own `data` listener, which will
-   * auto-resume the stream and deliver any subsequent live output.
+   * No `data` listener is attached. The caller should flush
+   * `initialBytes` to its consumer first, then wire its own `data`
+   * listener; that listener auto-resumes flowing mode and any bytes
+   * the agent emits between the handshake and listener-attachment
+   * sit in Node's internal readable buffer until then.
    */
   stream: Duplex;
   /**
@@ -281,10 +282,19 @@ export async function openAgentAttach(
 
 /**
  * Read until the first newline, parse the prefix as a JSON `AgentResponse`,
- * and return the trailing bytes (if any) verbatim. Pauses the stream after
- * the handshake so any further bytes that arrive before the caller wires
- * its own `data` listener stay buffered on the readable side (Node's
- * internal buffer holds them until the next listener auto-resumes flow).
+ * and return the trailing bytes (if any) verbatim.
+ *
+ * Deliberately does NOT call `stream.pause()`. Removing our `data`
+ * listener with no other listeners attached leaves Node's stream in
+ * `state.flowing = null` (the "no consumers, buffer internally" mode);
+ * when the caller later adds its own `data` listener, Node auto-resumes
+ * and flushes any bytes that arrived in the gap. Calling `pause()`
+ * here would set `state.flowing = false`, after which adding a `data`
+ * listener does NOT auto-resume — and the agent's live PTY output
+ * would silently pile up in the internal buffer, leaving the user
+ * unable to see any echo of their keystrokes (looks like "the terminal
+ * is dead"). This bit empty-scrollback (brand-new) sessions the
+ * hardest, because there's no initial replay to mask the failure.
  */
 function readHandshake(
   stream: Duplex
@@ -302,9 +312,6 @@ function readHandshake(
       const nl = joined.indexOf(0x0a);
       if (nl === -1) return;
       cleanup();
-      // Pause so further chunks wait in the readable buffer for the
-      // caller's listener instead of being silently dropped.
-      stream.pause();
       const line = joined.subarray(0, nl).toString("utf-8");
       // `Buffer.from(...)` copies — `joined.subarray` would share the
       // underlying memory with the concat buffer, which is fine in
