@@ -122,6 +122,43 @@ export default function TerminalPaneInner({
       term.loadAddon(new WebLinksAddon());
       term.open(container);
 
+      // xterm 5.x has a renderer-init race: Viewport schedules an
+      // _innerRefresh via an internal setTimeout(0), and if that
+      // callback fires before the render-service's `dimensions` are
+      // computed, the `dimensions` getter throws "Cannot read
+      // properties of undefined (reading 'dimensions')". Subsequent
+      // refreshes succeed once the renderer initializes, but Next.js's
+      // dev overlay treats that single throw as a runtime error.
+      // Wrap _innerRefresh on the instance to swallow only that
+      // specific error type. Internals aren't a public API, so the
+      // whole block is best-effort behind a try/catch — if xterm
+      // restructures, we just lose the suppression but keep working.
+      try {
+        const internal = term as unknown as {
+          _core?: {
+            viewport?: { _innerRefresh?: () => unknown };
+            _viewport?: { _innerRefresh?: () => unknown };
+          };
+        };
+        const viewport =
+          internal._core?.viewport ?? internal._core?._viewport;
+        if (viewport && typeof viewport._innerRefresh === "function") {
+          const original = viewport._innerRefresh.bind(viewport);
+          viewport._innerRefresh = function patchedInnerRefresh() {
+            try {
+              return original();
+            } catch (err) {
+              const msg =
+                err instanceof Error ? err.message : String(err);
+              if (msg.includes("dimensions")) return;
+              throw err;
+            }
+          };
+        }
+      } catch {
+        /* best-effort patch — silently skip if internals moved */
+      }
+
       // Forward keystrokes + resizes once we have a session id.
       term.onData((data) => {
         if (ws?.readyState === WebSocket.OPEN && sessionId) {
