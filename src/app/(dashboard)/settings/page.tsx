@@ -18,7 +18,7 @@ export default function SettingsPage() {
   const { data: rules, loading, refetch } = useRestartRules();
   const { data: servers } = useServers();
   const { toast } = useToast();
-  const [activeTab, setActiveTab] = useState("rules");
+  const [activeTab, setActiveTab] = useState("appearance");
   const [addModalOpen, setAddModalOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [testCommand, setTestCommand] = useState("");
@@ -138,9 +138,9 @@ export default function SettingsPage() {
 
       <Tabs
         tabs={[
+          { id: "appearance", label: "Appearance" },
           { id: "rules", label: "Restart Rules", count: rules?.length ?? 0 },
           { id: "test", label: "Test Command" },
-          { id: "appearance", label: "Appearance" },
           { id: "profile", label: "Profile" },
         ]}
         activeTab={activeTab}

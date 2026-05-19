@@ -1,7 +1,19 @@
 @import "tailwindcss";
 @config "../../tailwind.config.ts";
 
-@theme inline {
+/*
+ * Important: this block intentionally does NOT use `@theme inline`.
+ * With `inline`, Tailwind compiles utility classes like `bg-mg-bg`
+ * into `background-color: #0a0a0f` literally, baking the launch
+ * palette into the stylesheet — runtime overrides via
+ * `document.documentElement.style.setProperty("--color-mg-bg", …)`
+ * (used by src/lib/themes/provider.tsx to apply the user-selected
+ * theme live) would then be ignored. Plain `@theme` emits the
+ * utilities as `var(--color-mg-bg)`, so they pick up whatever the
+ * provider has written. Keep this distinction if/when this file is
+ * edited.
+ */
+@theme {
   --color-mg-bg: #0a0a0f;
   --color-mg-bg-secondary: #12121a;
   --color-mg-bg-tertiary: #1a1a2e;
@@ -43,32 +55,38 @@
   to { opacity: 1; transform: translateY(0); }
 }
 
+/* Root fallbacks: read from the same CSS variables the theme provider
+ * mutates so html/body track the active theme. The hex literals are
+ * only used on the very first paint, before the provider has run
+ * (e.g. SSR shell) — they match the default ManageT purple palette so
+ * the unauthenticated/login screen still looks right. */
 html {
-  background: #0a0a0f;
-  color: #e4e4e7;
+  background: var(--color-mg-bg, #0a0a0f);
+  color: var(--color-mg-text, #e4e4e7);
 }
 
 body {
-  background: #0a0a0f;
-  color: #e4e4e7;
+  background: var(--color-mg-bg, #0a0a0f);
+  color: var(--color-mg-text, #e4e4e7);
   font-family: var(--font-sans);
 }
 
-/* Scrollbar styling */
+/* Scrollbar styling — tracks the theme variables so the chrome
+ * matches whichever palette is active. */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
 
 ::-webkit-scrollbar-track {
-  background: #12121a;
+  background: var(--color-mg-bg-secondary, #12121a);
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #3f3f46;
+  background: var(--color-mg-border-hover, #3f3f46);
   border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #a855f7;
+  background: var(--color-mg-accent, #a855f7);
 }
