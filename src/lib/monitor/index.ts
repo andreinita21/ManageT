@@ -24,6 +24,7 @@ export { snapshotEvents } from "./snapshot-events";
 import { AlertEngine } from "./alert-engine";
 import { startPruner } from "./pruner";
 import { startStatusMonitor } from "@/lib/agent/status-monitor";
+import { startSessionReconciler } from "./session-reconciler";
 
 let _initialized = false;
 
@@ -36,6 +37,10 @@ let _initialized = false;
  *   2. Starts the background metric pruner.
  *   3. Starts the agent status monitor, which flips servers to
  *      `unreachable` after missed heartbeats.
+ *   4. Starts the session reconciler, which keeps the `sessions` table
+ *      in sync with each agent's in-memory list — re-imports CLI-
+ *      created sessions and surfaces orphans the dashboard had lost
+ *      track of, so the user can manage them from the UI.
  *
  * Metrics themselves are NOT collected here — they arrive via
  * POST /api/agent/heartbeat from the Rust agent running on each host.
@@ -47,6 +52,7 @@ function initMonitoring(): void {
   AlertEngine.getInstance().start();
   startPruner();
   startStatusMonitor();
+  startSessionReconciler();
 }
 
 export { initMonitoring };
