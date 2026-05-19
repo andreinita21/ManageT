@@ -10,7 +10,7 @@
  * Cancel reverts to whatever the server last gave us (i.e. the
  * provider's pre-edit prefs, which we snapshot on mount and restore).
  */
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { Select } from "@/components/ui/Select";
 import { useToast } from "@/components/ui/Toast";
@@ -235,38 +235,59 @@ export function AppearanceTab() {
   const appearance = useAppearance();
   const { toast } = useToast();
 
-  // Snapshot the user's persisted prefs on mount so Cancel can revert
-  // to exactly what's on the server. We re-snapshot whenever the
-  // provider replaces prefs (after a successful save).
-  const [persisted, setPersisted] = useState<AppearancePreferences>(appearance.prefs);
-  const [draft, setDraft] = useState<DraftState>(() => prefsToDraft(appearance.prefs));
+  // `persisted` is what's on the server (or DEFAULT_PREFERENCES while
+  // the initial fetch is in flight). We read it straight from
+  // appearance.prefs — the provider only mutates that on initial fetch
+  // and on successful save(), so it can never echo back from our own
+  // preview() calls. That's the key to making the sync effect loop-
+  // proof: previous designs had preview() push into appearance.prefs
+  // too, which made every draft change look like an external update.
+  const persisted = appearance.prefs;
+  const [draft, setDraft] = useState<DraftState>(() => prefsToDraft(persisted));
   const [saving, setSaving] = useState(false);
 
+  // Tracks the persisted snapshot we last synced the draft from. When
+  // appearance.prefs changes (e.g. initial fetch lands), we pull it in
+  // only if the user hasn't started editing — detected by comparing
+  // the current draft against this ref, not against the new persisted
+  // value (which is what mistakenly always matched in the loop).
+  const lastSyncedSnapRef = useRef<string>(JSON.stringify(persisted));
+
   useEffect(() => {
-    // If the provider loaded a new set of prefs (e.g. async initial
-    // fetch completed) and the user hasn't started editing, sync them
-    // in. We check by deep-comparing the persisted snapshot against
-    // the current draft — equal means "user hasn't touched anything."
-    const draftSnap = JSON.stringify(draftToPrefs(draft));
     const persistedSnap = JSON.stringify(persisted);
-    if (draftSnap === persistedSnap) {
-      const next = appearance.prefs;
-      setPersisted(next);
-      setDraft(prefsToDraft(next));
+    if (persistedSnap === lastSyncedSnapRef.current) return; // unchanged
+    const draftSnap = JSON.stringify(draftToPrefs(draft));
+    // User has unsaved edits — keep them.
+    if (draftSnap !== lastSyncedSnapRef.current) {
+      lastSyncedSnapRef.current = persistedSnap;
+      return;
     }
+    setDraft(prefsToDraft(persisted));
+    lastSyncedSnapRef.current = persistedSnap;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [appearance.prefs]);
+  }, [persisted]);
 
   const dirty = useMemo(() => {
     return JSON.stringify(draftToPrefs(draft)) !== JSON.stringify(persisted);
   }, [draft, persisted]);
 
   // Push the current draft into ThemeProvider as a preview every time
-  // it changes — that's what makes the whole app re-skin live.
+  // it changes — that's what makes the whole app re-skin live. The
+  // provider's preview() updates only `previewOverride`, not `prefs`,
+  // so this doesn't re-trigger the sync effect above.
   useEffect(() => {
     appearance.preview(draftToPrefs(draft));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draft]);
+
+  // Drop the preview override when the editor unmounts (user
+  // navigates away without saving) so the app falls back to the
+  // persisted theme. Without this, leaving the tab mid-edit would
+  // strand the preview palette on every other page.
+  useEffect(() => {
+    return () => appearance.resetPreview();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const selectTheme = (key: string) => {
     if (key === "custom") {
@@ -308,7 +329,11 @@ export function AppearanceTab() {
     setSaving(true);
     try {
       const saved = await appearance.save(draftToPrefs(draft));
-      setPersisted(saved);
+      // `appearance.prefs` is now `saved` — the sync effect will see
+      // the change and align lastSyncedSnapRef. We still call setDraft
+      // explicitly so the form fields reflect any server-side
+      // validation (e.g. font size clamping) instead of waiting a
+      // render for the sync effect to do it.
       setDraft(prefsToDraft(saved));
       toast("Appearance saved", "success");
     } catch (err) {
@@ -319,8 +344,11 @@ export function AppearanceTab() {
   };
 
   const onCancel = () => {
+    // Revert form to the currently persisted state and let the
+    // provider drop its preview override so the dashboard repaints
+    // with the saved theme too.
     setDraft(prefsToDraft(persisted));
-    appearance.preview(persisted);
+    appearance.resetPreview();
   };
 
   const groups = useMemo(() => groupPresets(PRESETS), []);

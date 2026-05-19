@@ -39,17 +39,18 @@ export default function TerminalPaneInner({
 }: TerminalPaneProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   // Appearance (theme + font) is shared via context so user preference
-  // changes in Settings propagate live. We capture the live values via
-  // refs so the long-lived useEffect closure always reads the latest
-  // ones without needing to be re-run when prefs change.
+  // changes in Settings propagate live. Read from `active`, which is
+  // the in-effect preview when the Appearance editor is open and the
+  // persisted prefs otherwise — that's what lets the picker reskin
+  // the running terminals while the user is browsing themes.
   const appearance = useAppearance();
   const termRef = useRef<Terminal | null>(null);
   const termThemeRef = useRef(appearance.colors.terminal);
-  const fontFamilyRef = useRef(appearance.prefs.terminalFontFamily);
-  const fontSizeRef = useRef(appearance.prefs.terminalFontSize);
+  const fontFamilyRef = useRef(appearance.active.terminalFontFamily);
+  const fontSizeRef = useRef(appearance.active.terminalFontSize);
   termThemeRef.current = appearance.colors.terminal;
-  fontFamilyRef.current = appearance.prefs.terminalFontFamily;
-  fontSizeRef.current = appearance.prefs.terminalFontSize;
+  fontFamilyRef.current = appearance.active.terminalFontFamily;
+  fontSizeRef.current = appearance.active.terminalFontSize;
   // Container background mirrors the terminal palette so the small
   // padding strip around the canvas matches the active theme instead
   // of staying on the launch purple.
@@ -65,15 +66,15 @@ export default function TerminalPaneInner({
     if (!t) return;
     try {
       t.options.theme = appearance.colors.terminal;
-      t.options.fontFamily = `'${appearance.prefs.terminalFontFamily}', monospace`;
-      t.options.fontSize = appearance.prefs.terminalFontSize;
+      t.options.fontFamily = `'${appearance.active.terminalFontFamily}', monospace`;
+      t.options.fontSize = appearance.active.terminalFontSize;
     } catch {
       /* if options aren't writable on this xterm version, ignore */
     }
   }, [
     appearance.colors.terminal,
-    appearance.prefs.terminalFontFamily,
-    appearance.prefs.terminalFontSize,
+    appearance.active.terminalFontFamily,
+    appearance.active.terminalFontSize,
   ]);
   const [status, setStatus] = useState<
     "connecting" | "connected" | "reconnecting" | "disconnected" | "error" | "lost"

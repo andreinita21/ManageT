@@ -38,15 +38,29 @@ import {
 } from "./presets";
 
 interface AppearanceContextValue {
+  /** The currently *persisted* preferences. Only changes on the
+   *  initial /api/preferences fetch and on a successful save(). The
+   *  Appearance settings page reads this to decide whether the user
+   *  has unsaved changes. */
   prefs: AppearancePreferences;
+  /** What's currently applied to the document (terminal palette,
+   *  fonts, CSS vars). Equals `prefs` unless a `preview()` override is
+   *  in effect. Consumers like TerminalPaneInner read this, not
+   *  `prefs`, so they reflect the user's in-progress selection. */
+  active: AppearancePreferences;
+  /** Resolved colours from `active`. */
   colors: ThemeColors;
-  /** Save the new preferences to the server and apply locally. Returns
-   *  the persisted prefs (which may differ slightly from input if the
-   *  server validated/clamped any field). */
+  /** Save to the server and apply. Clears any preview override. */
   save: (next: AppearancePreferences) => Promise<AppearancePreferences>;
-  /** Apply prefs locally without persisting — used by the Appearance
-   *  settings page for live preview before the user hits Save. */
+  /** Apply locally without persisting — used by the Appearance
+   *  settings page for live preview before Save. Keeps `prefs`
+   *  untouched, so consumers tracking "has the persisted theme
+   *  changed?" don't loop. */
   preview: (next: AppearancePreferences) => void;
+  /** Drop any preview override; `active` reverts to `prefs`. Call on
+   *  Cancel or when the editor unmounts so a half-finished preview
+   *  doesn't keep showing after the user navigates away. */
+  resetPreview: () => void;
   /** True until the first /api/preferences fetch has returned. UI can
    *  use this to avoid flashing the default palette over a stored one. */
   loading: boolean;
@@ -84,10 +98,18 @@ function applyUiPalette(palette: UiPalette): void {
 }
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
+  // Persisted prefs (server source of truth) and an optional preview
+  // override applied locally while the user is mid-edit. Keeping them
+  // separate is what prevents the AppearanceTab's "live preview" from
+  // looking like an external prefs update and triggering its own
+  // sync-effect — that's the loop that produced the
+  // "Maximum update depth exceeded" error.
   const [prefs, setPrefs] = useState<AppearancePreferences>(DEFAULT_PREFERENCES);
+  const [previewOverride, setPreviewOverride] = useState<AppearancePreferences | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
 
-  const colors = useMemo(() => resolveColors(prefs), [prefs]);
+  const active = previewOverride ?? prefs;
+  const colors = useMemo(() => resolveColors(active), [active]);
 
   // Push UI vars to the document whenever the resolved palette changes.
   useEffect(() => {
@@ -105,7 +127,12 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
       })
       .then((body) => {
         if (cancelled) return;
-        if (body?.data) setPrefs(body.data);
+        if (body?.data) {
+          setPrefs(body.data);
+          // Any stale preview belongs to a previous session; reset so
+          // the fresh persisted theme takes over.
+          setPreviewOverride(null);
+        }
       })
       .catch(() => {
         /* swallow — we'll just keep DEFAULT_PREFERENCES */
@@ -119,7 +146,17 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const preview = useCallback((next: AppearancePreferences) => {
-    setPrefs(next);
+    // Skip the state update when the value is unchanged. Both protects
+    // against React schedulers re-running effects with the same input
+    // and avoids unnecessary re-renders across every consumer.
+    setPreviewOverride((curr) => {
+      if (curr && shallowSamePrefs(curr, next)) return curr;
+      return next;
+    });
+  }, []);
+
+  const resetPreview = useCallback(() => {
+    setPreviewOverride(null);
   }, []);
 
   const save = useCallback(
@@ -142,14 +179,16 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
       }
       const body = (await resp.json()) as { data: AppearancePreferences };
       setPrefs(body.data);
+      // Save wins; any in-flight preview is now stale.
+      setPreviewOverride(null);
       return body.data;
     },
     []
   );
 
   const value: AppearanceContextValue = useMemo(
-    () => ({ prefs, colors, save, preview, loading }),
-    [prefs, colors, save, preview, loading]
+    () => ({ prefs, active, colors, save, preview, resetPreview, loading }),
+    [prefs, active, colors, save, preview, resetPreview, loading]
   );
 
   return (
@@ -157,6 +196,20 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
       {children}
     </AppearanceContext.Provider>
   );
+}
+
+/** Cheap structural equality for AppearancePreferences. customTheme
+ *  is compared via JSON.stringify because it's a deeply nested
+ *  ThemeColors object and would otherwise need a hand-written walker
+ *  for every preset addition. */
+function shallowSamePrefs(
+  a: AppearancePreferences,
+  b: AppearancePreferences
+): boolean {
+  if (a.themeKey !== b.themeKey) return false;
+  if (a.terminalFontFamily !== b.terminalFontFamily) return false;
+  if (a.terminalFontSize !== b.terminalFontSize) return false;
+  return JSON.stringify(a.customTheme) === JSON.stringify(b.customTheme);
 }
 
 export function useAppearance(): AppearanceContextValue {
@@ -180,9 +233,11 @@ export function useAppearanceOptional(): AppearanceContextValue {
   if (ctx) return ctx;
   return {
     prefs: DEFAULT_PREFERENCES,
+    active: DEFAULT_PREFERENCES,
     colors: resolveColors(DEFAULT_PREFERENCES),
     save: async (next) => next,
     preview: () => {},
+    resetPreview: () => {},
     loading: false,
   };
 }
