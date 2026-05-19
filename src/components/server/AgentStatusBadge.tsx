@@ -5,7 +5,7 @@
  * monitoring agent on a server. Pulls from `Server.agentStatus` (which the
  * backend derives from install progress + heartbeat freshness).
  */
-import React from "react";
+import React, { useEffect, useState } from "react";
 import type { Server } from "@/types";
 
 type AgentStatus = NonNullable<Server["agentStatus"]>;
@@ -96,7 +96,26 @@ export function AgentStatusBadge({
   className = "",
 }: AgentStatusBadgeProps) {
   const cfg = STATUS[status];
-  const age = formatAge(lastHeartbeatAt);
+
+  // The age string ("8s ago", "2m ago"…) is derived from Date.now(),
+  // which differs between the server render and the client hydration
+  // by however many ms it took the page to ship. That mismatch
+  // triggers a React hydration warning the first time the badge
+  // paints. Computing the age only on the client (after mount) and
+  // letting SSR + the first client paint render `age = null` keeps
+  // the two renders identical; the visible age then ticks in on the
+  // next animation frame and refreshes every few seconds.
+  const [age, setAge] = useState<string | null>(null);
+  useEffect(() => {
+    if (lastHeartbeatAt == null) {
+      setAge(null);
+      return;
+    }
+    const update = () => setAge(formatAge(lastHeartbeatAt));
+    update();
+    const id = setInterval(update, 5000);
+    return () => clearInterval(id);
+  }, [lastHeartbeatAt]);
 
   // Per-status detail line.
   let detail: string | null = null;

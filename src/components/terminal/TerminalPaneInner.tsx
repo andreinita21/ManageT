@@ -368,7 +368,22 @@ export default function TerminalPaneInner({
       };
     };
 
-    connect();
+    // Defer the first WS connect by one macrotask. In React StrictMode
+    // dev the effect mounts, immediately unmounts, then remounts; if
+    // we call connect() synchronously we open + close + reopen a WS,
+    // which the server logs as paired "[WS] client connected /
+    // disconnected" entries and which the user perceives as a slow
+    // initial connect (status pill lingers on "Connecting…" while
+    // the first WS aborts and the second one establishes). With a
+    // setTimeout(0), the cleanup runs first when StrictMode tears the
+    // effect down and `connectTimer` is cleared before any WS is
+    // attempted. In production the only effect is a sub-millisecond
+    // delay; both modes converge to a single connect.
+    let connectTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+      connectTimer = null;
+      if (!mounted) return;
+      connect();
+    }, 0);
 
     observer = new ResizeObserver(() => {
       if (mounted && fit) {
@@ -379,6 +394,10 @@ export default function TerminalPaneInner({
 
     return () => {
       mounted = false;
+      if (connectTimer) {
+        clearTimeout(connectTimer);
+        connectTimer = null;
+      }
       if (reconnectTimer) clearTimeout(reconnectTimer);
       observer?.disconnect();
       ws?.close();

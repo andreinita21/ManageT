@@ -36,6 +36,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { parse as parseUrl } from "node:url";
+import { StringDecoder } from "node:string_decoder";
 import { eq } from "drizzle-orm";
 
 import { db } from "@/lib/db";
@@ -188,6 +189,20 @@ async function handleAttachLifecycle(
   };
   map.set(sessionId, state);
 
+  // Decode the byte stream as UTF-8 with **a stateful decoder** so
+  // multi-byte characters that straddle chunk boundaries aren't
+  // mangled. The agent ships raw PTY bytes; tools like `ls --color`,
+  // emoji-laden prompts, or any non-ASCII output produce multi-byte
+  // sequences. Calling `Buffer.toString("utf-8")` on each chunk
+  // independently splits those sequences at random offsets and emits
+  // U+FFFD replacement characters that xterm's parser then chokes on
+  // (visible as repeated "Parsing error: code 192/204/255..." logs).
+  // StringDecoder buffers the trailing partial bytes from each
+  // chunk and prepends them to the next, which is exactly what we
+  // need. One decoder per session — never reset across the
+  // session's lifetime.
+  const decoder = new StringDecoder("utf-8");
+
   // Flush the agent's scrollback replay first. The agent sends the
   // `Attached` JSON line and then immediately dumps the session's
   // scrollback ring — both usually land in the same TCP read.
@@ -197,25 +212,29 @@ async function handleAttachLifecycle(
   // ("scrollback first, then live output") and matches what the user
   // expects when they re-open a tab on an existing session.
   if (handle.initialBytes.length > 0) {
-    sendJson(ws, {
-      type: "terminal:output",
-      sessionId,
-      data: handle.initialBytes.toString("utf-8"),
-    });
+    const text = decoder.write(handle.initialBytes);
+    if (text.length > 0) {
+      sendJson(ws, { type: "terminal:output", sessionId, data: text });
+    }
   }
 
   // Pipe live agent output → browser. Attaching the listener auto-
   // resumes the stream (paused during handshake) so anything that
   // arrived in between sits in the internal buffer and now flows.
   handle.stream.on("data", (chunk: Buffer) => {
-    sendJson(ws, {
-      type: "terminal:output",
-      sessionId,
-      data: chunk.toString("utf-8"),
-    });
+    const text = decoder.write(chunk);
+    if (text.length === 0) return; // chunk ended mid-codepoint
+    sendJson(ws, { type: "terminal:output", sessionId, data: text });
   });
 
   handle.stream.on("close", () => {
+    // Flush any trailing bytes from the decoder. In practice this is
+    // never visible output (a partial UTF-8 sequence at EOF is
+    // invalid), but it stops the decoder from holding onto bytes.
+    const rest = decoder.end();
+    if (rest.length > 0 && ws.readyState === WS_OPEN) {
+      sendJson(ws, { type: "terminal:output", sessionId, data: rest });
+    }
     const m = wsAttachments.get(ws);
     if (m && m.get(sessionId) === state) {
       m.delete(sessionId);
