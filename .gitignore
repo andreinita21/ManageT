@@ -55,3 +55,6 @@ next-env.d.ts
 
 # Claude Code per-project scratch (lock files for scheduled wakeups, etc.)
 /.claude/
+
+# Benchmark output (regenerate with scripts/benchmark-memory-storage.py)
+/reports/
