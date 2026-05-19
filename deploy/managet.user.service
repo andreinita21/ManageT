@@ -1,0 +1,35 @@
+[Unit]
+# ManageT dashboard — user-level systemd unit.
+#
+# Identical in intent to deploy/managet.service (the system-level
+# variant) but designed to be installed without root into
+# ~/.config/systemd/user/. Use this when you don't have sudo on the
+# host; the trade-off is that the service only runs while the user is
+# logged in unless `loginctl enable-linger andrei` has been set,
+# which is the single piece of state on this box that does require
+# sudo.
+Description=ManageT dashboard (Next.js production, user mode)
+Documentation=https://github.com/andreinita21/ManageT
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/andrei/managet
+
+# server.ts switches Next.js into production mode when NODE_ENV is
+# "production". tsx is loaded via its bundled cli.mjs so the full
+# path is explicit and doesn't depend on PATH.
+Environment=NODE_ENV=production
+Environment=PORT=3000
+ExecStart=/usr/bin/node /home/andrei/managet/node_modules/tsx/dist/cli.mjs /home/andrei/managet/server.ts
+
+Restart=on-failure
+RestartSec=5s
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# default.target is the user-session equivalent of multi-user.target;
+# `systemctl --user enable` hooks the unit into it.
+WantedBy=default.target
