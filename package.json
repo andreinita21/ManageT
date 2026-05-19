@@ -6,7 +6,8 @@
     "dev": "npx tsx server.ts",
     "dev:next": "next dev",
     "build": "next build",
-    "start": "next start",
+    "start": "NODE_ENV=production npx tsx server.ts",
+    "start:next": "next start",
     "lint": "eslint",
     "build:agent": "bash agent/scripts/build-release.sh"
   },
