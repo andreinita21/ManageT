@@ -156,6 +156,17 @@ export default function TerminalPaneInner({
         cursorStyle: "bar",
         scrollback: 10000,
         allowProposedApi: true,
+        // xterm 5.3's escape-sequence parser logs "Parsing error: {…}"
+        // via console.error for any byte sequence it doesn't fully
+        // recognise. Modern shells emit plenty of those — OSC 8
+        // hyperlinks, terminal-integration sequences (iTerm2 / VS
+        // Code shells), unknown DCS strings, etc. — and the terminal
+        // renders them correctly anyway because xterm gracefully
+        // abandons the unknown state. The only effect of the log is
+        // to flood Next.js's dev overlay. Disabling the internal log
+        // surface keeps real failures (exceptions) visible while
+        // silencing this advisory noise.
+        logLevel: "off",
       });
       termRef.current = term;
       fit = new FitAddon();
