@@ -235,37 +235,30 @@ export function AppearanceTab() {
   const appearance = useAppearance();
   const { toast } = useToast();
 
-  // `persisted` is what's on the server (or DEFAULT_PREFERENCES while
-  // the initial fetch is in flight). We read it straight from
-  // appearance.prefs — the provider only mutates that on initial fetch
-  // and on successful save(), so it can never echo back from our own
-  // preview() calls. That's the key to making the sync effect loop-
-  // proof: previous designs had preview() push into appearance.prefs
-  // too, which made every draft change look like an external update.
+  // `persisted` is what's on the server (DEFAULT_PREFERENCES while the
+  // initial /api/preferences fetch is in flight). The provider only
+  // mutates `appearance.prefs` on initial fetch and on successful
+  // save() — never from our own preview() calls — so reading it here
+  // is loop-safe.
   const persisted = appearance.prefs;
   const [draft, setDraft] = useState<DraftState>(() => prefsToDraft(persisted));
   const [saving, setSaving] = useState(false);
 
-  // Tracks the persisted snapshot we last synced the draft from. When
-  // appearance.prefs changes (e.g. initial fetch lands), we pull it in
-  // only if the user hasn't started editing — detected by comparing
-  // the current draft against this ref, not against the new persisted
-  // value (which is what mistakenly always matched in the loop).
-  const lastSyncedSnapRef = useRef<string>(JSON.stringify(persisted));
-
+  // One-shot init: when the initial fetch lands (loading false → true
+  // becomes loading true → false), pull the just-fetched persisted
+  // prefs into the draft. After that we never auto-sync again — the
+  // user owns the draft until they Save or Cancel. Tracked via a ref
+  // so subsequent loading flips or persisted updates from save() can't
+  // re-fire the sync and overwrite in-flight edits. This is what
+  // makes the effect loop-proof: a single boolean guards the only
+  // setState path inside it.
+  const initSyncedRef = useRef(false);
   useEffect(() => {
-    const persistedSnap = JSON.stringify(persisted);
-    if (persistedSnap === lastSyncedSnapRef.current) return; // unchanged
-    const draftSnap = JSON.stringify(draftToPrefs(draft));
-    // User has unsaved edits — keep them.
-    if (draftSnap !== lastSyncedSnapRef.current) {
-      lastSyncedSnapRef.current = persistedSnap;
-      return;
-    }
-    setDraft(prefsToDraft(persisted));
-    lastSyncedSnapRef.current = persistedSnap;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [persisted]);
+    if (initSyncedRef.current) return;
+    if (appearance.loading) return;
+    initSyncedRef.current = true;
+    setDraft(prefsToDraft(appearance.prefs));
+  }, [appearance.loading, appearance.prefs]);
 
   const dirty = useMemo(() => {
     return JSON.stringify(draftToPrefs(draft)) !== JSON.stringify(persisted);
