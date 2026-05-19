@@ -1,0 +1,39 @@
+[Unit]
+# ManageT dashboard (Next.js + custom WebSocket server).
+# Run alongside (not instead of) managet-agent.service, which owns the
+# Rust monitoring agent. The dashboard talks to that agent over SSH
+# (forwarded Unix socket) — it does NOT start the agent.
+Description=ManageT dashboard (Next.js production server)
+Documentation=https://github.com/andreinita21/ManageT
+After=network-online.target managet-agent.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=andrei
+Group=andrei
+WorkingDirectory=/home/andrei/managet
+
+# tsx loads server.ts directly. Calling it via node + the bundled
+# cli.mjs avoids any PATH lookups (Node's location is fixed at
+# /usr/bin/node on this host). server.ts reads `dev = NODE_ENV !==
+# "production"` and switches Next.js to production mode here.
+Environment=NODE_ENV=production
+Environment=PORT=3000
+ExecStart=/usr/bin/node /home/andrei/managet/node_modules/tsx/dist/cli.mjs /home/andrei/managet/server.ts
+
+# Auto-restart on crash. RestartSec=5s gives Next.js's compile cache
+# a beat to settle if the previous instance died mid-write.
+Restart=on-failure
+RestartSec=5s
+
+# Lightweight sandboxing — nothing we do needs root and we don't
+# create new privileges through child processes.
+NoNewPrivileges=true
+
+# Journal capture so `journalctl -u managet -f` works for live logs.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
