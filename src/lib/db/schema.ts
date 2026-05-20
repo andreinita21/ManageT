@@ -64,6 +64,26 @@ export const servers = sqliteTable("servers", {
   agentInstallStage: text("agent_install_stage"),
   // 0 | 1 — when 1, the next heartbeat returns {directive:"uninstall"}.
   pendingUninstall: integer("pending_uninstall").notNull().default(0),
+  // ---- Per-server agent configuration (editable from Settings) ----
+  // Heartbeat cadence the agent should run at (seconds). The agent
+  // reads this from its on-disk config; for now we only enforce at
+  // install time. A future patch will push live updates via the
+  // heartbeat response.
+  heartbeatIntervalSecs: integer("heartbeat_interval_secs").notNull().default(10),
+  // Verbosity of the agent's tracing logs. Applied at next install /
+  // restart; not pushed live yet.
+  logLevel: text("log_level", { enum: ["debug", "info", "warn", "error"] })
+    .notNull()
+    .default("info"),
+  // When true, the agent should self-update to the latest binary on
+  // start-up. Off by default — opt-in.
+  autoUpdate: integer("auto_update").notNull().default(0),
+  // How long closed sessions are retained before the dashboard's
+  // cleanup pass deletes them. 0 = never auto-delete.
+  sessionRetentionDays: integer("session_retention_days").notNull().default(30),
+  // Cap on concurrent (non-closed) sessions per server. NULL = no cap.
+  // Enforced when creating a new session via the API.
+  maxSessions: integer("max_sessions"),
   createdBy: text("created_by")
     .notNull()
     .references(() => users.id),

@@ -9,7 +9,7 @@
  */
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { eq } from "drizzle-orm";
+import { and, eq, ne } from "drizzle-orm";
 import { auth } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { sessions, servers } from "@/lib/db/schema";
@@ -86,11 +86,33 @@ export async function POST(
     // landed users in a root shell — see the WS handler for the
     // original rationale.
     const serverRows = await db
-      .select({ username: servers.username })
+      .select({ username: servers.username, maxSessions: servers.maxSessions })
       .from(servers)
       .where(eq(servers.id, serverId))
       .limit(1);
     const username = serverRows[0]?.username;
+    const maxSessions = serverRows[0]?.maxSessions ?? null;
+
+    // Per-server session cap (Settings → server → Agent settings).
+    // Counts every row that isn't `closed` — active, disconnected,
+    // reconnecting, recovering — so a paused-but-resumable session
+    // still occupies a slot. NULL means no cap.
+    if (maxSessions != null) {
+      const live = await db
+        .select({ id: sessions.id })
+        .from(sessions)
+        .where(
+          and(eq(sessions.serverId, serverId), ne(sessions.status, "closed"))
+        );
+      if (live.length >= maxSessions) {
+        return NextResponse.json(
+          {
+            error: `This server has reached its max-sessions cap (${maxSessions}). Close an existing session or raise the cap in Settings → Servers.`,
+          },
+          { status: 409 }
+        );
+      }
+    }
 
     const created = await createSession(serverId, {
       ...parsed.data,

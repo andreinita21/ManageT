@@ -164,6 +164,51 @@ export async function createServer(data: CreateServerRequest): Promise<Server> {
   return (json.data ?? json) as Server;
 }
 
+/**
+ * Partial-update a server row. Used by the Servers tab agent-config
+ * modal (heartbeat interval, log level, etc.). Returns the updated
+ * server so the caller can refresh local state without re-fetching
+ * the whole list.
+ */
+export async function updateServer(
+  id: string,
+  patch: Partial<{
+    name: string;
+    host: string;
+    port: number;
+    username: string;
+    authMethod: "key" | "password";
+    privateKeyPath: string;
+    password: string;
+    labels: string[];
+    groupName: string | null;
+    heartbeatIntervalSecs: number;
+    logLevel: "debug" | "info" | "warn" | "error";
+    autoUpdate: boolean;
+    sessionRetentionDays: number;
+    maxSessions: number | null;
+  }>
+): Promise<Server> {
+  const res = await fetch(`${API_BASE}/servers/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  handleUnauthorized(res);
+  if (!res.ok) {
+    let detail: string | undefined;
+    try {
+      const body = await res.json();
+      detail = body?.error ?? body?.detail;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(detail ?? `HTTP ${res.status}`);
+  }
+  const json = await res.json();
+  return (json.data ?? json) as Server;
+}
+
 export async function deleteServer(
   id: string,
   opts: { force?: boolean } = {}

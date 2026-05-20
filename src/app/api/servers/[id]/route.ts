@@ -27,6 +27,15 @@ const updateServerSchema = z.object({
   status: z
     .enum(["connected", "disconnected", "reconnecting", "unreachable", "unknown"])
     .optional(),
+  // Per-server agent settings. All optional so the same endpoint can
+  // handle partial updates from the connection-edit form *and* the
+  // agent-config form.
+  heartbeatIntervalSecs: z.number().int().min(5).max(600).optional(),
+  logLevel: z.enum(["debug", "info", "warn", "error"]).optional(),
+  autoUpdate: z.boolean().optional(),
+  sessionRetentionDays: z.number().int().min(0).max(3650).optional(),
+  // null clears the cap, integer ≥1 sets one.
+  maxSessions: z.number().int().min(1).max(1000).nullable().optional(),
 });
 
 export async function GET(
@@ -93,6 +102,13 @@ export async function PUT(
   if (input.labels !== undefined) updates.labels = JSON.stringify(input.labels);
   if (input.groupName !== undefined) updates.groupName = input.groupName;
   if (input.status !== undefined) updates.status = input.status;
+  if (input.heartbeatIntervalSecs !== undefined)
+    updates.heartbeatIntervalSecs = input.heartbeatIntervalSecs;
+  if (input.logLevel !== undefined) updates.logLevel = input.logLevel;
+  if (input.autoUpdate !== undefined) updates.autoUpdate = input.autoUpdate ? 1 : 0;
+  if (input.sessionRetentionDays !== undefined)
+    updates.sessionRetentionDays = input.sessionRetentionDays;
+  if (input.maxSessions !== undefined) updates.maxSessions = input.maxSessions;
 
   await db.update(servers).set(updates).where(eq(servers.id, id));
 

@@ -26,10 +26,10 @@
  * over the existing SSH connection pool, and we batch the DB writes
  * inside `reconcileServer` itself.
  */
-import { eq } from "drizzle-orm";
+import { and, eq, lt } from "drizzle-orm";
 
 import { db } from "@/lib/db";
-import { servers } from "@/lib/db/schema";
+import { servers, sessions } from "@/lib/db/schema";
 import { reconcileServer } from "@/lib/ssh/session-manager";
 
 /**
@@ -70,6 +70,32 @@ async function reconcileOnce(): Promise<void> {
         `[session-reconciler] ${row.name} (${row.host}) failed: ${msg}`
       );
     }
+
+    // Retention sweep: hard-delete `closed` session rows for this
+    // server that are older than the configured retention window.
+    // `sessionRetentionDays === 0` means "never auto-delete", so we
+    // skip those servers. The reconciler is the natural home for this
+    // — it already iterates every server on a 60s tick and the cost
+    // of one extra DELETE is negligible.
+    if (row.sessionRetentionDays > 0) {
+      const cutoff = now - row.sessionRetentionDays * 24 * 60 * 60 * 1000;
+      try {
+        await db
+          .delete(sessions)
+          .where(
+            and(
+              eq(sessions.serverId, row.id),
+              eq(sessions.status, "closed"),
+              lt(sessions.updatedAt, cutoff)
+            )
+          );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `[session-reconciler] retention sweep for ${row.name} failed: ${msg}`
+        );
+      }
+    }
   }
 }
 
@@ -100,8 +126,3 @@ export function stopSessionReconciler(): void {
 /** Exposed for tests / manual triggering (e.g. an admin API). */
 export { reconcileOnce };
 
-// Suppress an unused-warning hint from drizzle helpers we may want
-// for future extensions of this file. `eq` is kept because the
-// natural next change is filtering rows by id; remove if you
-// genuinely don't need it.
-void eq;

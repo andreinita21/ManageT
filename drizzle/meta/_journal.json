@@ -57,6 +57,13 @@
       "when": 1779283177475,
       "tag": "0007_groups",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1779318591125,
+      "tag": "0008_server_agent_config",
+      "breakpoints": true
     }
   ]
 }

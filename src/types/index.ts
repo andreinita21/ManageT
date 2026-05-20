@@ -44,6 +44,13 @@ export interface Server {
   agentInstallError?: string;
   agentInstallStage?: string;
   pendingUninstall: boolean;
+  // ---- Per-server agent configuration ----
+  heartbeatIntervalSecs: number;
+  logLevel: "debug" | "info" | "warn" | "error";
+  autoUpdate: boolean;
+  sessionRetentionDays: number;
+  /** NULL / undefined = no cap on concurrent sessions for this server. */
+  maxSessions?: number;
   createdBy: string;
   createdAt: number;
   updatedAt: number;

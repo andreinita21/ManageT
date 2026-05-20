@@ -8,7 +8,7 @@
 import React, { useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 
-import { useServers, createServer, deleteServer } from "@/lib/hooks/useApi";
+import { useServers, createServer, deleteServer, updateServer } from "@/lib/hooks/useApi";
 import { Button } from "@/components/ui/Button";
 import { Table } from "@/components/ui/Table";
 import { Modal } from "@/components/ui/Modal";
@@ -54,6 +54,9 @@ export function ServersTab() {
   const [deleteTarget, setDeleteTarget] = useState<Server | null>(null);
   const [forceDelete, setForceDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  // Server whose agent settings (heartbeat interval, log level, etc.)
+  // are being edited. NULL = modal closed.
+  const [agentEditTarget, setAgentEditTarget] = useState<Server | null>(null);
 
   const columns = useMemo(
     () => [
@@ -128,6 +131,17 @@ export function ServersTab() {
               variant="ghost"
               onClick={(e) => {
                 e.stopPropagation();
+                setAgentEditTarget(s);
+              }}
+              title="Edit per-server agent settings"
+            >
+              Agent
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={(e) => {
+                e.stopPropagation();
                 setForceDelete(false);
                 setDeleteTarget(s);
               }}
@@ -141,6 +155,26 @@ export function ServersTab() {
     ],
     [router]
   );
+
+  const handleSaveAgentConfig = async (
+    target: Server,
+    patch: {
+      heartbeatIntervalSecs: number;
+      logLevel: Server["logLevel"];
+      autoUpdate: boolean;
+      sessionRetentionDays: number;
+      maxSessions: number | null;
+    }
+  ) => {
+    try {
+      await updateServer(target.id, patch);
+      toast(`Agent settings saved for ${target.name}`, "success");
+      setAgentEditTarget(null);
+      refetch();
+    } catch (err) {
+      toast(err instanceof Error ? err.message : "Save failed", "error");
+    }
+  };
 
   const handleSubmit = async () => {
     setFormError(null);
@@ -412,6 +446,179 @@ export function ServersTab() {
           </label>
         </div>
       </Modal>
+
+      <AgentConfigModal
+        target={agentEditTarget}
+        onClose={() => setAgentEditTarget(null)}
+        onSave={handleSaveAgentConfig}
+      />
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Agent config modal
+// ---------------------------------------------------------------------------
+
+interface AgentConfigPatch {
+  heartbeatIntervalSecs: number;
+  logLevel: Server["logLevel"];
+  autoUpdate: boolean;
+  sessionRetentionDays: number;
+  maxSessions: number | null;
+}
+
+function AgentConfigModal({
+  target,
+  onClose,
+  onSave,
+}: {
+  target: Server | null;
+  onClose: () => void;
+  onSave: (target: Server, patch: AgentConfigPatch) => Promise<void> | void;
+}) {
+  // Local draft seeded from the row each time the modal opens.
+  const [heartbeat, setHeartbeat] = useState("10");
+  const [logLevel, setLogLevel] = useState<Server["logLevel"]>("info");
+  const [autoUpdate, setAutoUpdate] = useState(false);
+  const [retentionDays, setRetentionDays] = useState("30");
+  const [maxSessions, setMaxSessions] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  React.useEffect(() => {
+    if (!target) return;
+    setHeartbeat(String(target.heartbeatIntervalSecs));
+    setLogLevel(target.logLevel);
+    setAutoUpdate(target.autoUpdate);
+    setRetentionDays(String(target.sessionRetentionDays));
+    setMaxSessions(
+      target.maxSessions != null ? String(target.maxSessions) : ""
+    );
+    setError(null);
+  }, [target]);
+
+  const handleSave = async () => {
+    if (!target) return;
+    setError(null);
+    const hb = parseInt(heartbeat, 10);
+    if (Number.isNaN(hb) || hb < 5 || hb > 600) {
+      setError("Heartbeat interval must be between 5 and 600 seconds.");
+      return;
+    }
+    const ret = parseInt(retentionDays, 10);
+    if (Number.isNaN(ret) || ret < 0 || ret > 3650) {
+      setError("Retention must be between 0 (off) and 3650 days.");
+      return;
+    }
+    let cap: number | null = null;
+    if (maxSessions.trim() !== "") {
+      cap = parseInt(maxSessions, 10);
+      if (Number.isNaN(cap) || cap < 1 || cap > 1000) {
+        setError("Max sessions must be empty (no cap) or 1–1000.");
+        return;
+      }
+    }
+    setSaving(true);
+    try {
+      await onSave(target, {
+        heartbeatIntervalSecs: hb,
+        logLevel,
+        autoUpdate,
+        sessionRetentionDays: ret,
+        maxSessions: cap,
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Modal
+      open={target !== null}
+      onClose={() => {
+        if (!saving) onClose();
+      }}
+      title={`Agent settings — ${target?.name ?? ""}`}
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose} disabled={saving}>
+            Cancel
+          </Button>
+          <Button onClick={handleSave} loading={saving}>
+            Save
+          </Button>
+        </>
+      }
+    >
+      {target && (
+        <div className="space-y-4">
+          <p className="text-xs text-mg-text-tertiary">
+            Heartbeat interval, log level, and auto-update apply on the
+            agent's next restart or re-install. Retention and max sessions
+            are enforced by the dashboard immediately.
+          </p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Input
+              label="Heartbeat interval (seconds)"
+              type="number"
+              min={5}
+              max={600}
+              value={heartbeat}
+              onChange={(e) => setHeartbeat(e.target.value)}
+            />
+            <Select
+              label="Log level"
+              value={logLevel}
+              onChange={(e) =>
+                setLogLevel(e.target.value as Server["logLevel"])
+              }
+              options={[
+                { value: "debug", label: "debug" },
+                { value: "info", label: "info (default)" },
+                { value: "warn", label: "warn" },
+                { value: "error", label: "error" },
+              ]}
+            />
+            <Input
+              label="Session retention (days, 0 = never delete)"
+              type="number"
+              min={0}
+              max={3650}
+              value={retentionDays}
+              onChange={(e) => setRetentionDays(e.target.value)}
+            />
+            <Input
+              label="Max sessions (blank = no cap)"
+              type="number"
+              min={1}
+              max={1000}
+              value={maxSessions}
+              onChange={(e) => setMaxSessions(e.target.value)}
+              placeholder="unlimited"
+            />
+          </div>
+          <label className="flex items-start gap-2 text-sm text-mg-text-secondary cursor-pointer pt-1">
+            <input
+              type="checkbox"
+              checked={autoUpdate}
+              onChange={(e) => setAutoUpdate(e.target.checked)}
+              className="mt-0.5 accent-mg-accent"
+            />
+            <span>
+              <span className="font-medium text-mg-text">Auto-update agent</span>{" "}
+              — fetch the latest agent binary on every restart. Off by
+              default; turning it on may surprise users with a brief
+              restart on each agent boot.
+            </span>
+          </label>
+          {error && (
+            <div className="text-xs text-mg-danger bg-mg-danger/10 border border-mg-danger/30 rounded-md px-3 py-2">
+              {error}
+            </div>
+          )}
+        </div>
+      )}
+    </Modal>
   );
 }
