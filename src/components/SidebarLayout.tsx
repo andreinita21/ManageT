@@ -155,10 +155,9 @@ export function SidebarLayout({ children }: { children: React.ReactNode }) {
             left borders. Hover paints a subtle accent-tinted gradient
             sweep on each link without disturbing the indicator. */}
         <nav ref={navRef} className="relative flex-1 py-4 px-2 space-y-1">
-          {/* Sliding active indicator: a thin accent bar on the left
-              plus a soft accent-tinted panel that share the same
-              animated bbox. Hidden until measured to avoid the first
-              paint flying in from (0,0). */}
+          {/* Sliding active indicator: a soft accent-tinted panel that
+              animates between items. Hidden until measured to avoid
+              the first paint flying in from (0,0). */}
           <span
             aria-hidden
             className="pointer-events-none absolute left-2 right-2 rounded-lg"
@@ -169,7 +168,7 @@ export function SidebarLayout({ children }: { children: React.ReactNode }) {
               background:
                 "linear-gradient(90deg, color-mix(in srgb, var(--color-mg-accent) 18%, transparent) 0%, color-mix(in srgb, var(--color-mg-accent) 6%, transparent) 60%, transparent 100%)",
               boxShadow:
-                "inset 3px 0 0 0 var(--color-mg-accent), 0 0 18px -6px color-mix(in srgb, var(--color-mg-accent) 55%, transparent)",
+                "0 0 18px -6px color-mix(in srgb, var(--color-mg-accent) 55%, transparent)",
               transition: indicator.ready
                 ? "top 200ms cubic-bezier(0.2, 0.8, 0.2, 1), height 200ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity 160ms ease"
                 : "opacity 160ms ease",
@@ -208,16 +207,6 @@ export function SidebarLayout({ children }: { children: React.ReactNode }) {
                   {item.icon}
                   {!sidebarCollapsed && <span>{item.label}</span>}
                 </span>
-                {/* Active marker: a small pulsing accent dot pinned to
-                    the right edge. Hidden when collapsed because the
-                    sliding bar alone already carries the signal. */}
-                {active && !sidebarCollapsed && (
-                  <span
-                    aria-hidden
-                    className="relative z-[1] ml-auto h-1.5 w-1.5 rounded-full bg-mg-accent"
-                    style={{ boxShadow: "0 0 8px var(--color-mg-accent)" }}
-                  />
-                )}
               </Link>
             );
           })}
