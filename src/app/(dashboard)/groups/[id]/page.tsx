@@ -172,7 +172,7 @@ export default function GroupPage() {
 
   if (loading || !group) {
     return (
-      <div className="flex items-center justify-center h-[calc(100vh-3.5rem)] text-mg-text-tertiary text-sm">
+      <div className="flex items-center justify-center h-screen text-mg-text-tertiary text-sm">
         Loading group…
       </div>
     );
@@ -191,7 +191,7 @@ export default function GroupPage() {
   return (
     <div
       className="flex flex-col"
-      style={{ height: "calc(100vh - 3.5rem)" }}
+      style={{ height: "100vh" }}
     >
       <div className="flex items-center justify-between border-b border-mg-border bg-mg-bg-secondary px-4 py-2 flex-shrink-0">
         <div className="flex items-center gap-3 min-w-0">

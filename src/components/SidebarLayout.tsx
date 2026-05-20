@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useLayoutEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { signOut } from "next-auth/react";
@@ -69,6 +69,16 @@ const navItems = [
 export function SidebarLayout({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const navRef = useRef<HTMLElement | null>(null);
+  const linkRefs = useRef<Array<HTMLAnchorElement | null>>([]);
+  // Sliding-indicator geometry, measured from the active link's bbox.
+  // `ready` gates the entrance transition so the bar doesn't fly in
+  // from 0,0 on the first paint.
+  const [indicator, setIndicator] = useState<{ top: number; height: number; ready: boolean }>({
+    top: 0,
+    height: 0,
+    ready: false,
+  });
 
   // Don't render sidebar on the login page
   if (pathname === "/login") {
@@ -85,6 +95,35 @@ export function SidebarLayout({ children }: { children: React.ReactNode }) {
     if ("match" in item || "extraMatch" in item) return false;
     return pathname === item.href || pathname.startsWith(item.href + "/");
   };
+
+  const activeIndex = navItems.findIndex((item) => isActive(item));
+
+  // Re-measure the active link whenever the route changes or the
+  // sidebar collapses/expands (link heights stay the same but the
+  // container width changes — a ResizeObserver on the nav covers
+  // font-loading shifts too).
+  useLayoutEffect(() => {
+    const measure = () => {
+      const nav = navRef.current;
+      const link = activeIndex >= 0 ? linkRefs.current[activeIndex] : null;
+      if (!nav || !link) {
+        setIndicator((prev) => ({ ...prev, height: 0 }));
+        return;
+      }
+      const navRect = nav.getBoundingClientRect();
+      const linkRect = link.getBoundingClientRect();
+      setIndicator({
+        top: linkRect.top - navRect.top,
+        height: linkRect.height,
+        ready: true,
+      });
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined" || !navRef.current) return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(navRef.current);
+    return () => ro.disconnect();
+  }, [activeIndex, sidebarCollapsed]);
 
   return (
     <div className="flex h-screen overflow-hidden">
@@ -111,22 +150,74 @@ export function SidebarLayout({ children }: { children: React.ReactNode }) {
           )}
         </Link>
 
-        {/* Nav */}
-        <nav className="flex-1 py-4 px-2 space-y-1">
-          {navItems.map((item) => {
+        {/* Nav — a single sliding indicator (the accent bar + tinted
+            panel) animates between active items, replacing per-item
+            left borders. Hover paints a subtle accent-tinted gradient
+            sweep on each link without disturbing the indicator. */}
+        <nav ref={navRef} className="relative flex-1 py-4 px-2 space-y-1">
+          {/* Sliding active indicator: a thin accent bar on the left
+              plus a soft accent-tinted panel that share the same
+              animated bbox. Hidden until measured to avoid the first
+              paint flying in from (0,0). */}
+          <span
+            aria-hidden
+            className="pointer-events-none absolute left-2 right-2 rounded-lg"
+            style={{
+              top: indicator.top,
+              height: indicator.height,
+              opacity: indicator.height > 0 ? 1 : 0,
+              background:
+                "linear-gradient(90deg, color-mix(in srgb, var(--color-mg-accent) 18%, transparent) 0%, color-mix(in srgb, var(--color-mg-accent) 6%, transparent) 60%, transparent 100%)",
+              boxShadow:
+                "inset 3px 0 0 0 var(--color-mg-accent), 0 0 18px -6px color-mix(in srgb, var(--color-mg-accent) 55%, transparent)",
+              transition: indicator.ready
+                ? "top 200ms cubic-bezier(0.2, 0.8, 0.2, 1), height 200ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity 160ms ease"
+                : "opacity 160ms ease",
+            }}
+          />
+          {navItems.map((item, i) => {
             const active = isActive(item);
             return (
               <Link
                 key={item.href}
                 href={item.href}
-                className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all duration-200 ${
+                ref={(el) => {
+                  linkRefs.current[i] = el;
+                }}
+                aria-current={active ? "page" : undefined}
+                className={`group relative flex items-center gap-3 px-3 py-2.5 min-h-9 rounded-lg text-sm font-medium transition-colors duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-mg-accent focus-visible:ring-offset-0 ${
                   active
-                    ? "text-mg-accent bg-mg-bg-active border-l-2 border-mg-accent"
-                    : "text-mg-text-secondary hover:text-mg-text hover:bg-mg-bg-hover border-l-2 border-transparent"
+                    ? "text-mg-accent"
+                    : "text-mg-text-secondary hover:text-mg-text"
                 }`}
               >
-                {item.icon}
-                {!sidebarCollapsed && <span>{item.label}</span>}
+                {/* Per-link hover wash — sits behind the indicator on
+                    active items (which is fine; the indicator's own
+                    fill is denser) and provides the hover affordance
+                    on inactive ones. */}
+                <span
+                  aria-hidden
+                  className="pointer-events-none absolute inset-0 rounded-lg opacity-0 group-hover:opacity-100"
+                  style={{
+                    background:
+                      "linear-gradient(90deg, color-mix(in srgb, var(--color-mg-accent) 10%, transparent) 0%, transparent 80%)",
+                    transition: "opacity 160ms cubic-bezier(0.2, 0.8, 0.2, 1)",
+                  }}
+                />
+                <span className="relative z-[1] flex items-center gap-3">
+                  {item.icon}
+                  {!sidebarCollapsed && <span>{item.label}</span>}
+                </span>
+                {/* Active marker: a small pulsing accent dot pinned to
+                    the right edge. Hidden when collapsed because the
+                    sliding bar alone already carries the signal. */}
+                {active && !sidebarCollapsed && (
+                  <span
+                    aria-hidden
+                    className="relative z-[1] ml-auto h-1.5 w-1.5 rounded-full bg-mg-accent"
+                    style={{ boxShadow: "0 0 8px var(--color-mg-accent)" }}
+                  />
+                )}
               </Link>
             );
           })}

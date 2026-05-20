@@ -7,7 +7,7 @@
  * The interactive bits live in ./ServerDetailClient.tsx.
  */
 import { notFound, redirect } from "next/navigation";
-import { eq } from "drizzle-orm";
+import { and, eq, ne } from "drizzle-orm";
 import { auth } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { servers, sessions as sessionsTable } from "@/lib/db/schema";
@@ -35,7 +35,19 @@ export default async function ServerDetailPage({
   const [serverRows, bucketRows, sessionRows] = await Promise.all([
     db.select().from(servers).where(eq(servers.id, id)).limit(1),
     fetchMetricBuckets(id, "1h", from, to),
-    db.select().from(sessionsTable).where(eq(sessionsTable.serverId, id)),
+    // Mirror the GET /api/sessions filter: hide rows the reconciler has
+    // already marked as `closed` (orphans whose PTY no longer exists on
+    // the agent) so SSR matches the live useSessions() refetch and the
+    // /sessions hub.
+    db
+      .select()
+      .from(sessionsTable)
+      .where(
+        and(
+          eq(sessionsTable.serverId, id),
+          ne(sessionsTable.status, "closed")
+        )
+      ),
   ]);
 
   if (serverRows.length === 0) {

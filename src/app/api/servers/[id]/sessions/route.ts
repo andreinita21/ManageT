@@ -17,7 +17,7 @@ import { rowToSession } from "@/lib/db/transform";
 import { createSession, reconcileServer } from "@/lib/ssh/session-manager";
 
 export async function GET(
-  _request: Request,
+  request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const session = await auth();
@@ -36,7 +36,16 @@ export async function GET(
   // Best-effort reconcile. If the agent is down we fall back to whatever the
   // DB has (already handled inside reconcileServer).
   const merged = await reconcileServer(id);
-  return NextResponse.json({ data: merged });
+  // Drop rows the reconciler just marked as `closed` (orphans whose PTY
+  // no longer exists on the agent) so callers don't see ghost sessions.
+  // Matches the GET /api/sessions filter — both endpoints converge on
+  // the same "currently live" view by default.
+  const url = new URL(request.url);
+  const includeClosed = url.searchParams.get("includeClosed") === "1";
+  const data = includeClosed
+    ? merged
+    : merged.filter((s) => s.status !== "closed");
+  return NextResponse.json({ data });
 }
 
 const createBody = z.object({

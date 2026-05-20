@@ -204,7 +204,7 @@ function TerminalPage() {
   );
 
   return (
-    <div className="flex flex-col" style={{ height: "calc(100vh - 3.5rem)" }}>
+    <div className="flex flex-col" style={{ height: "100vh" }}>
       {/* Tab bar — only shown once at least one terminal is open. The
           empty state has its own "New Session" CTA, so the bar (and
           its "+" button) would be redundant chrome on a blank page. */}

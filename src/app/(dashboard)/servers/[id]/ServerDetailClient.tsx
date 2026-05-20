@@ -2,7 +2,13 @@
 
 import React, { useState, useMemo } from "react";
 import { useRouter } from "next/navigation";
-import { useServer, useServerMetrics, useSessions, retryAgentInstall } from "@/lib/hooks/useApi";
+import {
+  useServer,
+  useServerMetrics,
+  useSessions,
+  useLatestMetrics,
+  retryAgentInstall,
+} from "@/lib/hooks/useApi";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { AgentStatusBadge } from "@/components/server/AgentStatusBadge";
@@ -50,6 +56,12 @@ export function ServerDetailClient({
   const { data: server, refetch: refetchServer } = useServer(serverId, initialServer);
   const { data: metrics } = useServerMetrics(serverId, initialMetrics);
   const { data: sessions } = useSessions(serverId, initialSessions);
+  // Subscribe to the same live "latest sample" stream the dashboard uses so
+  // the Quick stats tiles on this page match what's shown on the dashboard
+  // card for this server. The bucketed `metrics` array still drives the
+  // history charts below.
+  const { data: latestByServer } = useLatestMetrics();
+  const liveLatest = latestByServer[serverId];
   const [activeTab, setActiveTab] = useState("metrics");
   // Tracks clicks on the Retry/Reinstall button so we can switch to the
   // live progress panel *immediately*, without waiting for the next
@@ -116,7 +128,22 @@ export function ServerDetailClient({
     []
   );
 
-  const latestMetric = currentMetrics.length > 0 ? currentMetrics[currentMetrics.length - 1] : null;
+  // The "Quick stats" tiles read from the live latest-sample stream so the
+  // numbers track the dashboard card (which polls /api/metrics/latest every
+  // 10s). Falling back to the most recent bucket only matters before the
+  // first poll completes — once we have a live sample, that's the source of
+  // truth for both views.
+  const latestBucket = currentMetrics.length > 0 ? currentMetrics[currentMetrics.length - 1] : null;
+  const latestMetric = liveLatest
+    ? {
+        cpuPercent: liveLatest.cpuPercent,
+        memoryUsedMb: liveLatest.memoryUsedMb,
+        memoryTotalMb: liveLatest.memoryTotalMb,
+        diskUsedPercent: liveLatest.diskUsedPercent,
+        load1m: liveLatest.load1m,
+        capturedAt: liveLatest.capturedAt,
+      }
+    : latestBucket;
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -284,19 +311,19 @@ export function ServerDetailClient({
                   <AreaChart data={chartData}>
                     <defs>
                       <linearGradient id="cpuGrad" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor="#a855f7" stopOpacity={0.3} />
-                        <stop offset="95%" stopColor="#a855f7" stopOpacity={0} />
+                        <stop offset="5%" stopColor="var(--color-mg-accent)" stopOpacity={0.3} />
+                        <stop offset="95%" stopColor="var(--color-mg-accent)" stopOpacity={0} />
                       </linearGradient>
                     </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                    <XAxis dataKey="time" stroke="#71717a" fontSize={11} />
-                    <YAxis stroke="#71717a" fontSize={11} domain={[0, 100]} />
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--color-mg-border)" />
+                    <XAxis dataKey="time" stroke="var(--color-mg-text-tertiary)" fontSize={11} />
+                    <YAxis stroke="var(--color-mg-text-tertiary)" fontSize={11} domain={[0, 100]} />
                     <Tooltip
-                      contentStyle={{ backgroundColor: "#12121a", border: "1px solid #27272a", borderRadius: "8px" }}
-                      labelStyle={{ color: "#a1a1aa" }}
-                      itemStyle={{ color: "#e4e4e7" }}
+                      contentStyle={{ backgroundColor: "var(--color-mg-bg-secondary)", border: "1px solid var(--color-mg-border)", borderRadius: "8px" }}
+                      labelStyle={{ color: "var(--color-mg-text-secondary)" }}
+                      itemStyle={{ color: "var(--color-mg-text)" }}
                     />
-                    <Area type="monotone" dataKey="cpu" stroke="#a855f7" fill="url(#cpuGrad)" strokeWidth={2} />
+                    <Area type="monotone" dataKey="cpu" stroke="var(--color-mg-accent)" fill="url(#cpuGrad)" strokeWidth={2} />
                   </AreaChart>
                 </ResponsiveContainer>
               </div>
@@ -308,19 +335,19 @@ export function ServerDetailClient({
                   <AreaChart data={chartData}>
                     <defs>
                       <linearGradient id="memGrad" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor="#c084fc" stopOpacity={0.3} />
-                        <stop offset="95%" stopColor="#c084fc" stopOpacity={0} />
+                        <stop offset="5%" stopColor="var(--color-mg-accent-bright)" stopOpacity={0.3} />
+                        <stop offset="95%" stopColor="var(--color-mg-accent-bright)" stopOpacity={0} />
                       </linearGradient>
                     </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                    <XAxis dataKey="time" stroke="#71717a" fontSize={11} />
-                    <YAxis stroke="#71717a" fontSize={11} domain={[0, 100]} />
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--color-mg-border)" />
+                    <XAxis dataKey="time" stroke="var(--color-mg-text-tertiary)" fontSize={11} />
+                    <YAxis stroke="var(--color-mg-text-tertiary)" fontSize={11} domain={[0, 100]} />
                     <Tooltip
-                      contentStyle={{ backgroundColor: "#12121a", border: "1px solid #27272a", borderRadius: "8px" }}
-                      labelStyle={{ color: "#a1a1aa" }}
-                      itemStyle={{ color: "#e4e4e7" }}
+                      contentStyle={{ backgroundColor: "var(--color-mg-bg-secondary)", border: "1px solid var(--color-mg-border)", borderRadius: "8px" }}
+                      labelStyle={{ color: "var(--color-mg-text-secondary)" }}
+                      itemStyle={{ color: "var(--color-mg-text)" }}
                     />
-                    <Area type="monotone" dataKey="memory" stroke="#c084fc" fill="url(#memGrad)" strokeWidth={2} />
+                    <Area type="monotone" dataKey="memory" stroke="var(--color-mg-accent-bright)" fill="url(#memGrad)" strokeWidth={2} />
                   </AreaChart>
                 </ResponsiveContainer>
               </div>
@@ -330,15 +357,15 @@ export function ServerDetailClient({
                 <h3 className="text-sm font-medium text-mg-text-secondary mb-4">System Load</h3>
                 <ResponsiveContainer width="100%" height={180}>
                   <LineChart data={chartData}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                    <XAxis dataKey="time" stroke="#71717a" fontSize={11} />
-                    <YAxis stroke="#71717a" fontSize={11} />
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--color-mg-border)" />
+                    <XAxis dataKey="time" stroke="var(--color-mg-text-tertiary)" fontSize={11} />
+                    <YAxis stroke="var(--color-mg-text-tertiary)" fontSize={11} />
                     <Tooltip
-                      contentStyle={{ backgroundColor: "#12121a", border: "1px solid #27272a", borderRadius: "8px" }}
-                      labelStyle={{ color: "#a1a1aa" }}
-                      itemStyle={{ color: "#e4e4e7" }}
+                      contentStyle={{ backgroundColor: "var(--color-mg-bg-secondary)", border: "1px solid var(--color-mg-border)", borderRadius: "8px" }}
+                      labelStyle={{ color: "var(--color-mg-text-secondary)" }}
+                      itemStyle={{ color: "var(--color-mg-text)" }}
                     />
-                    <Line type="monotone" dataKey="load1m" stroke="#7c3aed" strokeWidth={2} dot={false} />
+                    <Line type="monotone" dataKey="load1m" stroke="var(--color-mg-accent-dim)" strokeWidth={2} dot={false} />
                   </LineChart>
                 </ResponsiveContainer>
               </div>
