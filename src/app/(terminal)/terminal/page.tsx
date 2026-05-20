@@ -205,58 +205,62 @@ function TerminalPage() {
 
   return (
     <div className="flex flex-col" style={{ height: "calc(100vh - 3.5rem)" }}>
-      {/* Tab bar */}
-      <div className="flex items-center border-b border-mg-border bg-mg-bg-secondary px-2 flex-shrink-0">
-        <div className="flex items-center flex-1 overflow-x-auto">
-          {tabs.map((tab) => (
-            <div
-              key={tab.id}
-              className={`group flex items-center gap-2 px-4 py-2.5 text-sm cursor-pointer border-b-2 -mb-px transition-all duration-200 ${
-                activeTabId === tab.id
-                  ? "text-mg-accent border-mg-accent bg-mg-bg-active"
-                  : "text-mg-text-secondary border-transparent hover:text-mg-text hover:bg-mg-bg-hover"
-              }`}
-              onClick={() => setActiveTabId(tab.id)}
-            >
-              <span className="truncate max-w-[160px]">{tab.label}</span>
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  closeTab(tab.id);
-                }}
-                className="opacity-0 group-hover:opacity-100 text-mg-text-tertiary hover:text-mg-danger transition-all duration-200"
-                aria-label="Close tab"
+      {/* Tab bar — only shown once at least one terminal is open. The
+          empty state has its own "New Session" CTA, so the bar (and
+          its "+" button) would be redundant chrome on a blank page. */}
+      {tabs.length > 0 && (
+        <div className="flex items-center border-b border-mg-border bg-mg-bg-secondary px-2 flex-shrink-0">
+          <div className="flex items-center flex-1 overflow-x-auto">
+            {tabs.map((tab) => (
+              <div
+                key={tab.id}
+                className={`group flex items-center gap-2 px-4 py-2.5 text-sm cursor-pointer border-b-2 -mb-px transition-all duration-200 ${
+                  activeTabId === tab.id
+                    ? "text-mg-accent border-mg-accent bg-mg-bg-active"
+                    : "text-mg-text-secondary border-transparent hover:text-mg-text hover:bg-mg-bg-hover"
+                }`}
+                onClick={() => setActiveTabId(tab.id)}
               >
-                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M6 18L18 6M6 6l12 12"
-                  />
-                </svg>
-              </button>
-            </div>
-          ))}
+                <span className="truncate max-w-[160px]">{tab.label}</span>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    closeTab(tab.id);
+                  }}
+                  className="opacity-0 group-hover:opacity-100 text-mg-text-tertiary hover:text-mg-danger transition-all duration-200"
+                  aria-label="Close tab"
+                >
+                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M6 18L18 6M6 6l12 12"
+                    />
+                  </svg>
+                </button>
+              </div>
+            ))}
+          </div>
+          <div className="flex items-center gap-1 px-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setPickerOpen(true)}
+              title="New terminal"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M12 4v16m8-8H4"
+                />
+              </svg>
+            </Button>
+          </div>
         </div>
-        <div className="flex items-center gap-1 px-2">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setPickerOpen(true)}
-            title="New terminal"
-          >
-            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M12 4v16m8-8H4"
-              />
-            </svg>
-          </Button>
-        </div>
-      </div>
+      )}
 
       {/* Body */}
       <div className="flex-1 flex overflow-hidden min-h-0 relative">
