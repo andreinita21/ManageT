@@ -365,7 +365,7 @@ export default function SessionsPage() {
                 handleClose(s);
               }}
             >
-              <span className="text-red-400">Close</span>
+              <span className="text-mg-danger">Close</span>
             </Button>
           </div>
         ),
@@ -464,7 +464,7 @@ export default function SessionsPage() {
                 handleClose(s);
               }}
             >
-              <span className="text-red-400">Close</span>
+              <span className="text-mg-danger">Close</span>
             </Button>
           </div>
         ),
@@ -584,7 +584,7 @@ export default function SessionsPage() {
               onClick={handleBulkClose}
               disabled={selectedIds.size === 0 || bulkBusy}
             >
-              <span className="text-red-400">
+              <span className="text-mg-danger">
                 Close {selectedIds.size > 0 ? selectedIds.size : ""}
               </span>
             </Button>

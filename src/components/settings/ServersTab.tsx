@@ -132,7 +132,7 @@ export function ServersTab() {
                 setDeleteTarget(s);
               }}
             >
-              <span className="text-red-400">Delete</span>
+              <span className="text-mg-danger">Delete</span>
             </Button>
           </div>
         ),
@@ -350,7 +350,7 @@ export function ServersTab() {
               onChange={(e) => setForm({ ...form, groupName: e.target.value })}
             />
             {formError && (
-              <div className="text-xs text-red-400 bg-red-500/10 border border-red-500/30 rounded-md px-3 py-2">
+              <div className="text-xs text-mg-danger bg-mg-danger/10 border border-mg-danger/30 rounded-md px-3 py-2">
                 {formError}
               </div>
             )}
@@ -401,7 +401,7 @@ export function ServersTab() {
               type="checkbox"
               checked={forceDelete}
               onChange={(e) => setForceDelete(e.target.checked)}
-              className="mt-0.5 accent-red-500"
+              className="mt-0.5 accent-mg-danger"
             />
             <span>
               <span className="font-medium text-mg-text">Force delete</span>{" "}

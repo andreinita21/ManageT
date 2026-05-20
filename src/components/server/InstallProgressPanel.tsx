@@ -183,13 +183,13 @@ export function InstallProgressPanel({ serverId, onDone }: InstallProgressPanelP
       </ul>
 
       {failed && server?.agentInstallError && (
-        <div className="text-xs text-red-300 bg-red-500/10 border border-red-500/30 rounded-md px-3 py-2 whitespace-pre-wrap break-words font-mono">
+        <div className="text-xs text-mg-danger bg-mg-danger/10 border border-mg-danger/30 rounded-md px-3 py-2 whitespace-pre-wrap break-words font-mono">
           {server.agentInstallError}
         </div>
       )}
 
       {error && (
-        <div className="text-xs text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded-md px-3 py-2">
+        <div className="text-xs text-mg-warning bg-mg-warning/10 border border-mg-warning/30 rounded-md px-3 py-2">
           Poll error: {error}
         </div>
       )}
@@ -223,8 +223,8 @@ export function InstallProgressPanel({ serverId, onDone }: InstallProgressPanelP
 function StageIcon({ state }: { state: "pending" | "running" | "done" }) {
   if (state === "done") {
     return (
-      <span className="w-5 h-5 rounded-full bg-emerald-500/20 border border-emerald-400/40 flex items-center justify-center">
-        <svg className="w-3 h-3 text-emerald-300" viewBox="0 0 20 20" fill="currentColor">
+      <span className="w-5 h-5 rounded-full bg-mg-success/20 border border-mg-success/40 flex items-center justify-center">
+        <svg className="w-3 h-3 text-mg-success" viewBox="0 0 20 20" fill="currentColor">
           <path
             fillRule="evenodd"
             d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 111.4-1.4L8 12.58l7.3-7.3a1 1 0 011.4 0z"
@@ -236,7 +236,7 @@ function StageIcon({ state }: { state: "pending" | "running" | "done" }) {
   }
   if (state === "running") {
     return (
-      <span className="w-5 h-5 rounded-full border-2 border-blue-400/40 border-t-blue-400 animate-spin" />
+      <span className="w-5 h-5 rounded-full border-2 border-mg-info/40 border-t-mg-info animate-spin" />
     );
   }
   return <span className="w-5 h-5 rounded-full border border-mg-border" />;

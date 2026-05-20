@@ -644,7 +644,7 @@ function MosaicCell({
             }}
             draggable={false}
             onDragStart={(e) => e.preventDefault()}
-            className="w-5 h-5 flex items-center justify-center rounded text-mg-text-tertiary hover:text-red-400 hover:bg-mg-bg-hover text-xs leading-none ml-1"
+            className="w-5 h-5 flex items-center justify-center rounded text-mg-text-tertiary hover:text-mg-danger hover:bg-mg-bg-hover text-xs leading-none ml-1"
             title="Remove from group (shell keeps running)"
           >
             ✕
@@ -675,10 +675,10 @@ function MosaicCell({
           <span
             className={`text-[7rem] font-bold leading-none tabular-nums transition-colors ${
               isHoverTarget
-                ? "text-mg-accent-bright drop-shadow-[0_0_18px_rgba(168,85,247,0.7)]"
+                ? "text-mg-accent-bright drop-shadow-[0_0_18px_var(--color-mg-accent)]"
                 : isSource
                   ? "text-mg-accent/40"
-                  : "text-mg-accent/70 drop-shadow-[0_0_12px_rgba(168,85,247,0.45)]"
+                  : "text-mg-accent/70 drop-shadow-[0_0_12px_var(--color-mg-accent)]"
             }`}
             aria-hidden
           >

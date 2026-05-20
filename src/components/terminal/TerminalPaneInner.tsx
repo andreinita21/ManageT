@@ -470,15 +470,15 @@ export default function TerminalPaneInner({
             </>
           ) : status === "lost" ? (
             <>
-              <div className="w-2 h-2 rounded-full bg-yellow-400" />
-              <span className="text-xs text-yellow-400">
+              <div className="w-2 h-2 rounded-full bg-mg-warning" />
+              <span className="text-xs text-mg-warning">
                 Session lost{statusDetail ? `: ${statusDetail}` : ""}
               </span>
             </>
           ) : (
             <>
-              <div className="w-2 h-2 rounded-full bg-red-400" />
-              <span className="text-xs text-red-400">
+              <div className="w-2 h-2 rounded-full bg-mg-danger" />
+              <span className="text-xs text-mg-danger">
                 {status === "error" ? "Error" : "Disconnected"}
               </span>
             </>
@@ -490,7 +490,7 @@ export default function TerminalPaneInner({
       {errorMessage && (
         <div className="absolute inset-0 z-20 flex items-center justify-center p-6 bg-mg-bg-secondary/95">
           <div className="max-w-md text-center">
-            <div className="text-red-400 text-sm font-medium mb-2">Terminal failed</div>
+            <div className="text-mg-danger text-sm font-medium mb-2">Terminal failed</div>
             <div className="text-xs text-mg-text-secondary font-mono break-all">
               {errorMessage}
             </div>

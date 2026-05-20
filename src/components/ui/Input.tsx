@@ -32,11 +32,11 @@ export function Input({
         )}
         <input
           id={inputId}
-          className={`w-full rounded-lg bg-mg-bg-tertiary border border-mg-border px-3 py-2 text-sm text-mg-text placeholder:text-mg-text-tertiary focus:border-mg-accent focus:outline-none focus:ring-1 focus:ring-mg-accent/30 transition-all duration-200 ${icon ? "pl-10" : ""} ${error ? "border-red-500" : ""} ${className}`}
+          className={`w-full rounded-lg bg-mg-bg-tertiary border border-mg-border px-3 py-2 text-sm text-mg-text placeholder:text-mg-text-tertiary focus:border-mg-accent focus:outline-none focus:ring-1 focus:ring-mg-accent/30 transition-all duration-200 ${icon ? "pl-10" : ""} ${error ? "border-mg-danger" : ""} ${className}`}
           {...props}
         />
       </div>
-      {error && <span className="text-xs text-red-400">{error}</span>}
+      {error && <span className="text-xs text-mg-danger">{error}</span>}
     </div>
   );
 }

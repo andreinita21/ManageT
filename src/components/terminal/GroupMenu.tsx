@@ -194,7 +194,7 @@ export function GroupMenu({ session, onMutated }: GroupMenuProps) {
                 type="button"
                 onClick={handleLeave}
                 disabled={busy}
-                className="w-full text-left px-3 py-1.5 hover:bg-mg-bg-hover text-red-400 disabled:opacity-50"
+                className="w-full text-left px-3 py-1.5 hover:bg-mg-bg-hover text-mg-danger disabled:opacity-50"
               >
                 Remove from group
               </button>

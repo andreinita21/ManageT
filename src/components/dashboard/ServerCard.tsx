@@ -23,32 +23,32 @@ interface ServerCardProps {
  */
 const dotByAgentStatus: Record<Server["agentStatus"], { color: string; glow: string }> = {
   healthy: {
-    color: "bg-emerald-400",
-    glow: "shadow-[0_0_8px_rgba(52,211,153,0.6)]",
+    color: "bg-mg-success",
+    glow: "shadow-[0_0_8px_var(--color-mg-success)]",
   },
   installing: {
-    color: "bg-blue-400 animate-pulse",
-    glow: "shadow-[0_0_8px_rgba(96,165,250,0.5)]",
+    color: "bg-mg-info animate-pulse",
+    glow: "shadow-[0_0_8px_var(--color-mg-info)]",
   },
   install_failed: {
-    color: "bg-red-500",
-    glow: "shadow-[0_0_8px_rgba(239,68,68,0.6)]",
+    color: "bg-mg-danger",
+    glow: "shadow-[0_0_8px_var(--color-mg-danger)]",
   },
   unreachable: {
-    color: "bg-amber-400",
-    glow: "shadow-[0_0_8px_rgba(251,191,36,0.6)]",
+    color: "bg-mg-warning",
+    glow: "shadow-[0_0_8px_var(--color-mg-warning)]",
   },
   uninstalling: {
-    color: "bg-zinc-400 animate-pulse",
-    glow: "shadow-[0_0_8px_rgba(161,161,170,0.4)]",
+    color: "bg-mg-text-tertiary animate-pulse",
+    glow: "shadow-[0_0_8px_var(--color-mg-text-tertiary)]",
   },
   uninstall_failed: {
-    color: "bg-red-500",
-    glow: "shadow-[0_0_8px_rgba(239,68,68,0.6)]",
+    color: "bg-mg-danger",
+    glow: "shadow-[0_0_8px_var(--color-mg-danger)]",
   },
   not_installed: {
-    color: "bg-zinc-500",
-    glow: "shadow-[0_0_8px_rgba(113,113,122,0.3)]",
+    color: "bg-mg-text-tertiary",
+    glow: "shadow-[0_0_8px_var(--color-mg-text-tertiary)]",
   },
 };
 
@@ -112,7 +112,12 @@ export function ServerCard({ server, cpuHistory = [], memoryUsedMb, memoryTotalM
               className="h-full rounded-full transition-all duration-500"
               style={{
                 width: `${Math.min(memoryPercent, 100)}%`,
-                backgroundColor: memoryPercent > 90 ? "#ef4444" : memoryPercent > 70 ? "#f59e0b" : "#a855f7",
+                backgroundColor:
+                  memoryPercent > 90
+                    ? "var(--color-mg-danger)"
+                    : memoryPercent > 70
+                      ? "var(--color-mg-warning)"
+                      : "var(--color-mg-accent)",
               }}
             />
           </div>

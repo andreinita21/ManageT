@@ -23,6 +23,14 @@ export interface UiPalette {
   textTertiary: string;
   border: string;
   borderHover: string;
+  // Semantic status colours. Each preset pulls these from its own
+  // terminal palette so e.g. "online" picks up Catppuccin's green
+  // instead of Tailwind's emerald. Custom themes can override every
+  // value via the Appearance settings.
+  success: string;
+  warning: string;
+  danger: string;
+  info: string;
 }
 
 export interface TerminalPalette {
@@ -96,6 +104,35 @@ function uiFromTerminal(
       : lighten(t.foreground, 0.4),
     border: lift(t.background, 0.1),
     borderHover: lift(t.background, 0.2),
+    // Semantic colours derived from the terminal palette — bright
+    // variants tend to read better on dark backgrounds; on light
+    // themes we drop to the non-bright tones for legibility.
+    success: opts.isDark ? t.brightGreen : t.green,
+    warning: opts.isDark ? t.brightYellow : t.yellow,
+    danger: opts.isDark ? t.brightRed : t.red,
+    info: opts.isDark ? t.brightBlue : t.blue,
+  };
+}
+
+/**
+ * Fill in any missing semantic UI tokens on a legacy palette by
+ * deriving them from the paired terminal palette. Keeps backward
+ * compatibility for `customTheme` rows persisted before we added the
+ * status tokens.
+ */
+function withSemanticDefaults(colors: ThemeColors): ThemeColors {
+  const ui = colors.ui as Partial<UiPalette> & UiPalette;
+  if (ui.success && ui.warning && ui.danger && ui.info) return colors;
+  const t = colors.terminal;
+  return {
+    terminal: colors.terminal,
+    ui: {
+      ...ui,
+      success: ui.success ?? t.brightGreen ?? t.green,
+      warning: ui.warning ?? t.brightYellow ?? t.yellow,
+      danger: ui.danger ?? t.brightRed ?? t.red,
+      info: ui.info ?? t.brightBlue ?? t.blue,
+    },
   };
 }
 
@@ -178,6 +215,10 @@ const MG_DEFAULT_UI: UiPalette = {
   textTertiary: "#71717a",
   border: "#27272a",
   borderHover: "#3f3f46",
+  success: "#4ade80",
+  warning: "#facc15",
+  danger: "#f87171",
+  info: "#60a5fa",
 };
 
 // Catppuccin (https://github.com/catppuccin/catppuccin) — RGB hex from the
@@ -689,8 +730,12 @@ export const DEFAULT_PREFERENCES: AppearancePreferences = {
  */
 export function resolveColors(prefs: AppearancePreferences): ThemeColors {
   if (prefs.themeKey === "custom") {
-    return prefs.customTheme ?? PRESETS_BY_KEY[DEFAULT_PRESET_KEY].colors;
+    return withSemanticDefaults(
+      prefs.customTheme ?? PRESETS_BY_KEY[DEFAULT_PRESET_KEY].colors
+    );
   }
   const preset = PRESETS_BY_KEY[prefs.themeKey];
-  return preset ? preset.colors : PRESETS_BY_KEY[DEFAULT_PRESET_KEY].colors;
+  return withSemanticDefaults(
+    preset ? preset.colors : PRESETS_BY_KEY[DEFAULT_PRESET_KEY].colors
+  );
 }

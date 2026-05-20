@@ -367,7 +367,7 @@ export default function StacksPage() {
                 handleHardDelete(s);
               }}
             >
-              <span className="text-red-400">Delete forever</span>
+              <span className="text-mg-danger">Delete forever</span>
             </Button>
           </div>
         ),
@@ -675,7 +675,7 @@ function StackEditor({
                 {draft.services.length > 1 && (
                   <button
                     type="button"
-                    className="text-xs text-red-400 hover:underline"
+                    className="text-xs text-mg-danger hover:underline"
                     onClick={() => removeService(svc.key)}
                   >
                     Remove
@@ -891,13 +891,13 @@ function StateBadge({
     },
     partial: {
       text: `Partial ${runtime.activeCount}/${runtime.totalCount}`,
-      dot: "bg-amber-400",
-      bg: "bg-amber-500/15 text-amber-300",
+      dot: "bg-mg-warning",
+      bg: "bg-mg-warning/15 text-mg-warning",
     },
     running: {
       text: `Running ${runtime.activeCount}/${runtime.totalCount}`,
-      dot: "bg-emerald-400",
-      bg: "bg-emerald-500/15 text-emerald-300",
+      dot: "bg-mg-success",
+      bg: "bg-mg-success/15 text-mg-success",
     },
   };
   const l = labels[runtime.state];
@@ -988,7 +988,7 @@ function StackRowActions({
           onDelete(stack);
         }}
       >
-        <span className="text-red-400">Delete</span>
+        <span className="text-mg-danger">Delete</span>
       </Button>
     </div>
   );
@@ -1088,8 +1088,8 @@ function StackDetailGrid({
                   </td>
                   <td className="px-3 py-2">
                     {isActive ? (
-                      <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/15 px-2 py-0.5 text-xs font-medium text-emerald-300">
-                        <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                      <span className="inline-flex items-center gap-1.5 rounded-full bg-mg-success/15 px-2 py-0.5 text-xs font-medium text-mg-success">
+                        <span className="h-1.5 w-1.5 rounded-full bg-mg-success" />
                         running
                       </span>
                     ) : (

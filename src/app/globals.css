@@ -28,12 +28,23 @@
   --color-mg-border: #27272a;
   --color-mg-border-hover: #3f3f46;
 
+  /* Semantic status colours. ThemeProvider rewrites these per-preset so
+   * status dots, error pills, etc. pull from the active theme's
+   * terminal palette instead of fixed Tailwind tones. */
+  --color-mg-success: #4ade80;
+  --color-mg-warning: #facc15;
+  --color-mg-danger: #f87171;
+  --color-mg-info: #60a5fa;
+
   --font-sans: var(--font-inter), system-ui, sans-serif;
   --font-mono: var(--font-jetbrains), "Fira Code", monospace;
 
-  --shadow-glow: 0 0 20px rgba(168, 85, 247, 0.15);
-  --shadow-glow-lg: 0 0 40px rgba(168, 85, 247, 0.2);
-  --shadow-glow-hover: 0 0 30px rgba(168, 85, 247, 0.3);
+  /* Glow shadows pull from the active accent so card hovers and the
+   * alert pulse repaint with the theme. color-mix gives us soft alpha
+   * without baking in a specific hue. */
+  --shadow-glow: 0 0 20px color-mix(in srgb, var(--color-mg-accent) 15%, transparent);
+  --shadow-glow-lg: 0 0 40px color-mix(in srgb, var(--color-mg-accent) 20%, transparent);
+  --shadow-glow-hover: 0 0 30px color-mix(in srgb, var(--color-mg-accent) 30%, transparent);
 
   --animate-pulse-glow: pulse-glow 2s ease-in-out infinite;
   --animate-fade-in: fade-in 0.2s ease-out;
@@ -41,8 +52,8 @@
 }
 
 @keyframes pulse-glow {
-  0%, 100% { box-shadow: 0 0 20px rgba(168, 85, 247, 0.15); }
-  50% { box-shadow: 0 0 30px rgba(168, 85, 247, 0.3); }
+  0%, 100% { box-shadow: 0 0 20px color-mix(in srgb, var(--color-mg-accent) 15%, transparent); }
+  50% { box-shadow: 0 0 30px color-mix(in srgb, var(--color-mg-accent) 30%, transparent); }
 }
 
 @keyframes fade-in {

@@ -82,6 +82,10 @@ const UI_VAR_MAP: Record<keyof UiPalette, string> = {
   textTertiary: "--color-mg-text-tertiary",
   border: "--color-mg-border",
   borderHover: "--color-mg-border-hover",
+  success: "--color-mg-success",
+  warning: "--color-mg-warning",
+  danger: "--color-mg-danger",
+  info: "--color-mg-info",
 };
 
 function applyUiPalette(palette: UiPalette): void {

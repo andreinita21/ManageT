@@ -12,7 +12,7 @@ export function AlertBadge({ count, className = "" }: AlertBadgeProps) {
 
   return (
     <span
-      className={`inline-flex items-center justify-center min-w-[20px] h-5 rounded-full bg-red-500/20 text-red-400 border border-red-500/30 text-xs font-bold px-1.5 animate-pulse-glow ${className}`}
+      className={`inline-flex items-center justify-center min-w-[20px] h-5 rounded-full bg-mg-danger/20 text-mg-danger border border-mg-danger/30 text-xs font-bold px-1.5 animate-pulse-glow ${className}`}
     >
       {count > 99 ? "99+" : count}
     </span>

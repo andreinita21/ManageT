@@ -96,11 +96,11 @@ export default function DashboardPage() {
         </div>
         <div className="bg-mg-bg-secondary border border-mg-border rounded-lg p-4">
           <p className="text-xs text-mg-text-tertiary uppercase tracking-wider">Online</p>
-          <p className="text-2xl font-bold text-emerald-400 mt-1">{counts.connected}</p>
+          <p className="text-2xl font-bold text-mg-success mt-1">{counts.connected}</p>
         </div>
         <div className="bg-mg-bg-secondary border border-mg-border rounded-lg p-4">
           <p className="text-xs text-mg-text-tertiary uppercase tracking-wider">Offline</p>
-          <p className="text-2xl font-bold text-red-400 mt-1">{counts.disconnected}</p>
+          <p className="text-2xl font-bold text-mg-danger mt-1">{counts.disconnected}</p>
         </div>
       </div>
 
@@ -140,8 +140,8 @@ export default function DashboardPage() {
           ))}
         </div>
       ) : error ? (
-        <div className="bg-mg-bg-secondary border border-red-500/30 rounded-lg p-8 text-center">
-          <p className="text-red-400 text-sm">Failed to load servers: {error}</p>
+        <div className="bg-mg-bg-secondary border border-mg-danger/30 rounded-lg p-8 text-center">
+          <p className="text-mg-danger text-sm">Failed to load servers: {error}</p>
           <Button variant="secondary" size="sm" className="mt-4" onClick={refetch}>
             Retry
           </Button>

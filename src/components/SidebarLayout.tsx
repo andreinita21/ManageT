@@ -136,7 +136,7 @@ export function SidebarLayout({ children }: { children: React.ReactNode }) {
         <div className="px-2 pb-4 space-y-1">
           <button
             onClick={() => signOut({ callbackUrl: "/login" })}
-            className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-mg-text-tertiary hover:text-red-400 hover:bg-mg-bg-hover transition-all duration-200"
+            className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-mg-text-tertiary hover:text-mg-danger hover:bg-mg-bg-hover transition-all duration-200"
           >
             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
@@ -162,19 +162,6 @@ export function SidebarLayout({ children }: { children: React.ReactNode }) {
 
       {/* Main content */}
       <div className="flex-1 flex flex-col overflow-hidden">
-        {/* Top bar */}
-        <header className="h-14 border-b border-mg-border bg-mg-bg-secondary flex items-center justify-between px-6">
-          <div className="flex items-center gap-4">
-            <h1 className="text-sm font-medium text-mg-text capitalize">
-              {pathname.split("/").filter(Boolean)[0] || "Dashboard"}
-            </h1>
-          </div>
-          <div className="flex items-center gap-3">
-            <div className="w-2 h-2 rounded-full bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.5)]" />
-            <span className="text-xs text-mg-text-secondary">System Online</span>
-          </div>
-        </header>
-
         {/* Page content */}
         {/* /stacks and /groups own their own padding because they can split
             into a table + terminal mosaic layout that needs to fill the

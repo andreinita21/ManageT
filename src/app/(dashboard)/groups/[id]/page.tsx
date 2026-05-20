@@ -256,7 +256,7 @@ export default function GroupPage() {
             onClick={handleDeleteGroup}
             disabled={busy}
           >
-            <span className="text-red-400">Delete group</span>
+            <span className="text-mg-danger">Delete group</span>
           </Button>
           <Button
             onClick={() => setAddOpen(true)}

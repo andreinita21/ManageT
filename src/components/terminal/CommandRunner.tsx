@@ -86,12 +86,12 @@ export function CommandRunner({ servers, className = "" }: CommandRunnerProps) {
       {(result || error) && (
         <div className="bg-mg-bg rounded-lg border border-mg-border overflow-hidden">
           {error && (
-            <div className="px-4 py-3 text-sm text-red-400">{error}</div>
+            <div className="px-4 py-3 text-sm text-mg-danger">{error}</div>
           )}
           {result && (
             <>
               <div className="flex items-center gap-3 px-4 py-2 border-b border-mg-border text-xs">
-                <span className={`font-mono ${result.exitCode === 0 ? "text-emerald-400" : "text-red-400"}`}>
+                <span className={`font-mono ${result.exitCode === 0 ? "text-mg-success" : "text-mg-danger"}`}>
                   exit: {result.exitCode}
                 </span>
                 <span className="text-mg-text-tertiary">
@@ -104,7 +104,7 @@ export function CommandRunner({ servers, className = "" }: CommandRunnerProps) {
                 </pre>
               )}
               {result.stderr && (
-                <pre className="px-4 py-3 text-xs font-mono text-red-400 overflow-x-auto whitespace-pre-wrap border-t border-mg-border">
+                <pre className="px-4 py-3 text-xs font-mono text-mg-danger overflow-x-auto whitespace-pre-wrap border-t border-mg-border">
                   {result.stderr}
                 </pre>
               )}

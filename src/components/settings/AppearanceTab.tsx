@@ -166,6 +166,10 @@ const UI_COLOR_FIELDS: ColorField[] = [
   { key: "textTertiary", label: "Text tertiary", scope: "ui" },
   { key: "border", label: "Border", scope: "ui" },
   { key: "borderHover", label: "Border hover", scope: "ui" },
+  { key: "success", label: "Success (online)", scope: "ui" },
+  { key: "warning", label: "Warning", scope: "ui" },
+  { key: "danger", label: "Danger / error", scope: "ui" },
+  { key: "info", label: "Info / pending", scope: "ui" },
 ];
 
 /** Normalise any string into a 6-digit hex acceptable to <input type="color">.

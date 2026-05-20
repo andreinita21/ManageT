@@ -25,10 +25,10 @@ function ToastNotification({ item, onDismiss }: { item: ToastItem; onDismiss: (i
   }, [item.id, onDismiss]);
 
   const iconColors: Record<ToastItem["type"], string> = {
-    success: "text-emerald-400",
-    error: "text-red-400",
-    info: "text-blue-400",
-    warning: "text-amber-400",
+    success: "text-mg-success",
+    error: "text-mg-danger",
+    info: "text-mg-info",
+    warning: "text-mg-warning",
   };
 
   return (

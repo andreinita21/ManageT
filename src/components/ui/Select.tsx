@@ -33,7 +33,7 @@ export function Select({
       )}
       <select
         id={selectId}
-        className={`w-full rounded-lg bg-mg-bg-tertiary border border-mg-border px-3 py-2 text-sm text-mg-text focus:border-mg-accent focus:outline-none focus:ring-1 focus:ring-mg-accent/30 transition-all duration-200 ${error ? "border-red-500" : ""} ${className}`}
+        className={`w-full rounded-lg bg-mg-bg-tertiary border border-mg-border px-3 py-2 text-sm text-mg-text focus:border-mg-accent focus:outline-none focus:ring-1 focus:ring-mg-accent/30 transition-all duration-200 ${error ? "border-mg-danger" : ""} ${className}`}
         {...props}
       >
         {placeholder && (
@@ -47,7 +47,7 @@ export function Select({
           </option>
         ))}
       </select>
-      {error && <span className="text-xs text-red-400">{error}</span>}
+      {error && <span className="text-xs text-mg-danger">{error}</span>}
     </div>
   );
 }

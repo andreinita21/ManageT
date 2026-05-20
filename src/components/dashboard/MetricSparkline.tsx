@@ -14,7 +14,9 @@ export function MetricSparkline({
   data,
   width = 120,
   height = 30,
-  color = "#a855f7",
+  // Default to the active theme's accent so the sparkline retints when
+  // the user switches themes instead of staying ManageT purple.
+  color = "var(--color-mg-accent)",
   className = "",
 }: MetricSparklineProps) {
   if (data.length < 2) {

@@ -164,7 +164,7 @@ function TerminalPanel({
         <div className="flex items-center gap-2 min-w-0">
           <span
             className={`h-1.5 w-1.5 rounded-full flex-shrink-0 ${
-              isActive ? "bg-emerald-400" : "bg-mg-text-tertiary/60"
+              isActive ? "bg-mg-success" : "bg-mg-text-tertiary/60"
             }`}
           />
           <span className="font-mono text-mg-text truncate">{svc.name}</span>

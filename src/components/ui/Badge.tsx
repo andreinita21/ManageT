@@ -10,9 +10,9 @@ interface BadgeProps {
 
 const variantClasses: Record<NonNullable<BadgeProps["variant"]>, string> = {
   default: "bg-mg-bg-tertiary text-mg-text-secondary",
-  success: "bg-emerald-500/15 text-emerald-400 border-emerald-500/30",
-  warning: "bg-amber-500/15 text-amber-400 border-amber-500/30",
-  danger: "bg-red-500/15 text-red-400 border-red-500/30",
+  success: "bg-mg-success/15 text-mg-success border-mg-success/30",
+  warning: "bg-mg-warning/15 text-mg-warning border-mg-warning/30",
+  danger: "bg-mg-danger/15 text-mg-danger border-mg-danger/30",
   accent: "bg-mg-accent/15 text-mg-accent-bright border-mg-accent/30",
 };
 
