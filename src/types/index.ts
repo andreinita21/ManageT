@@ -62,6 +62,8 @@ export interface Session {
   disconnectedAt?: number;
   retryCount: number;
   stackId?: string;
+  groupId?: string;
+  groupOrderIndex?: number;
   createdAt: number;
   updatedAt: number;
 }
@@ -194,6 +196,60 @@ export interface LaunchStackResponse {
     serverId: string;
     error: string;
   }>;
+}
+
+// --- Groups (mosaic-view collections of standalone sessions) ---
+
+/** Hard cap on terminals per group. Matches the mosaic layout (max two
+ *  rows of three). */
+export const GROUP_MAX_MEMBERS = 6;
+
+export interface Group {
+  id: string;
+  name: string;
+  createdBy: string;
+  createdAt: number;
+  updatedAt: number;
+  /** Member sessions, ordered by `groupOrderIndex`. */
+  members: Session[];
+}
+
+/** Per-user persisted layout for a group's mosaic.
+ *
+ *  `rowHeights` is a 1- or 2-entry array summing to 1. `colWidthsByRow`
+ *  has one inner array per row; each inner array sums to 1 and has length
+ *  matching the number of members in that row. If counts no longer match
+ *  the current member arrangement, the UI falls back to the default
+ *  equal-split layout (and overwrites on the next drag).
+ *
+ *  `fontSizeBySession` carries optional per-pane font-size overrides
+ *  (the user's +/- bumps from the cell bar). Keys that don't appear
+ *  fall back to the global appearance default.
+ */
+export interface GroupLayout {
+  rowHeights: number[];
+  colWidthsByRow: number[][];
+  fontSizeBySession?: Record<string, number>;
+}
+
+export interface CreateGroupRequest {
+  name: string;
+  /** First member — required, since empty groups aren't allowed. */
+  sessionId: string;
+}
+
+export interface UpdateGroupRequest {
+  name?: string;
+}
+
+export interface AddGroupMemberRequest {
+  sessionId: string;
+}
+
+export interface ReorderGroupRequest {
+  /** Full ordered list of session ids in the group. Length must equal
+   *  current member count. */
+  sessionIds: string[];
 }
 
 export interface Alert {

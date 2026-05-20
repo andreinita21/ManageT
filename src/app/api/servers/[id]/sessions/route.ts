@@ -13,24 +13,8 @@ import { eq } from "drizzle-orm";
 import { auth } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { sessions, servers } from "@/lib/db/schema";
+import { rowToSession } from "@/lib/db/transform";
 import { createSession, reconcileServer } from "@/lib/ssh/session-manager";
-import type { Session } from "@/types";
-
-function rowToSession(r: typeof sessions.$inferSelect): Session {
-  return {
-    ...r,
-    status: r.status as Session["status"],
-    restartPolicy: r.restartPolicy as Session["restartPolicy"],
-    cwd: r.cwd ?? undefined,
-    lastCommand: r.lastCommand ?? undefined,
-    envSnapshot: r.envSnapshot
-      ? (JSON.parse(r.envSnapshot) as Record<string, string>)
-      : undefined,
-    scrollBufferTail: r.scrollBufferTail ?? undefined,
-    disconnectedAt: r.disconnectedAt ?? undefined,
-    stackId: r.stackId ?? undefined,
-  };
-}
 
 export async function GET(
   _request: Request,
@@ -86,7 +70,23 @@ export async function POST(
     );
   }
   try {
-    const created = await createSession(serverId, parsed.data);
+    // Mirror the WS session:create handler: look up the server's
+    // configured Unix username so the agent spawns the shell as that
+    // user instead of as itself (root, on hosts where the agent runs
+    // as root). Without this the group-view "+ Add terminal" flow
+    // landed users in a root shell — see the WS handler for the
+    // original rationale.
+    const serverRows = await db
+      .select({ username: servers.username })
+      .from(servers)
+      .where(eq(servers.id, serverId))
+      .limit(1);
+    const username = serverRows[0]?.username;
+
+    const created = await createSession(serverId, {
+      ...parsed.data,
+      user: username,
+    });
     const rows = await db
       .select()
       .from(sessions)

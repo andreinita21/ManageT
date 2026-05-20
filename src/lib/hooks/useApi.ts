@@ -17,6 +17,8 @@ import type {
   LaunchStackResponse,
   TestRestartRuleRequest,
   TestRestartRuleResponse,
+  Group,
+  GroupLayout,
 } from "@/types";
 
 const API_BASE = "/api";
@@ -205,6 +207,21 @@ export async function deleteSession(id: string): Promise<void> {
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
 }
 
+export async function updateSession(
+  id: string,
+  patch: { sessionName?: string; restartPolicy?: "auto" | "ask" | "never" }
+): Promise<Session> {
+  const res = await fetch(`${API_BASE}/sessions/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  handleUnauthorized(res);
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
+  return (json.data ?? json) as Session;
+}
+
 export function useSession(id: string) {
   return useFetch<Session>(`/sessions/${id}`);
 }
@@ -391,6 +408,114 @@ export async function stopStack(id: string): Promise<{ stopped: number }> {
   }
   const json = await res.json();
   return (json.data ?? json) as { stopped: number };
+}
+
+// --- Group hooks ---
+
+export function useGroups() {
+  return useFetch<Group[]>("/groups");
+}
+
+export function useGroup(id: string) {
+  return useFetch<Group>(`/groups/${id}`);
+}
+
+export async function createGroup(data: { name: string; sessionId: string }): Promise<Group> {
+  const res = await fetch(`${API_BASE}/groups`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  handleUnauthorized(res);
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
+  return (json.data ?? json) as Group;
+}
+
+export async function renameGroup(id: string, name: string): Promise<Group> {
+  const res = await fetch(`${API_BASE}/groups/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  handleUnauthorized(res);
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
+  return (json.data ?? json) as Group;
+}
+
+export async function deleteGroup(id: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/groups/${id}`, { method: "DELETE" });
+  handleUnauthorized(res);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+}
+
+export async function addGroupMember(
+  groupId: string,
+  sessionId: string
+): Promise<Group> {
+  const res = await fetch(`${API_BASE}/groups/${groupId}/members`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId }),
+  });
+  handleUnauthorized(res);
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
+  return (json.data ?? json) as Group;
+}
+
+export async function removeGroupMember(
+  groupId: string,
+  sessionId: string
+): Promise<{ group: Group | null; groupDeleted: boolean }> {
+  const res = await fetch(
+    `${API_BASE}/groups/${groupId}/members/${sessionId}`,
+    { method: "DELETE" }
+  );
+  handleUnauthorized(res);
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
+  return {
+    group: (json.data ?? null) as Group | null,
+    groupDeleted: Boolean(json.groupDeleted),
+  };
+}
+
+export async function reorderGroup(
+  groupId: string,
+  sessionIds: string[]
+): Promise<Group> {
+  const res = await fetch(`${API_BASE}/groups/${groupId}/order`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionIds }),
+  });
+  handleUnauthorized(res);
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
+  return (json.data ?? json) as Group;
+}
+
+export async function getGroupLayout(groupId: string): Promise<GroupLayout | null> {
+  const res = await fetch(`${API_BASE}/groups/${groupId}/layout`);
+  handleUnauthorized(res);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const json = await res.json();
+  return (json.data ?? null) as GroupLayout | null;
+}
+
+export async function saveGroupLayout(
+  groupId: string,
+  layout: GroupLayout
+): Promise<void> {
+  const res = await fetch(`${API_BASE}/groups/${groupId}/layout`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(layout),
+  });
+  handleUnauthorized(res);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
 }
 
 // --- Command execution ---

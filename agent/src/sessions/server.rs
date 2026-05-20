@@ -117,11 +117,16 @@ async fn handle_client(stream: UnixStream, manager: Arc<SessionManager>) -> Resu
             let c = cols.unwrap_or(80);
             match manager.create(name, command, r, c, user) {
                 Ok(sess) => {
+                    // Snapshot the name *before* the `await` so we don't
+                    // hold a MutexGuard across a suspension point — the
+                    // guard isn't Send and the dispatcher future has to
+                    // be Send for tokio::spawn.
+                    let name_snapshot = sess.name.lock().unwrap().clone();
                     send_resp(
                         &mut wr,
                         &Response::Created {
                             id: sess.id.clone(),
-                            name: sess.name.clone(),
+                            name: name_snapshot,
                         },
                     )
                     .await?;
@@ -171,6 +176,21 @@ async fn handle_client(stream: UnixStream, manager: Arc<SessionManager>) -> Resu
             }
             Ok(())
         }
+        Request::Rename { id, name } => {
+            match manager.rename(&id, name) {
+                Ok(()) => send_resp(&mut wr, &Response::Ok).await?,
+                Err(e) => {
+                    send_resp(
+                        &mut wr,
+                        &Response::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await?
+                }
+            }
+            Ok(())
+        }
         Request::Attach { id, rows, cols } => {
             // Resolve session first so we can return a clean error before
             // switching to raw mode.
@@ -192,11 +212,12 @@ async fn handle_client(stream: UnixStream, manager: Arc<SessionManager>) -> Resu
             if let (Some(r), Some(c)) = (rows, cols) {
                 sess.resize(r, c).await;
             }
+            let name_snapshot = sess.name.lock().unwrap().clone();
             send_resp(
                 &mut wr,
                 &Response::Attached {
                     id: sess.id.clone(),
-                    name: sess.name.clone(),
+                    name: name_snapshot,
                 },
             )
             .await?;

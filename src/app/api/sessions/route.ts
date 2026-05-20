@@ -6,24 +6,9 @@ import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { sessions } from "@/lib/db/schema";
+import { rowToSession } from "@/lib/db/transform";
 import { eq } from "drizzle-orm";
 import type { Session } from "@/types";
-
-function rowToSession(r: typeof sessions.$inferSelect): Session {
-  return {
-    ...r,
-    status: r.status as Session["status"],
-    restartPolicy: r.restartPolicy as Session["restartPolicy"],
-    cwd: r.cwd ?? undefined,
-    lastCommand: r.lastCommand ?? undefined,
-    envSnapshot: r.envSnapshot
-      ? (JSON.parse(r.envSnapshot) as Record<string, string>)
-      : undefined,
-    scrollBufferTail: r.scrollBufferTail ?? undefined,
-    disconnectedAt: r.disconnectedAt ?? undefined,
-    stackId: r.stackId ?? undefined,
-  };
-}
 
 export async function GET(request: Request) {
   const session = await auth();

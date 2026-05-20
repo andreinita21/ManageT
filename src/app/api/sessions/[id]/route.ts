@@ -1,40 +1,29 @@
 /**
  * API routes for individual session operations.
  * GET /api/sessions/[id] — get session details
- * PUT /api/sessions/[id] — update session (restartPolicy, status)
+ * PUT /api/sessions/[id] — update session (restartPolicy, status, sessionName)
  * DELETE /api/sessions/[id] — kill the session and remove it
  */
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { sessions } from "@/lib/db/schema";
+import { rowToSession } from "@/lib/db/transform";
 import { eq } from "drizzle-orm";
 import { z } from "zod";
-import { killSession } from "@/lib/ssh/session-manager";
-import type { Session } from "@/types";
+import { killSession, renameSession } from "@/lib/ssh/session-manager";
 
 const updateSessionSchema = z.object({
   restartPolicy: z.enum(["auto", "ask", "never"]).optional(),
   status: z
     .enum(["active", "disconnected", "reconnecting", "recovering", "closed"])
     .optional(),
+  // Display name for the session — surfaces in /sessions, /terminal
+  // tabs, group mosaic bars, etc. Bounded to keep table cells readable.
+  // We don't touch the agent's view of the PTY: the rename is purely a
+  // dashboard-side label.
+  sessionName: z.string().trim().min(1).max(80).optional(),
 });
-
-function rowToSession(r: typeof sessions.$inferSelect): Session {
-  return {
-    ...r,
-    status: r.status as Session["status"],
-    restartPolicy: r.restartPolicy as Session["restartPolicy"],
-    cwd: r.cwd ?? undefined,
-    lastCommand: r.lastCommand ?? undefined,
-    envSnapshot: r.envSnapshot
-      ? (JSON.parse(r.envSnapshot) as Record<string, string>)
-      : undefined,
-    scrollBufferTail: r.scrollBufferTail ?? undefined,
-    disconnectedAt: r.disconnectedAt ?? undefined,
-    stackId: r.stackId ?? undefined,
-  };
-}
 
 export async function GET(
   _request: Request,
@@ -99,6 +88,37 @@ export async function PUT(
 
   if (input.restartPolicy !== undefined) updates.restartPolicy = input.restartPolicy;
   if (input.status !== undefined) updates.status = input.status;
+  if (input.sessionName !== undefined) updates.sessionName = input.sessionName;
+
+  // Sync the session name to the agent BEFORE writing the DB. If the
+  // agent rejects (e.g. older binary without rename op), we want the
+  // dashboard's name to stay identical to what `managet ls` / `managet
+  // attach <name>` reports on the host — that's the entire point of
+  // the round-trip — so the DB write only happens if the agent
+  // accepted or the row is already stale (agent never knew about it).
+  if (
+    input.sessionName !== undefined &&
+    input.sessionName !== existing[0].sessionName
+  ) {
+    const outcome = await renameSession(
+      existing[0].serverId,
+      id,
+      input.sessionName
+    );
+    if (outcome.kind === "agent_rejected") {
+      return NextResponse.json(
+        {
+          error:
+            "Agent refused the rename — likely an older agent binary without the `rename` op. Redeploy the agent and try again.",
+          detail: outcome.message,
+        },
+        { status: 502 }
+      );
+    }
+    // `pushed` and `stale` both fall through to the DB update. Stale
+    // sessions get reconciled to `closed` on the next /sessions read,
+    // and renaming a row that's about to be closed is harmless.
+  }
 
   await db.update(sessions).set(updates).where(eq(sessions.id, id));
 

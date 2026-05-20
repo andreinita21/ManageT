@@ -21,6 +21,7 @@ import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } fr
 import { useSearchParams } from "next/navigation";
 import { TerminalPane } from "@/components/terminal/TerminalPane";
 import { CommandRunner } from "@/components/terminal/CommandRunner";
+import { GroupMenu } from "@/components/terminal/GroupMenu";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
 import { useServers, useSessions } from "@/lib/hooks/useApi";
@@ -102,7 +103,15 @@ function TerminalPage() {
     [tabs]
   );
 
-  // ---- Bootstrap: URL-param auto-connect + restore live sessions ----
+  // ---- Bootstrap: URL-param auto-connect only ----
+  // The /terminal page used to auto-open every live session from the
+  // backend on a bare visit. That made the "click Terminal in the
+  // sidebar" experience feel random — whichever sessions happened to
+  // still be alive on the agent suddenly appeared as tabs. We removed
+  // that: only ?server= or ?session= in the URL opens a tab; a bare
+  // visit lands on the empty state so the user explicitly picks
+  // "new terminal" or "send a command". Existing sessions are
+  // surfaced via /sessions and the `+` button's picker.
   useEffect(() => {
     if (bootstrappedRef.current) return;
     if (!servers) return; // wait until we know what servers exist
@@ -110,11 +119,16 @@ function TerminalPage() {
     bootstrappedRef.current = true;
 
     // ?session=<id>: auto-attach. If the session is missing/stale, fall
-    // through to other modes rather than showing nothing.
+    // through to the empty state rather than showing nothing useful.
     if (initialSession) {
       const sess = sessions.find((s) => s.id === initialSession);
       if (sess) {
         const server = servers.find((s) => s.id === sess.serverId);
+        // setState-in-effect is intentional here — one-shot bootstrap
+        // gated by `bootstrappedRef`, can't be expressed as derived
+        // state without losing the "open exactly once on first nav"
+        // behaviour the URL contract needs.
+        // eslint-disable-next-line react-hooks/set-state-in-effect
         addTab({
           serverId: sess.serverId,
           sessionId: sess.id,
@@ -122,6 +136,10 @@ function TerminalPage() {
         });
         return;
       }
+      toast(
+        `Session ${initialSession.slice(0, 8)}… isn't available anymore.`,
+        "error"
+      );
     }
 
     // ?server=<id>: auto-create a session for that server, no modal.
@@ -138,26 +156,21 @@ function TerminalPage() {
         "error"
       );
     }
-
-    // No URL params: restore any sessions that are still alive on the
-    // backend so the user reattaches to their work after a refresh.
-    const alive = sessions.filter((s) => s.status === "active");
-    if (alive.length > 0) {
-      for (const sess of alive) {
-        const server = servers.find((s) => s.id === sess.serverId);
-        addTab({
-          serverId: sess.serverId,
-          sessionId: sess.id,
-          label: server?.name ?? sess.sessionName,
-        });
-      }
-    }
   }, [servers, sessions, initialServer, initialSession, addTab, toast]);
+
+  const sessionsById = useMemo(() => {
+    const m = new Map<string, Session>();
+    (sessions ?? []).forEach((s) => m.set(s.id, s));
+    return m;
+  }, [sessions]);
 
   const renderedTabs = useMemo(
     () =>
       tabs.map((tab) => {
         const isActive = tab.id === activeTabId;
+        const liveSession = tab.sessionId
+          ? sessionsById.get(tab.sessionId) ?? null
+          : null;
         return (
           <div
             key={tab.id}
@@ -178,10 +191,16 @@ function TerminalPage() {
                 refetchSessions();
               }}
             />
+            {isActive && (
+              <GroupMenu
+                session={liveSession}
+                onMutated={() => refetchSessions()}
+              />
+            )}
           </div>
         );
       }),
-    [tabs, activeTabId, refetchSessions]
+    [tabs, activeTabId, refetchSessions, sessionsById]
   );
 
   return (

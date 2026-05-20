@@ -56,7 +56,14 @@ export type AgentRequest =
     }
   | { op: "attach"; id: string; rows?: number; cols?: number }
   | { op: "kill"; id: string }
-  | { op: "resize"; id: string; rows: number; cols: number };
+  | { op: "resize"; id: string; rows: number; cols: number }
+  /** Update a session's display name in place. The dashboard fires this
+   *  after a rename in the UI so that `managet list` / `managet attach
+   *  <name>` on the host show the same name. Older agents that don't
+   *  know about this op respond with `Response::Error`; the caller
+   *  treats that as "name updated locally only" rather than a hard
+   *  failure. */
+  | { op: "rename"; id: string; name: string };
 
 export interface AgentSessionInfo {
   id: string;

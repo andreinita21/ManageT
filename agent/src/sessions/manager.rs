@@ -28,9 +28,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use nix::sys::signal::{killpg, Signal};
+use nix::unistd::Pid;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::{broadcast, mpsc};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::protocol::SessionInfo;
 
@@ -43,7 +45,10 @@ const INPUT_CHAN_CAP: usize = 64;
 
 pub struct Session {
     pub id: String,
-    pub name: String,
+    /// Display name shown by `managet list` / `managet attach <name>` and
+    /// by the dashboard. Wrapped in a Mutex so the dashboard's rename
+    /// flow can update it in place without tearing down the PTY.
+    pub name: Mutex<String>,
     pub command: String,
     pub created_at_ms: u64,
 
@@ -82,12 +87,18 @@ impl Session {
     pub fn info(&self) -> SessionInfo {
         SessionInfo {
             id: self.id.clone(),
-            name: self.name.clone(),
+            name: self.name.lock().unwrap().clone(),
             command: self.command.clone(),
             created_at_ms: self.created_at_ms,
             attached_clients: self.attached.load(Ordering::SeqCst),
             running: self.running.load(Ordering::SeqCst),
         }
+    }
+
+    /// Update the display name. Cheap — just locks and replaces the
+    /// stored String. Called by `SessionManager::rename`.
+    pub fn set_name(&self, new_name: String) {
+        *self.name.lock().unwrap() = new_name;
     }
 
     pub fn append_scrollback(&self, data: &[u8]) {
@@ -118,9 +129,54 @@ impl Session {
         let _ = self.resize_tx.send((rows, cols)).await;
     }
 
+    /// Tear down the PTY for this session.
+    ///
+    /// Sequence:
+    ///   1. SIGTERM the whole process group rooted at `root_pid` via
+    ///      `killpg`. This is the critical bit — `portable-pty`'s
+    ///      `ChildKiller::kill()` (held in `kill_handle`) signals only
+    ///      the direct child, which is typically `su`. `su` exits
+    ///      cleanly on SIGTERM without forwarding to its bash child,
+    ///      so the bash gets reparented to init and the agent's
+    ///      `wait()` never returns — the session stays "detached"
+    ///      forever even though the dashboard thinks it killed it.
+    ///      Signalling the whole PG hits every descendant at once.
+    ///   2. Tell `portable-pty` to also fire its own kill (it's the
+    ///      official handle that releases the underlying Child).
+    ///   3. Spawn a background SIGKILL-after-2s escalation in case
+    ///      anything in the PG ignores SIGTERM (long-running shells
+    ///      with traps, sshd-managed sessions, etc.).
     pub fn request_kill(&self) {
+        if let Some(pid) = self.root_pid {
+            // killpg expects the *process group* id, not the leader's
+            // PID — but for PTY-spawned children the two are equal
+            // because the child became a session leader via setsid()
+            // when its controlling tty was opened.
+            if let Err(e) = killpg(Pid::from_raw(pid as i32), Signal::SIGTERM) {
+                // ESRCH (no such process) is the harmless case — the
+                // group is already gone. Anything else is worth a log.
+                if e != nix::errno::Errno::ESRCH {
+                    warn!(
+                        "killpg(SIGTERM, pgid={}) failed: {} — relying on \
+                         portable-pty fallback",
+                        pid, e
+                    );
+                }
+            }
+        }
         if let Some(mut k) = self.kill_handle.lock().unwrap().take() {
             let _ = k.kill();
+        }
+        // Escalation: 2s after the polite SIGTERM, send SIGKILL to the
+        // PG. SIGKILL can't be ignored or trapped, so anything still
+        // alive in the group goes down. No-op if the PG is empty by
+        // then (ESRCH).
+        if let Some(pid) = self.root_pid {
+            let pgid = Pid::from_raw(pid as i32);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let _ = killpg(pgid, Signal::SIGKILL);
+            });
         }
     }
 }
@@ -170,7 +226,10 @@ impl SessionManager {
         }
         let mut hits: Vec<_> = s
             .values()
-            .filter(|sess| sess.id.starts_with(id_or_prefix) || sess.name == id_or_prefix)
+            .filter(|sess| {
+                sess.id.starts_with(id_or_prefix)
+                    || *sess.name.lock().unwrap() == id_or_prefix
+            })
             .cloned()
             .collect();
         match hits.len() {
@@ -184,6 +243,16 @@ impl SessionManager {
         let session = self.resolve(id_or_prefix)?;
         session.request_kill();
         // The waiter task will flip `running` and we'll cull on next list.
+        Ok(())
+    }
+
+    /// Rename a session in place. Resolves by id-or-prefix (same rule as
+    /// kill/resize) so the dashboard can pass a uuid prefix if it wants.
+    /// No-ops if `new_name` equals the current name; never spawns or
+    /// kills anything.
+    pub fn rename(&self, id_or_prefix: &str, new_name: String) -> Result<()> {
+        let session = self.resolve(id_or_prefix)?;
+        session.set_name(new_name);
         Ok(())
     }
 
@@ -373,7 +442,7 @@ impl SessionManager {
 
         let session = Arc::new(Session {
             id: id.clone(),
-            name: name.clone(),
+            name: Mutex::new(name.clone()),
             command: command_label.clone(),
             created_at_ms: now_ms(),
             scrollback: Mutex::new(VecDeque::new()),

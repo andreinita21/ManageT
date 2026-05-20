@@ -56,6 +56,13 @@ pub enum Request {
     /// Resize an attached session's PTY. Used after the initial Attach
     /// when the user resizes their terminal window.
     Resize { id: String, rows: u16, cols: u16 },
+    /// Change a session's display name in-place. The PTY child is
+    /// untouched; this is purely a label update so that
+    /// `managet attach <name>` and `managet list` show the same name
+    /// the dashboard does after a rename. Added in agent v1.x —
+    /// older agents reply with `Response::Error` for an unknown op,
+    /// which the dashboard treats as "name updated locally only".
+    Rename { id: String, name: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

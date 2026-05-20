@@ -35,6 +35,8 @@ import { eq } from "drizzle-orm";
 
 import { db } from "@/lib/db";
 import { sessions } from "@/lib/db/schema";
+import { rowToSession } from "@/lib/db/transform";
+import { cleanupEmptyGroupIfNeeded } from "@/lib/groups";
 import type { Session } from "@/types";
 import {
   agentRequest,
@@ -157,11 +159,70 @@ export async function resizeSession(
   await agentRequest(serverId, { op: "resize", id: sessionId, rows, cols });
 }
 
+/** Result of pushing a rename to the agent. Distinguishes the three
+ *  outcomes the PUT handler needs to differentiate:
+ *   - `pushed`: agent accepted, name updated on the host.
+ *   - `stale`: agent has no such session id (DB row is stale; the
+ *     rename is still valid for the dashboard's view).
+ *   - `agent_rejected`: the agent ran and replied with an error
+ *     that isn't a stale lookup (unknown op on an old agent,
+ *     internal failure, etc.). The caller should treat this as a
+ *     hard failure so the dashboard's view doesn't diverge from
+ *     what `managet ls` shows on the host. */
+export type RenameOutcome =
+  | { kind: "pushed" }
+  | { kind: "stale" }
+  | { kind: "agent_rejected"; message: string };
+
+const STALE_SESSION_RE = /no session matches/i;
+
+/** Push a display-name update to the agent so `managet list` /
+ *  `managet attach <name>` on the host see the same name the dashboard
+ *  does after a UI rename. The caller (PUT route) decides whether to
+ *  proceed with the DB write based on the returned outcome. */
+export async function renameSession(
+  serverId: string,
+  sessionId: string,
+  newName: string
+): Promise<RenameOutcome> {
+  try {
+    await agentRequest(serverId, {
+      op: "rename",
+      id: sessionId,
+      name: newName,
+    });
+    return { kind: "pushed" };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (STALE_SESSION_RE.test(msg)) {
+      // Agent doesn't know about this session id anymore (process
+      // restarted, PTY exited, …). Renaming the DB row is still
+      // meaningful — the row will get reconciled to closed on the
+      // next reconcile pass anyway.
+      return { kind: "stale" };
+    }
+    console.warn(
+      `[session-manager] agent rename rejected for ${sessionId}: ${msg}`
+    );
+    return { kind: "agent_rejected", message: msg };
+  }
+}
+
 /** SIGTERM the PTY child and drop the DB row. */
 export async function killSession(
   serverId: string,
   sessionId: string
 ): Promise<void> {
+  // Capture the group link before deletion so we can auto-clean an empty
+  // group afterwards (the FK is ON DELETE SET NULL on the column, which
+  // doesn't help us here — we need the *id* the row used to belong to).
+  const linkRows = await db
+    .select({ groupId: sessions.groupId })
+    .from(sessions)
+    .where(eq(sessions.id, sessionId))
+    .limit(1);
+  const groupId = linkRows[0]?.groupId ?? null;
+
   try {
     await agentRequest(serverId, { op: "kill", id: sessionId });
   } catch (err) {
@@ -171,6 +232,7 @@ export async function killSession(
     if (!/no session matches/i.test(msg)) throw err;
   }
   await db.delete(sessions).where(eq(sessions.id, sessionId));
+  if (groupId) await cleanupEmptyGroupIfNeeded(groupId);
 }
 
 /** Fetch the live session list from the agent on a server. */
@@ -266,18 +328,3 @@ export async function reconcileServer(serverId: string): Promise<Session[]> {
   return after.map(rowToSession);
 }
 
-function rowToSession(r: typeof sessions.$inferSelect): Session {
-  return {
-    ...r,
-    status: r.status as Session["status"],
-    restartPolicy: r.restartPolicy as Session["restartPolicy"],
-    cwd: r.cwd ?? undefined,
-    lastCommand: r.lastCommand ?? undefined,
-    envSnapshot: r.envSnapshot
-      ? (JSON.parse(r.envSnapshot) as Record<string, string>)
-      : undefined,
-    scrollBufferTail: r.scrollBufferTail ?? undefined,
-    disconnectedAt: r.disconnectedAt ?? undefined,
-    stackId: r.stackId ?? undefined,
-  };
-}

@@ -5,6 +5,11 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { signOut } from "next-auth/react";
 
+// Sidebar order, top-to-bottom. Servers is intentionally NOT a
+// top-level nav item — it lives as a tab under Settings (the
+// `/settings?tab=servers` route). The `/servers` and
+// `/servers/[id]` routes still work (the former 302-redirects into
+// Settings, the latter is reached from Dashboard server cards).
 const navItems = [
   {
     href: "/dashboard",
@@ -12,35 +17,6 @@ const navItems = [
     icon: (
       <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
-      </svg>
-    ),
-  },
-  {
-    href: "/servers",
-    label: "Servers",
-    match: "/servers",
-    icon: (
-      <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01" />
-      </svg>
-    ),
-  },
-  {
-    href: "/terminal",
-    label: "Terminal",
-    icon: (
-      <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-      </svg>
-    ),
-  },
-  {
-    href: "/stacks",
-    label: "Stacks",
-    match: "/stacks",
-    icon: (
-      <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 6h16M4 12h16M4 18h16" />
       </svg>
     ),
   },
@@ -55,8 +31,32 @@ const navItems = [
     ),
   },
   {
+    href: "/stacks",
+    label: "Stacks",
+    match: "/stacks",
+    icon: (
+      <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 6h16M4 12h16M4 18h16" />
+      </svg>
+    ),
+  },
+  {
+    href: "/terminal",
+    label: "Terminal",
+    icon: (
+      <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+      </svg>
+    ),
+  },
+  {
+    // Matches both /settings (any tab) and the legacy /servers route
+    // (now a redirect into Settings) so navigating to a server detail
+    // page still highlights the right top-level item.
     href: "/settings",
     label: "Settings",
+    match: "/settings",
+    extraMatch: "/servers",
     icon: (
       <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
@@ -76,7 +76,13 @@ export function SidebarLayout({ children }: { children: React.ReactNode }) {
   }
 
   const isActive = (item: typeof navItems[number]) => {
-    if (item.match) return pathname.startsWith(item.match);
+    if ("match" in item && typeof item.match === "string") {
+      if (pathname.startsWith(item.match)) return true;
+    }
+    if ("extraMatch" in item && typeof item.extraMatch === "string") {
+      if (pathname.startsWith(item.extraMatch)) return true;
+    }
+    if ("match" in item || "extraMatch" in item) return false;
     return pathname === item.href || pathname.startsWith(item.href + "/");
   };
 
@@ -88,8 +94,13 @@ export function SidebarLayout({ children }: { children: React.ReactNode }) {
           sidebarCollapsed ? "w-16" : "w-60"
         }`}
       >
-        {/* Logo */}
-        <div className="flex items-center gap-3 px-4 h-14 border-b border-mg-border">
+        {/* Logo — clicking it returns to the dashboard, matching the
+            convention every web app the user already uses. */}
+        <Link
+          href="/dashboard"
+          className="flex items-center gap-3 px-4 h-14 border-b border-mg-border hover:bg-mg-bg-hover transition-colors"
+          title="Go to dashboard"
+        >
           <div className="w-8 h-8 rounded-lg bg-mg-accent/20 flex items-center justify-center flex-shrink-0">
             <svg className="w-5 h-5 text-mg-accent" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
@@ -98,7 +109,7 @@ export function SidebarLayout({ children }: { children: React.ReactNode }) {
           {!sidebarCollapsed && (
             <span className="text-lg font-bold text-mg-text tracking-tight">ManageT</span>
           )}
-        </div>
+        </Link>
 
         {/* Nav */}
         <nav className="flex-1 py-4 px-2 space-y-1">
@@ -165,11 +176,14 @@ export function SidebarLayout({ children }: { children: React.ReactNode }) {
         </header>
 
         {/* Page content */}
-        {/* /stacks owns its own padding because it can split into a table +
-            terminal layout that needs to fill the full content height. */}
+        {/* /stacks and /groups own their own padding because they can split
+            into a table + terminal mosaic layout that needs to fill the
+            full content height. */}
         <main
           className={`flex-1 overflow-auto ${
-            pathname.startsWith("/terminal") || pathname.startsWith("/stacks")
+            pathname.startsWith("/terminal") ||
+            pathname.startsWith("/stacks") ||
+            pathname.startsWith("/groups")
               ? ""
               : "p-6"
           }`}

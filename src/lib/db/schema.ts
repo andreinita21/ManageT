@@ -100,6 +100,15 @@ export const sessions = sqliteTable("sessions", {
   // When set, this session was launched as part of a stack and the column
   // points at the row in `stacks` so we can group / co-kill them.
   stackId: text("stack_id").references(() => stacks.id, { onDelete: "set null" }),
+  // Optional membership in a `groups` row. Mutually exclusive with stackId
+  // at the application layer — stack-bound sessions can't be added to groups.
+  // ON DELETE SET NULL so deleting a group frees its sessions instead of
+  // killing them.
+  groupId: text("group_id").references(() => groups.id, { onDelete: "set null" }),
+  // Position within the group's mosaic (0..5). Meaningful only when
+  // groupId is set; otherwise ignored. Used for both the slot index and
+  // the persisted drag-and-drop order.
+  groupOrderIndex: integer("group_order_index").notNull().default(0),
   createdAt: integer("created_at").notNull(),
   updatedAt: integer("updated_at").notNull(),
 });
@@ -173,6 +182,41 @@ export const stacks = sqliteTable("stacks", {
     .notNull()
     .references(() => users.id),
   createdAt: integer("created_at").notNull(),
+  updatedAt: integer("updated_at").notNull(),
+});
+
+/**
+ * Groups co-locate up to 6 standalone terminal sessions into a single
+ * mosaic view. Distinct from `stacks` (which define services to launch
+ * together) — a group is a *display* construct over already-running
+ * sessions. Membership is one-group-per-session; stack-bound sessions
+ * are ineligible. Empty groups are auto-deleted by the API layer.
+ */
+export const groups = sqliteTable("groups", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull(),
+  createdBy: text("created_by")
+    .notNull()
+    .references(() => users.id),
+  createdAt: integer("created_at").notNull(),
+  updatedAt: integer("updated_at").notNull(),
+});
+
+/**
+ * Per-user persisted layout for a group's mosaic — row heights and
+ * per-row column widths as ratios in [0, 1]. Stored as JSON so the schema
+ * doesn't need to change if we add e.g. font overrides later. One row per
+ * (userId, groupId).
+ */
+export const groupLayouts = sqliteTable("group_layouts", {
+  id: text("id").primaryKey(),
+  userId: text("user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  groupId: text("group_id")
+    .notNull()
+    .references(() => groups.id, { onDelete: "cascade" }),
+  layoutJson: text("layout_json").notNull(),
   updatedAt: integer("updated_at").notNull(),
 });
 

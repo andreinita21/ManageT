@@ -11,29 +11,13 @@ import { eq } from "drizzle-orm";
 import { auth } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { servers, sessions as sessionsTable } from "@/lib/db/schema";
-import { rowToServer } from "@/lib/db/transform";
+import { rowToServer, rowToSession } from "@/lib/db/transform";
 import {
   defaultMetricsWindow,
   fetchMetricBuckets,
 } from "@/lib/monitor/metrics-buckets";
-import type { MetricSnapshot, Session } from "@/types";
+import type { MetricSnapshot } from "@/types";
 import { ServerDetailClient } from "./ServerDetailClient";
-
-function rowToSession(r: typeof sessionsTable.$inferSelect): Session {
-  return {
-    ...r,
-    status: r.status as Session["status"],
-    restartPolicy: r.restartPolicy as Session["restartPolicy"],
-    cwd: r.cwd ?? undefined,
-    lastCommand: r.lastCommand ?? undefined,
-    envSnapshot: r.envSnapshot
-      ? (JSON.parse(r.envSnapshot) as Record<string, string>)
-      : undefined,
-    scrollBufferTail: r.scrollBufferTail ?? undefined,
-    disconnectedAt: r.disconnectedAt ?? undefined,
-    stackId: r.stackId ?? undefined,
-  };
-}
 
 export default async function ServerDetailPage({
   params,

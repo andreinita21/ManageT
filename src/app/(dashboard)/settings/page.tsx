@@ -1,6 +1,8 @@
 "use client";
 
-import React, { useState, useMemo } from "react";
+import React, { Suspense, useEffect, useMemo, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+
 import { useRestartRules, useServers } from "@/lib/hooks/useApi";
 import { createRestartRule, deleteRestartRule, testRestartRule } from "@/lib/hooks/useApi";
 import { Button } from "@/components/ui/Button";
@@ -12,13 +14,66 @@ import { Table } from "@/components/ui/Table";
 import { Badge } from "@/components/ui/Badge";
 import { useToast } from "@/components/ui/Toast";
 import { AppearanceTab } from "@/components/settings/AppearanceTab";
+import { ServersTab } from "@/components/settings/ServersTab";
 import type { RestartRule, CreateRestartRuleRequest, TestRestartRuleResponse } from "@/types";
 
-export default function SettingsPage() {
+// Whitelist of accepted tab ids — anything else in ?tab= falls back to
+// the default. Keeps the URL→state mapping a closed set.
+const TAB_IDS = ["appearance", "servers", "rules", "test", "profile"] as const;
+type TabId = (typeof TAB_IDS)[number];
+const isTabId = (s: string | null): s is TabId =>
+  s !== null && (TAB_IDS as readonly string[]).includes(s);
+
+export default function SettingsPageWrapper() {
+  return (
+    <Suspense
+      fallback={
+        <div className="flex items-center justify-center h-64 text-mg-text-tertiary text-sm">
+          Loading settings…
+        </div>
+      }
+    >
+      <SettingsPage />
+    </Suspense>
+  );
+}
+
+function SettingsPage() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
   const { data: rules, loading, refetch } = useRestartRules();
   const { data: servers } = useServers();
   const { toast } = useToast();
-  const [activeTab, setActiveTab] = useState("appearance");
+  // Initial tab comes from ?tab= — the navbar's "Servers" item drives
+  // this. Defaulting to "appearance" matches the prior behaviour.
+  const tabFromUrl = searchParams.get("tab");
+  const [activeTab, setActiveTab] = useState<TabId>(
+    isTabId(tabFromUrl) ? tabFromUrl : "appearance"
+  );
+
+  // Keep state in sync if the URL changes (e.g. user clicks Sidebar's
+  // Servers item while already on Settings).
+  useEffect(() => {
+    if (isTabId(tabFromUrl) && tabFromUrl !== activeTab) {
+      setActiveTab(tabFromUrl);
+    }
+  }, [tabFromUrl, activeTab]);
+
+  // When the user clicks a tab, mirror the choice into the URL so the
+  // sidebar's active highlight (which keys off ?tab=) stays in sync and
+  // a refresh lands on the same tab.
+  const handleTabChange = (id: string) => {
+    if (!isTabId(id)) return;
+    setActiveTab(id);
+    const params = new URLSearchParams(searchParams.toString());
+    if (id === "appearance") {
+      params.delete("tab");
+    } else {
+      params.set("tab", id);
+    }
+    const qs = params.toString();
+    router.replace(qs ? `/settings?${qs}` : "/settings");
+  };
   const [addModalOpen, setAddModalOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [testCommand, setTestCommand] = useState("");
@@ -131,7 +186,7 @@ export default function SettingsPage() {
   );
 
   return (
-    <div className="space-y-6 animate-fade-in max-w-4xl">
+    <div className="space-y-6 animate-fade-in">
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-bold text-mg-text">Settings</h1>
       </div>
@@ -139,15 +194,18 @@ export default function SettingsPage() {
       <Tabs
         tabs={[
           { id: "appearance", label: "Appearance" },
+          { id: "servers", label: "Servers", count: servers?.length ?? 0 },
           { id: "rules", label: "Restart Rules", count: rules?.length ?? 0 },
           { id: "test", label: "Test Command" },
           { id: "profile", label: "Profile" },
         ]}
         activeTab={activeTab}
-        onChange={setActiveTab}
+        onChange={handleTabChange}
       />
 
       {activeTab === "appearance" && <AppearanceTab />}
+
+      {activeTab === "servers" && <ServersTab />}
 
       {/* Restart Rules Tab */}
       {activeTab === "rules" && (

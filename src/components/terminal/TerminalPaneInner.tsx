@@ -29,6 +29,11 @@ interface TerminalPaneProps {
   className?: string;
   /** Called once with the backend's session id after `session:create` returns or `session:attach` succeeds. */
   onSessionReady?: (sessionId: string) => void;
+  /** Override the global appearance font size for just this pane. Used
+   *  by the group mosaic to expose per-pane +/- controls so a single
+   *  cramped pane in a 6-up layout can be bumped up without changing
+   *  the user's global preference. */
+  fontSize?: number;
 }
 
 export default function TerminalPaneInner({
@@ -36,6 +41,7 @@ export default function TerminalPaneInner({
   sessionId: initialSessionId,
   className = "",
   onSessionReady,
+  fontSize,
 }: TerminalPaneProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   // Appearance (theme + font) is shared via context so user preference
@@ -45,12 +51,17 @@ export default function TerminalPaneInner({
   // the running terminals while the user is browsing themes.
   const appearance = useAppearance();
   const termRef = useRef<Terminal | null>(null);
+  const fitRef = useRef<FitAddon | null>(null);
   const termThemeRef = useRef(appearance.colors.terminal);
   const fontFamilyRef = useRef(appearance.active.terminalFontFamily);
-  const fontSizeRef = useRef(appearance.active.terminalFontSize);
+  // Per-pane font size overrides the global default when present. The
+  // refs (read inside the long-lived xterm init effect) get the
+  // *effective* value so initial mount uses the override too.
+  const effectiveFontSize = fontSize ?? appearance.active.terminalFontSize;
+  const fontSizeRef = useRef(effectiveFontSize);
   termThemeRef.current = appearance.colors.terminal;
   fontFamilyRef.current = appearance.active.terminalFontFamily;
-  fontSizeRef.current = appearance.active.terminalFontSize;
+  fontSizeRef.current = effectiveFontSize;
   // Container background mirrors the terminal palette so the small
   // padding strip around the canvas matches the active theme instead
   // of staying on the launch purple.
@@ -61,20 +72,27 @@ export default function TerminalPaneInner({
 
   // Live-apply theme + font changes to the running xterm instance so
   // the user gets immediate feedback without tearing the WS down.
+  // After a font change xterm's cell grid no longer matches the
+  // container — call `fit` so cols/rows recompute on the same paint.
   useEffect(() => {
     const t = termRef.current;
     if (!t) return;
     try {
       t.options.theme = appearance.colors.terminal;
       t.options.fontFamily = `'${appearance.active.terminalFontFamily}', monospace`;
-      t.options.fontSize = appearance.active.terminalFontSize;
+      t.options.fontSize = effectiveFontSize;
     } catch {
       /* if options aren't writable on this xterm version, ignore */
     }
+    // Refit on the next frame — running it immediately can race with
+    // xterm's internal renderer re-measure of the new font.
+    requestAnimationFrame(() => {
+      try { fitRef.current?.fit(); } catch { /* swallow — see init effect's tryFit */ }
+    });
   }, [
     appearance.colors.terminal,
     appearance.active.terminalFontFamily,
-    appearance.active.terminalFontSize,
+    effectiveFontSize,
   ]);
   const [status, setStatus] = useState<
     "connecting" | "connected" | "reconnecting" | "disconnected" | "error" | "lost"
@@ -170,6 +188,7 @@ export default function TerminalPaneInner({
       });
       termRef.current = term;
       fit = new FitAddon();
+      fitRef.current = fit;
       term.loadAddon(fit);
       term.loadAddon(new WebLinksAddon());
       term.open(container);
@@ -414,6 +433,7 @@ export default function TerminalPaneInner({
       ws?.close();
       term?.dispose();
       termRef.current = null;
+      fitRef.current = null;
     };
     // We intentionally depend on serverId + the *frozen-at-mount*
     // session id (via useState above). The prop `initialSessionId` is

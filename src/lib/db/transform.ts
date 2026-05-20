@@ -6,10 +6,11 @@
  * the `null -> undefined` normalisation so every route/lib uses the same
  * shape.
  */
-import type { servers } from "./schema";
-import type { Server, AgentStatus } from "@/types";
+import type { servers, sessions } from "./schema";
+import type { Server, AgentStatus, Session } from "@/types";
 
 type ServerRow = typeof servers.$inferSelect;
+type SessionRow = typeof sessions.$inferSelect;
 
 export function rowToServer(r: ServerRow): Server {
   return {
@@ -34,6 +35,29 @@ export function rowToServer(r: ServerRow): Server {
     agentInstallStage: r.agentInstallStage ?? undefined,
     pendingUninstall: r.pendingUninstall === 1,
     createdBy: r.createdBy,
+    createdAt: r.createdAt,
+    updatedAt: r.updatedAt,
+  };
+}
+
+export function rowToSession(r: SessionRow): Session {
+  return {
+    id: r.id,
+    serverId: r.serverId,
+    sessionName: r.sessionName,
+    status: r.status as Session["status"],
+    restartPolicy: r.restartPolicy as Session["restartPolicy"],
+    cwd: r.cwd ?? undefined,
+    lastCommand: r.lastCommand ?? undefined,
+    envSnapshot: r.envSnapshot
+      ? (JSON.parse(r.envSnapshot) as Record<string, string>)
+      : undefined,
+    scrollBufferTail: r.scrollBufferTail ?? undefined,
+    disconnectedAt: r.disconnectedAt ?? undefined,
+    retryCount: r.retryCount,
+    stackId: r.stackId ?? undefined,
+    groupId: r.groupId ?? undefined,
+    groupOrderIndex: r.groupOrderIndex,
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,
   };
