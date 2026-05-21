@@ -49,19 +49,20 @@ pub enum BarColor {
 }
 
 impl BarColor {
+    /// Full-row SGR: bold + contrasting foreground + coloured background.
+    /// The bar fills the whole bottom row with this background so it
+    /// reads as a proper tmux-style status bar, not a single coloured
+    /// word floating on the user's default background.
     fn sgr(self) -> &'static str {
-        // Bold + bright-foreground gives a strong but theme-friendly
-        // colour on every terminal. Background stays the user's
-        // default, so the bar reads as text rather than as a stripe.
         match self {
-            BarColor::Green => "\x1b[1;92m",
-            BarColor::Cyan => "\x1b[1;96m",
-            BarColor::Magenta => "\x1b[1;95m",
-            BarColor::Yellow => "\x1b[1;93m",
-            BarColor::Blue => "\x1b[1;94m",
-            BarColor::Red => "\x1b[1;91m",
-            BarColor::White => "\x1b[1;97m",
-            BarColor::Gray => "\x1b[2;37m",
+            BarColor::Green => "\x1b[1;30;42m",   // black on green
+            BarColor::Cyan => "\x1b[1;30;46m",    // black on cyan
+            BarColor::Magenta => "\x1b[1;97;45m", // white on magenta
+            BarColor::Yellow => "\x1b[1;30;43m",  // black on yellow
+            BarColor::Blue => "\x1b[1;97;44m",    // white on blue
+            BarColor::Red => "\x1b[1;97;41m",     // white on red
+            BarColor::White => "\x1b[1;30;47m",   // black on white
+            BarColor::Gray => "\x1b[1;97;100m",   // white on bright-black
         }
     }
 
@@ -189,6 +190,8 @@ pub struct StatusBar {
     rows: u16,
     cols: u16,
     config: BarConfig,
+    /// Throttling state for `redraw_after_io`.
+    last_redraw: Option<Instant>,
 }
 
 impl StatusBar {
@@ -206,6 +209,7 @@ impl StatusBar {
             rows,
             cols,
             config,
+            last_redraw: None,
         }
     }
 
@@ -214,63 +218,95 @@ impl StatusBar {
         self.cols = cols;
     }
 
-    /// Enter status-bar mode: set the scrolling region, paint the bar,
-    /// and nudge the cursor to row 1 so it doesn't linger at the row we
-    /// just took over. The nudge is what stops the shell prompt from
-    /// "covering" the bar after attach — without it the cursor stays
-    /// on the now-reserved bottom row.
-    pub fn enter<W: Write>(&self, w: &mut W) -> io::Result<()> {
+    /// Enter status-bar mode. Three defences keep the bar safe:
+    ///   1. DECSTBM restricts scrolling to rows 1..(rows-1).
+    ///   2. DECOM (origin mode) clamps cursor *positioning* to the
+    ///      same region — without this, a shell that thinks it has
+    ///      `rows` rows can still address row `rows` directly and
+    ///      walk all over the bar. This is what fixed the "typing
+    ///      overwrites the bar, backspace eats it" bug.
+    ///   3. Cursor is nudged to (1,1) so the inner app doesn't linger
+    ///      at the now-reserved bottom row on attach.
+    /// The caller is responsible for calling `redraw_after_io()` after
+    /// every chunk of PTY bytes — that's the cheap belt-and-braces
+    /// against alt-screen escapes or `clear` sequences that bypass
+    /// the scrolling region entirely.
+    pub fn enter<W: Write>(&mut self, w: &mut W) -> io::Result<()> {
         if self.rows < 3 {
             return Ok(());
         }
-        // DECSTBM scrolling region.
+        // DECSTBM + DECOM + cursor home + paint.
         write!(w, "\x1b[1;{}r", self.rows.saturating_sub(1))?;
-        // Move the cursor to the top of the new region so it can't
-        // stay parked on the bar row.
+        write!(w, "\x1b[?6h")?;
         write!(w, "\x1b[1;1H")?;
+        self.last_redraw = None;
         self.redraw(w)
     }
 
-    /// Redraw the bar in-place. Clears the bar row before painting so
-    /// stale shell content can't bleed through.
-    pub fn redraw<W: Write>(&self, w: &mut W) -> io::Result<()> {
+    /// Redraw the bar in-place. Always re-asserts DECOM in case the
+    /// inner app turned it off (vim toggles modes during init, etc.).
+    pub fn redraw<W: Write>(&mut self, w: &mut W) -> io::Result<()> {
         if self.rows < 3 {
             return Ok(());
         }
         let line = self.compose(self.cols as usize);
+        // SGR before SAVE_CURSOR so we don't accidentally paint the
+        // bar's attributes into wherever the user's cursor was sitting
+        // when we save it. After RESTORE_CURSOR we explicitly reset to
+        // RESET to keep the inner app's attributes clean.
+        // DECOM (`\x1b[?6h`) is re-asserted at the END so even if the
+        // PTY stream just turned it off, the next move is clamped.
+        // We also use \x1b[?7l (autowrap off) while painting so the
+        // trailing cell never causes a wrap-and-scroll.
         write!(
             w,
-            "{save}\x1b[{row};1H{clear}{color}{line}{reset}{restore}",
+            "{save}\x1b[?7l\x1b[{row};1H{color}{line}{reset}\x1b[?7h{restore}\x1b[?6h",
             save = SAVE_CURSOR,
             row = self.rows,
-            clear = CLEAR_LINE,
             color = self.config.color.sgr(),
             line = line,
             reset = RESET,
             restore = RESTORE_CURSOR
         )?;
-        w.flush()
+        w.flush()?;
+        self.last_redraw = Some(Instant::now());
+        Ok(())
+    }
+
+    /// Throttled redraw — call this after every chunk of PTY output.
+    /// Repaints only if more than `MIN_REDRAW_INTERVAL` has elapsed
+    /// since the last paint, so a tight `tail -f` loop doesn't pay
+    /// the cost of writing the bar bytes thousands of times per
+    /// second.
+    pub fn redraw_after_io<W: Write>(&mut self, w: &mut W) -> io::Result<()> {
+        const MIN_REDRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+        if let Some(last) = self.last_redraw {
+            if last.elapsed() < MIN_REDRAW_INTERVAL {
+                return Ok(());
+            }
+        }
+        self.redraw(w)
     }
 
     pub fn leave<W: Write>(&self, w: &mut W) -> io::Result<()> {
         if self.rows < 3 {
             return Ok(());
         }
-        // Reset scrolling region, clear bar row, leave cursor on the
-        // last content row so the post-detach `[managet] detached.`
-        // doesn't appear on a half-painted line.
+        // Turn off DECOM, reset scrolling region, clear the bar row.
         write!(
             w,
-            "\x1b[r\x1b[{row};1H{clear}",
+            "\x1b[?6l\x1b[r\x1b[{row};1H{clear}",
             row = self.rows,
             clear = CLEAR_LINE,
         )?;
         w.flush()
     }
 
-    /// Build the visible content for the bar. Always starts with the
+    /// Build a row-wide line of bar content. Always starts with the
     /// branding sigil, then appends each configured field if there's
-    /// room. We never wrap or right-pad — bar is left-aligned, period.
+    /// room. The line is **padded with spaces to `cols`** so the
+    /// background colour fills the full row — that's what makes it
+    /// look like a tmux status bar rather than a coloured word.
     fn compose(&self, cols: usize) -> String {
         let mut out = String::from(SIGIL);
         for f in &self.config.fields {
@@ -286,16 +322,22 @@ impl StatusBar {
             };
             let candidate = format!("{out} · {segment}");
             if visible_len(&candidate) > cols {
-                // Out of room. Stop appending — the most important
-                // fields are listed earlier in the config.
                 break;
             }
             out = candidate;
         }
-        // Final safety clamp in case the sigil + first field already
-        // exceeded `cols` on an unusably-narrow terminal.
+        // Clamp width if even the sigil + first segment overflowed.
         if visible_len(&out) > cols {
-            return truncate(&out, cols.max(1));
+            out = truncate(&out, cols.max(1));
+        }
+        // Pad with spaces to the full row so the SGR background fills
+        // every cell. One trailing-space buffer is left when the
+        // terminal is exactly `cols` wide so the final cell doesn't
+        // get autowrap-clobbered on terminals that fail to honour
+        // \x1b[?7l.
+        let len = visible_len(&out);
+        if len < cols.saturating_sub(1) {
+            out.push_str(&" ".repeat(cols.saturating_sub(1) - len));
         }
         out
     }

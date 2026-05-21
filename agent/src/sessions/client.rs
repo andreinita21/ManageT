@@ -160,12 +160,12 @@ pub async fn run_attach(id: String) -> Result<()> {
     let _raw = RawMode::enable().context("enable raw mode")?;
 
     // 3. Paint the status bar and set the scrolling region. Shared
-    //    behind an Arc<Mutex<>> so the SIGWINCH task and the periodic
-    //    redraw ticker can both mutate / read it. The Mutex is fine —
-    //    redraws are rare (5s) and resize is rarer.
+    //    behind an Arc<Mutex<>> — the SIGWINCH task, the duration tick
+    //    task, AND the byte-pump (which redraws on every PTY chunk so
+    //    a clobbered bar bounces back immediately) all reach for it.
     let bar = Arc::new(Mutex::new(StatusBar::new(session_name, rows, cols)));
     {
-        let bar = bar.lock().unwrap();
+        let mut bar = bar.lock().unwrap();
         let mut out = std::io::stdout();
         let _ = bar.enter(&mut out);
     }
@@ -185,10 +185,10 @@ pub async fn run_attach(id: String) -> Result<()> {
             if let Ok((rows, cols)) = local_term_size_result() {
                 let pty_rows = if rows >= 3 { rows - 1 } else { rows };
                 let _ = send_resize(&resize_id, pty_rows, cols).await;
-                if let Ok(mut bar) = resize_bar.lock() {
-                    bar.resize(rows, cols);
+                if let Ok(mut bar_guard) = resize_bar.lock() {
+                    bar_guard.resize(rows, cols);
                     let mut out = std::io::stdout();
-                    let _ = bar.enter(&mut out);
+                    let _ = bar_guard.enter(&mut out);
                 }
             }
         }
@@ -205,7 +205,7 @@ pub async fn run_attach(id: String) -> Result<()> {
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            if let Ok(bar) = tick_bar.lock() {
+            if let Ok(mut bar) = tick_bar.lock() {
                 let mut out = std::io::stdout();
                 let _ = bar.redraw(&mut out);
             }
@@ -213,13 +213,17 @@ pub async fn run_attach(id: String) -> Result<()> {
     });
 
     // 6. Pipe stdin → socket and socket → stdout. The detach state
-    //    machine watches stdin for `Ctrl-A d`.
-    let pipe_result = pipe_attach(reader, wr).await;
+    //    machine watches stdin for `Ctrl-A d`. Pass the bar in so we
+    //    can redraw it after every chunk of PTY output — that's what
+    //    makes the bar survive `clear`, vim alt-screen exit, and
+    //    anything else that disrespects the scrolling region.
+    let pipe_result = pipe_attach(reader, wr, bar.clone()).await;
 
     resize_task.abort();
     tick_task.abort();
-    // Tear down the bar (reset scrolling region, clear bar row) BEFORE
-    // RawMode drops, so the cursor restore lands in a sane place.
+    // Tear down the bar (turn off DECOM, reset scrolling region, clear
+    // the bar row) BEFORE RawMode drops, so the cursor restore lands
+    // in a sane place.
     if let Ok(bar) = bar.lock() {
         let mut out = std::io::stdout();
         let _ = bar.leave(&mut out);
@@ -232,6 +236,7 @@ pub async fn run_attach(id: String) -> Result<()> {
 async fn pipe_attach(
     mut socket_reader: BufReader<tokio::net::unix::OwnedReadHalf>,
     mut socket_writer: tokio::net::unix::OwnedWriteHalf,
+    bar: Arc<Mutex<StatusBar>>,
 ) -> Result<()> {
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
@@ -253,7 +258,10 @@ async fn pipe_attach(
 
     loop {
         tokio::select! {
-            // Bytes from the agent → write to user's stdout.
+            // Bytes from the agent → write to user's stdout, then
+            // bounce the bar back. `redraw_after_io` is throttled to
+            // ~100ms so a `tail -f`-flooded stream doesn't pay the
+            // ~80-byte bar-repaint cost every chunk.
             r = socket_reader.read(&mut sock_buf) => {
                 match r {
                     Ok(0) => return Ok(()),
@@ -261,6 +269,10 @@ async fn pipe_attach(
                     Ok(n) => {
                         stdout.write_all(&sock_buf[..n]).await?;
                         stdout.flush().await?;
+                        if let Ok(mut bar_guard) = bar.lock() {
+                            let mut sync_out = std::io::stdout();
+                            let _ = bar_guard.redraw_after_io(&mut sync_out);
+                        }
                     }
                 }
             }
