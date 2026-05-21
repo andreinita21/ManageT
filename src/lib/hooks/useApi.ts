@@ -187,6 +187,7 @@ export async function updateServer(
     autoUpdate: boolean;
     sessionRetentionDays: number;
     maxSessions: number | null;
+    apiUrl: string;
   }>
 ): Promise<Server> {
   const res = await fetch(`${API_BASE}/servers/${id}`, {

@@ -56,6 +56,27 @@ pub enum Command {
     Kill {
         id: String,
     },
+
+    /// Update fields in the on-disk config file in-place and exit. Used
+    /// by the dashboard to push a new dashboard URL or heartbeat
+    /// interval without re-running the full installer. The caller is
+    /// responsible for restarting the service afterwards (e.g.
+    /// `systemctl restart managet-agent`) so the running process picks
+    /// up the new values.
+    Reconfigure(ReconfigureArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ReconfigureArgs {
+    /// New dashboard API base URL (e.g. https://managet.example.com).
+    /// Validated the same way as during install — must start with
+    /// http:// or https:// and not be empty.
+    #[arg(long)]
+    pub api_url: Option<String>,
+
+    /// New heartbeat interval in seconds (5–600). Optional.
+    #[arg(long)]
+    pub interval_secs: Option<u64>,
 }
 
 #[derive(Debug, Args)]

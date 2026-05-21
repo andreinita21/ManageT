@@ -8,7 +8,7 @@
 use anyhow::Result;
 use clap::Parser;
 use managet_agent::cli::{Cli, Command};
-use managet_agent::{collector, installer, reporter, sessions};
+use managet_agent::{collector, config, installer, reporter, sessions};
 
 fn init_tracing() {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -34,5 +34,6 @@ async fn main() -> Result<()> {
         Command::New { name, command } => sessions::client::run_new(name, command).await,
         Command::Attach { id } => sessions::client::run_attach(id).await,
         Command::Kill { id } => sessions::client::run_kill(id).await,
+        Command::Reconfigure(args) => config::reconfigure(args),
     }
 }

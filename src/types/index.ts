@@ -51,6 +51,12 @@ export interface Server {
   sessionRetentionDays: number;
   /** NULL / undefined = no cap on concurrent sessions for this server. */
   maxSessions?: number;
+  /**
+   * Dashboard URL the agent has been told to heartbeat to. `undefined`
+   * for rows installed before this field existed — UI shows it as
+   * "unknown" but still lets the user push a new value.
+   */
+  apiUrl?: string;
   createdBy: string;
   createdAt: number;
   updatedAt: number;

@@ -12,6 +12,7 @@ import { rowToServer } from "@/lib/db/transform";
 import { eq } from "drizzle-orm";
 import { encryptPassword } from "@/lib/crypto";
 import { sshUninstallAgent } from "@/lib/agent/uninstaller";
+import { pushAgentReconfigure } from "@/lib/agent/reconfigure";
 import { z } from "zod";
 
 const updateServerSchema = z.object({
@@ -36,6 +37,16 @@ const updateServerSchema = z.object({
   sessionRetentionDays: z.number().int().min(0).max(3650).optional(),
   // null clears the cap, integer ≥1 sets one.
   maxSessions: z.number().int().min(1).max(1000).nullable().optional(),
+  // Dashboard URL the agent should heartbeat to. When this changes,
+  // the PUT handler SSH-pushes a `managet-agent reconfigure` to the
+  // agent and only persists on success.
+  apiUrl: z
+    .string()
+    .url()
+    .refine((v) => v.startsWith("http://") || v.startsWith("https://"), {
+      message: "must start with http:// or https://",
+    })
+    .optional(),
 });
 
 export async function GET(
@@ -109,6 +120,41 @@ export async function PUT(
   if (input.sessionRetentionDays !== undefined)
     updates.sessionRetentionDays = input.sessionRetentionDays;
   if (input.maxSessions !== undefined) updates.maxSessions = input.maxSessions;
+
+  // Push live-applicable changes to the agent before we persist them.
+  // `apiUrl` is the headline use-case (repoint LAN install at a Cloudflare
+  // tunnel), but pushing `interval_secs` here as well means the heartbeat
+  // cadence changes immediately rather than waiting for the next install.
+  // If the push fails (agent offline, old binary without reconfigure
+  // subcommand, etc.), refuse the whole update so the dashboard's row
+  // doesn't drift away from what's actually running on the host.
+  const row = existing[0];
+  const urlChanging = input.apiUrl !== undefined && input.apiUrl !== row.apiUrl;
+  const intervalChanging =
+    input.heartbeatIntervalSecs !== undefined &&
+    input.heartbeatIntervalSecs !== row.heartbeatIntervalSecs;
+  if (urlChanging || intervalChanging) {
+    const result = await pushAgentReconfigure(id, {
+      apiUrl: urlChanging ? input.apiUrl : undefined,
+      intervalSecs: intervalChanging ? input.heartbeatIntervalSecs : undefined,
+    });
+    if (!result.ok) {
+      return NextResponse.json(
+        {
+          error: `Could not push config to the agent: ${
+            result.error ?? "unknown error"
+          }. The server row was not updated.`,
+        },
+        { status: 502 }
+      );
+    }
+    if (urlChanging) updates.apiUrl = input.apiUrl;
+  } else if (input.apiUrl !== undefined) {
+    // URL field was sent but is unchanged — write it through to cover
+    // the unlikely case where the DB column was NULL and the user just
+    // re-typed the same value as a "lock it in" affordance.
+    updates.apiUrl = input.apiUrl;
+  }
 
   await db.update(servers).set(updates).where(eq(servers.id, id));
 

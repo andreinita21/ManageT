@@ -98,6 +98,34 @@ impl AgentConfig {
     }
 }
 
+/// `managet-agent reconfigure --api-url <…> [--interval-secs <…>]`.
+/// Loads the on-disk config, mutates the requested fields, validates,
+/// and writes it back. Does not restart the service — the caller is
+/// expected to do that. Used by the dashboard's "Dashboard URL" push so
+/// agents can be repointed at a new tunnel URL without a full reinstall.
+pub fn reconfigure(args: crate::cli::ReconfigureArgs) -> anyhow::Result<()> {
+    let mut cfg = AgentConfig::load().context("loading config to reconfigure")?;
+    if let Some(url) = args.api_url {
+        let trimmed = url.trim().trim_end_matches('/').to_string();
+        if trimmed.is_empty() {
+            anyhow::bail!("--api-url cannot be empty");
+        }
+        if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+            anyhow::bail!("--api-url must start with http:// or https://");
+        }
+        cfg.api_url = trimmed;
+    }
+    if let Some(interval) = args.interval_secs {
+        if interval == 0 {
+            anyhow::bail!("--interval-secs must be > 0");
+        }
+        cfg.heartbeat_interval_secs = interval;
+    }
+    cfg.save().context("writing updated config")?;
+    println!("reconfigured: api_url={} interval_secs={}", cfg.api_url, cfg.heartbeat_interval_secs);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

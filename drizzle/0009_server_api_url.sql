@@ -1,0 +1,1 @@
+ALTER TABLE `servers` ADD `api_url` text;

@@ -84,6 +84,13 @@ export const servers = sqliteTable("servers", {
   // Cap on concurrent (non-closed) sessions per server. NULL = no cap.
   // Enforced when creating a new session via the API.
   maxSessions: integer("max_sessions"),
+  // Dashboard URL the agent has been told to heartbeat to. Populated at
+  // install time and editable from Settings → Servers → Agent so users
+  // can repoint agents (e.g. switching a LAN install onto a Cloudflare
+  // tunnel without a full reinstall). NULL on rows installed before
+  // this column existed; the dashboard treats NULL as "use the URL
+  // currently in the agent's config.toml — unknown to us".
+  apiUrl: text("api_url"),
   createdBy: text("created_by")
     .notNull()
     .references(() => users.id),

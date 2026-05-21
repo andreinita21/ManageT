@@ -39,6 +39,7 @@ export function rowToServer(r: ServerRow): Server {
     autoUpdate: r.autoUpdate === 1,
     sessionRetentionDays: r.sessionRetentionDays,
     maxSessions: r.maxSessions ?? undefined,
+    apiUrl: r.apiUrl ?? undefined,
     createdBy: r.createdBy,
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,

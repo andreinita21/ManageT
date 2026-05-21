@@ -158,13 +158,7 @@ export function ServersTab() {
 
   const handleSaveAgentConfig = async (
     target: Server,
-    patch: {
-      heartbeatIntervalSecs: number;
-      logLevel: Server["logLevel"];
-      autoUpdate: boolean;
-      sessionRetentionDays: number;
-      maxSessions: number | null;
-    }
+    patch: AgentConfigPatch
   ) => {
     try {
       await updateServer(target.id, patch);
@@ -466,6 +460,7 @@ interface AgentConfigPatch {
   autoUpdate: boolean;
   sessionRetentionDays: number;
   maxSessions: number | null;
+  apiUrl: string;
 }
 
 function AgentConfigModal({
@@ -478,6 +473,7 @@ function AgentConfigModal({
   onSave: (target: Server, patch: AgentConfigPatch) => Promise<void> | void;
 }) {
   // Local draft seeded from the row each time the modal opens.
+  const [apiUrl, setApiUrl] = useState("");
   const [heartbeat, setHeartbeat] = useState("10");
   const [logLevel, setLogLevel] = useState<Server["logLevel"]>("info");
   const [autoUpdate, setAutoUpdate] = useState(false);
@@ -488,6 +484,7 @@ function AgentConfigModal({
 
   React.useEffect(() => {
     if (!target) return;
+    setApiUrl(target.apiUrl ?? "");
     setHeartbeat(String(target.heartbeatIntervalSecs));
     setLogLevel(target.logLevel);
     setAutoUpdate(target.autoUpdate);
@@ -498,9 +495,20 @@ function AgentConfigModal({
     setError(null);
   }, [target]);
 
+  const urlChanged = target ? apiUrl.trim() !== (target.apiUrl ?? "") : false;
+
   const handleSave = async () => {
     if (!target) return;
     setError(null);
+    const url = apiUrl.trim();
+    if (!url) {
+      setError("Dashboard URL is required.");
+      return;
+    }
+    if (!(url.startsWith("http://") || url.startsWith("https://"))) {
+      setError("Dashboard URL must start with http:// or https://.");
+      return;
+    }
     const hb = parseInt(heartbeat, 10);
     if (Number.isNaN(hb) || hb < 5 || hb > 600) {
       setError("Heartbeat interval must be between 5 and 600 seconds.");
@@ -522,6 +530,7 @@ function AgentConfigModal({
     setSaving(true);
     try {
       await onSave(target, {
+        apiUrl: url,
         heartbeatIntervalSecs: hb,
         logLevel,
         autoUpdate,
@@ -554,10 +563,27 @@ function AgentConfigModal({
       {target && (
         <div className="space-y-4">
           <p className="text-xs text-mg-text-tertiary">
-            Heartbeat interval, log level, and auto-update apply on the
-            agent's next restart or re-install. Retention and max sessions
-            are enforced by the dashboard immediately.
+            Changing the dashboard URL or heartbeat interval pushes the
+            new value to the agent over SSH and restarts it. Log level and
+            auto-update apply on the agent's next install. Retention and
+            max sessions are enforced by the dashboard.
           </p>
+          <div>
+            <Input
+              label="Dashboard URL (the agent calls home to this)"
+              type="url"
+              value={apiUrl}
+              onChange={(e) => setApiUrl(e.target.value)}
+              placeholder="https://managet.example.com"
+            />
+            {urlChanged && (
+              <p className="mt-1 text-xs text-mg-warning">
+                Saving will SSH into the agent, rewrite its config, and
+                restart it. The agent must be reachable from this dashboard
+                at the new URL or it will go silent.
+              </p>
+            )}
+          </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <Input
               label="Heartbeat interval (seconds)"

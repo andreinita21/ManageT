@@ -287,6 +287,10 @@ export async function installAgent(serverId: string): Promise<InstallResult> {
         agentStatus: "installing",
         agentInstallStage: "awaiting first heartbeat",
         agentInstallError: null,
+        // Persist the URL we just baked into the agent's config so the
+        // dashboard can show it in Settings → Servers and offer a
+        // one-click repoint via the Reconfigure flow.
+        apiUrl: dashboardUrl,
         updatedAt: Date.now(),
       })
       .where(eq(servers.id, serverId));
