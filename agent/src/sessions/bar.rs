@@ -243,24 +243,34 @@ impl StatusBar {
         self.redraw(w)
     }
 
-    /// Redraw the bar in-place. Always re-asserts DECOM in case the
-    /// inner app turned it off (vim toggles modes during init, etc.).
+    /// Redraw the bar in-place.
+    ///
+    /// The critical detail: we **disable DECOM while painting**. With
+    /// origin mode left on, `\x1b[24;1H` would clamp to row 23 (the
+    /// bottom of the scroll region) and the bar would land *inside*
+    /// the region, smearing on top of whatever the shell is drawing
+    /// at row 23. After painting we re-enable DECOM so the shell is
+    /// still kept inside the region.
+    ///
+    /// Sequence:
+    ///   1. `\x1b[s`   save cursor + state (DECOM-on snapshot taken)
+    ///   2. `\x1b[?6l` DECOM off so the next move addresses absolute coords
+    ///   3. `\x1b[?7l` autowrap off so the final cell can't trigger a scroll
+    ///   4. `\x1b[N;1H` move to row N (the real bottom row)
+    ///   5. SGR + padded line
+    ///   6. `\x1b[0m`  reset SGR
+    ///   7. `\x1b[?7h` autowrap back on
+    ///   8. `\x1b[u`   restore cursor + saved state (DECRC restores DECOM=on)
+    ///   9. `\x1b[?6h` explicit DECOM-on as a belt-and-braces for terminals
+    ///                that don't honour DECOM in DECRC
     pub fn redraw<W: Write>(&mut self, w: &mut W) -> io::Result<()> {
         if self.rows < 3 {
             return Ok(());
         }
         let line = self.compose(self.cols as usize);
-        // SGR before SAVE_CURSOR so we don't accidentally paint the
-        // bar's attributes into wherever the user's cursor was sitting
-        // when we save it. After RESTORE_CURSOR we explicitly reset to
-        // RESET to keep the inner app's attributes clean.
-        // DECOM (`\x1b[?6h`) is re-asserted at the END so even if the
-        // PTY stream just turned it off, the next move is clamped.
-        // We also use \x1b[?7l (autowrap off) while painting so the
-        // trailing cell never causes a wrap-and-scroll.
         write!(
             w,
-            "{save}\x1b[?7l\x1b[{row};1H{color}{line}{reset}\x1b[?7h{restore}\x1b[?6h",
+            "{save}\x1b[?6l\x1b[?7l\x1b[{row};1H{color}{line}{reset}\x1b[?7h{restore}\x1b[?6h",
             save = SAVE_CURSOR,
             row = self.rows,
             color = self.config.color.sgr(),
