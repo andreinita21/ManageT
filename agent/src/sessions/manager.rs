@@ -352,6 +352,15 @@ impl SessionManager {
                 // Run the user-supplied command as the target user, then
                 // drop into their login shell so the session stays alive
                 // after the command exits.
+                //
+                // `--session-command` (util-linux) keeps the existing
+                // session — same as `-c` but does NOT call setsid().
+                // Without this the inner bash loses its controlling
+                // terminal across the su call ("cannot set terminal
+                // process group: Inappropriate ioctl for device" /
+                // "no job control in this shell"). Job control is
+                // essential — without it Ctrl+C, suspend, fg/bg, etc.
+                // all break.
                 let user_shell = if u.shell.as_os_str().is_empty() {
                     "/bin/sh".to_string()
                 } else {
@@ -361,16 +370,16 @@ impl SessionManager {
                 let mut c = CommandBuilder::new("su");
                 c.arg("-l");
                 c.arg(&u.name);
-                c.arg("-c");
+                c.arg("--session-command");
                 c.arg(chained);
                 c
             }
             (Some(u), None) => {
                 // Interactive shell as the target user. We still go through
-                // `su -l … -c "cd …; exec <shell> -l"` rather than plain
-                // `su -l` so the cwd takes effect. Costs one extra exec
-                // (negligible) and lets every code path share the same
-                // cd-then-shell template.
+                // `su -l … --session-command "cd …; exec <shell> -l"`
+                // rather than plain `su -l` so the cwd takes effect, and
+                // we use `--session-command` (not `-c`) to keep the
+                // controlling terminal — see the rationale above.
                 let user_shell = if u.shell.as_os_str().is_empty() {
                     "/bin/sh".to_string()
                 } else {
@@ -384,7 +393,7 @@ impl SessionManager {
                 let mut c = CommandBuilder::new("su");
                 c.arg("-l");
                 c.arg(&u.name);
-                c.arg("-c");
+                c.arg("--session-command");
                 c.arg(chained);
                 c
             }
