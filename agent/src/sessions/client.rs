@@ -19,8 +19,10 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::signal::unix::{signal, SignalKind};
 
+use super::bar::StatusBar;
 use super::protocol::{Request, Response};
 use super::server::socket_path;
+use std::sync::{Arc, Mutex};
 
 /// `managet ls` — print the active sessions in a small table.
 pub async fn run_ls() -> Result<()> {
@@ -102,6 +104,9 @@ pub async fn run_attach(id: String) -> Result<()> {
     }
 
     // 1. Open the long-lived data connection. Send Attach, read response.
+    //    The PTY sees `rows - 1` so the local bottom row stays ours for
+    //    the status bar. When the terminal is comically short (< 3 rows)
+    //    we skip the bar entirely and pass the full size through.
     let stream = UnixStream::connect(&socket_path())
         .await
         .with_context(|| {
@@ -110,9 +115,10 @@ pub async fn run_attach(id: String) -> Result<()> {
     let (rd, mut wr) = stream.into_split();
 
     let (rows, cols) = local_term_size().unwrap_or((24, 80));
+    let pty_rows = if rows >= 3 { rows - 1 } else { rows };
     let line = serde_json::to_string(&Request::Attach {
         id: id.clone(),
-        rows: Some(rows),
+        rows: Some(pty_rows),
         cols: Some(cols),
     })?;
     wr.write_all(line.as_bytes()).await?;
@@ -124,10 +130,12 @@ pub async fn run_attach(id: String) -> Result<()> {
     reader.read_line(&mut response_line).await?;
     let resp: Response = serde_json::from_str(response_line.trim_end())
         .context("parsing attach response")?;
-    let resolved_id = match resp {
+    let (resolved_id, session_name) = match resp {
         Response::Attached { id, name } => {
-            eprintln!("[managet] attached to {}. Detach: Ctrl-A d", name);
-            id
+            // No "[managet] attached" eprintln — the bar replaces that
+            // banner. The user sees branding immediately on the status
+            // bar instead of having a one-line message scroll past.
+            (id, name)
         }
         Response::Error { message } => return Err(anyhow!(message)),
         other => return Err(anyhow!("unexpected response: {other:?}")),
@@ -139,28 +147,71 @@ pub async fn run_attach(id: String) -> Result<()> {
     //    on drop, including on panic.
     let _raw = RawMode::enable().context("enable raw mode")?;
 
-    // 3. SIGWINCH handler: when the local window is resized, push the
+    // 3. Paint the status bar and set the scrolling region. Shared
+    //    behind an Arc<Mutex<>> so the SIGWINCH task and the periodic
+    //    redraw ticker can both mutate / read it. The Mutex is fine —
+    //    redraws are rare (5s) and resize is rarer.
+    let bar = Arc::new(Mutex::new(StatusBar::new(session_name, rows, cols)));
+    {
+        let bar = bar.lock().unwrap();
+        let mut out = std::io::stdout();
+        let _ = bar.enter(&mut out);
+    }
+
+    // 4. SIGWINCH handler: when the local window is resized, push the
     //    new size to the agent over a SECOND short-lived control
-    //    connection (the main connection is in raw-byte mode).
+    //    connection (the main connection is in raw-byte mode) and
+    //    repaint the bar at the new bottom row.
     let resize_id = resolved_id.clone();
+    let resize_bar = bar.clone();
     let mut winch = signal(SignalKind::window_change()).context("install SIGWINCH handler")?;
     let resize_task = tokio::spawn(async move {
         loop {
-            // Wait for next resize event.
             if winch.recv().await.is_none() {
                 break;
             }
             if let Ok((rows, cols)) = local_term_size_result() {
-                let _ = send_resize(&resize_id, rows, cols).await;
+                let pty_rows = if rows >= 3 { rows - 1 } else { rows };
+                let _ = send_resize(&resize_id, pty_rows, cols).await;
+                if let Ok(mut bar) = resize_bar.lock() {
+                    bar.resize(rows, cols);
+                    let mut out = std::io::stdout();
+                    let _ = bar.enter(&mut out);
+                }
             }
         }
     });
 
-    // 4. Pipe stdin → socket and socket → stdout. The detach state
+    // 5. Periodic redraw — updates the duration counter and reasserts
+    //    the bar after any inner app (vim / less / etc.) leaves alt
+    //    screen and stomps our scrolling region.
+    let tick_bar = bar.clone();
+    let tick_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+        // First tick fires immediately; we just painted the bar in
+        // step 3 so skip it.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if let Ok(bar) = tick_bar.lock() {
+                let mut out = std::io::stdout();
+                let _ = bar.redraw(&mut out);
+            }
+        }
+    });
+
+    // 6. Pipe stdin → socket and socket → stdout. The detach state
     //    machine watches stdin for `Ctrl-A d`.
     let pipe_result = pipe_attach(reader, wr).await;
 
     resize_task.abort();
+    tick_task.abort();
+    // Tear down the bar (reset scrolling region, clear bar row) BEFORE
+    // RawMode drops, so the cursor restore lands in a sane place.
+    if let Ok(bar) = bar.lock() {
+        let mut out = std::io::stdout();
+        let _ = bar.leave(&mut out);
+    }
     pipe_result
 }
 
