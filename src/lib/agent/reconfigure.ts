@@ -25,6 +25,10 @@ import { eq } from "drizzle-orm";
 export interface ReconfigurePatch {
   apiUrl?: string;
   intervalSecs?: number;
+  /** One of the eight bar colours accepted by the agent. */
+  barColor?: string;
+  /** Comma-separated field list, e.g. `"session,user_host,detach"`. */
+  barFields?: string;
 }
 
 export interface ReconfigureResult {
@@ -40,7 +44,12 @@ export async function pushAgentReconfigure(
   serverId: string,
   patch: ReconfigurePatch
 ): Promise<ReconfigureResult> {
-  if (patch.apiUrl === undefined && patch.intervalSecs === undefined) {
+  if (
+    patch.apiUrl === undefined &&
+    patch.intervalSecs === undefined &&
+    patch.barColor === undefined &&
+    patch.barFields === undefined
+  ) {
     return { ok: true };
   }
 
@@ -75,6 +84,8 @@ export async function pushAgentReconfigure(
   const flags: string[] = [];
   if (patch.apiUrl !== undefined) flags.push(`--api-url ${shellEscape(patch.apiUrl)}`);
   if (patch.intervalSecs !== undefined) flags.push(`--interval-secs ${patch.intervalSecs}`);
+  if (patch.barColor !== undefined) flags.push(`--bar-color ${shellEscape(patch.barColor)}`);
+  if (patch.barFields !== undefined) flags.push(`--bar-fields ${shellEscape(patch.barFields)}`);
   const reconfigureCmd = `${sudoPrefix}managet-agent reconfigure ${flags.join(" ")}`;
   const reconfigureRes = await executeCommand(
     serverId,
@@ -90,6 +101,15 @@ export async function pushAgentReconfigure(
         reconfigureRes.stderr || reconfigureRes.stdout
       }`,
     };
+  }
+
+  // Bar-only changes don't need a service restart — the bar reloads
+  // its config on every attach. Restart only when we touched api_url
+  // or interval_secs, which the long-running heartbeat loop only reads
+  // at startup.
+  const needsRestart = patch.apiUrl !== undefined || patch.intervalSecs !== undefined;
+  if (!needsRestart) {
+    return { ok: true };
   }
 
   // Restart the service so the heartbeat loop picks up the new

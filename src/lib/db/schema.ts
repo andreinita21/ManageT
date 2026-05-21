@@ -91,6 +91,17 @@ export const servers = sqliteTable("servers", {
   // this column existed; the dashboard treats NULL as "use the URL
   // currently in the agent's config.toml — unknown to us".
   apiUrl: text("api_url"),
+  // ---- `managet attach` status bar ----
+  // Stored as the strings the agent's `bar.toml` understands, so a
+  // dashboard PUT can be SSH-pushed verbatim. NULL = "leave whatever
+  // the agent has on disk alone".
+  barColor: text("bar_color", {
+    enum: ["green", "cyan", "magenta", "yellow", "blue", "red", "white", "gray"],
+  }),
+  // Comma-separated list of field keys, in order, e.g. "session,user_host,detach".
+  // Recognised keys: session, user_host, duration, detach. Same shape
+  // we pass to `managet-agent reconfigure --bar-fields`.
+  barFields: text("bar_fields"),
   createdBy: text("created_by")
     .notNull()
     .references(() => users.id),

@@ -71,6 +71,13 @@
       "when": 1779319874299,
       "tag": "0009_server_api_url",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1779348538761,
+      "tag": "0010_server_bar_settings",
+      "breakpoints": true
     }
   ]
 }

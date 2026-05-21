@@ -39,6 +39,14 @@ pub enum Request {
         /// about this field.
         #[serde(default)]
         user: Option<String>,
+        /// Optional working directory to start the new session in. When
+        /// `Some(path)`, the agent tries to `cd` to it before exec'ing
+        /// the shell; if the target user doesn't have access we fall
+        /// back to their `$HOME`. Lets `managet new` typed in
+        /// `~/projects/foo` start the session in `~/projects/foo`
+        /// instead of `$HOME`.
+        #[serde(default)]
+        cwd: Option<String>,
     },
     /// Begin streaming a session's input/output over this connection.
     /// After the agent replies with `Response::Attached`, both sides

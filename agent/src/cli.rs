@@ -77,6 +77,20 @@ pub struct ReconfigureArgs {
     /// New heartbeat interval in seconds (5–600). Optional.
     #[arg(long)]
     pub interval_secs: Option<u64>,
+
+    /// New colour for the `managet attach` status bar.
+    /// One of: green, cyan, magenta, yellow, blue, red, white, gray.
+    /// Persisted to /etc/managet-agent/bar.toml — the running agent
+    /// doesn't need to be restarted, the bar reloads on next attach.
+    #[arg(long)]
+    pub bar_color: Option<String>,
+
+    /// Comma-separated list of fields to render in the status bar,
+    /// in order. Recognised: session, user_host, duration, detach.
+    /// Unknown entries are dropped silently. Persisted to
+    /// /etc/managet-agent/bar.toml.
+    #[arg(long)]
+    pub bar_fields: Option<String>,
 }
 
 #[derive(Debug, Args)]

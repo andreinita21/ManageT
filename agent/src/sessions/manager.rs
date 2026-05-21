@@ -275,6 +275,7 @@ impl SessionManager {
         rows: u16,
         cols: u16,
         user: Option<String>,
+        cwd: Option<String>,
     ) -> Result<Arc<Session>> {
         let id = uuid::Uuid::new_v4().to_string();
         let name = name.unwrap_or_else(|| format!("session-{}", &id[..8]));
@@ -334,6 +335,18 @@ impl SessionManager {
         // configured login shell.
         let shell = default_shell();
         let command_label = command.clone().unwrap_or_else(|| shell.clone());
+        // `cd_prefix` is the shell snippet we prepend to land in the
+        // user's invocation cwd. `2>/dev/null || true` makes it a no-op
+        // if the cwd is inaccessible to the target user (or has been
+        // deleted between `managet new` and exec) — they keep their
+        // default starting directory instead of getting a hard failure.
+        let cd_prefix = match cwd.as_deref() {
+            Some(p) if !p.is_empty() => {
+                format!("cd {} 2>/dev/null || true; ", shell_single_quote(p))
+            }
+            _ => String::new(),
+        };
+
         let mut cmd = match (resolved_user.as_ref(), command.as_deref()) {
             (Some(u), Some(cmd_str)) => {
                 // Run the user-supplied command as the target user, then
@@ -344,7 +357,7 @@ impl SessionManager {
                 } else {
                     u.shell.to_string_lossy().into_owned()
                 };
-                let chained = format!("{}; exec {} -l", cmd_str, user_shell);
+                let chained = format!("{cd_prefix}{cmd_str}; exec {user_shell} -l");
                 let mut c = CommandBuilder::new("su");
                 c.arg("-l");
                 c.arg(&u.name);
@@ -353,10 +366,26 @@ impl SessionManager {
                 c
             }
             (Some(u), None) => {
-                // Plain interactive login shell as the target user.
+                // Interactive shell as the target user. We still go through
+                // `su -l … -c "cd …; exec <shell> -l"` rather than plain
+                // `su -l` so the cwd takes effect. Costs one extra exec
+                // (negligible) and lets every code path share the same
+                // cd-then-shell template.
+                let user_shell = if u.shell.as_os_str().is_empty() {
+                    "/bin/sh".to_string()
+                } else {
+                    u.shell.to_string_lossy().into_owned()
+                };
+                let chained = if cd_prefix.is_empty() {
+                    format!("exec {user_shell} -l")
+                } else {
+                    format!("{cd_prefix}exec {user_shell} -l")
+                };
                 let mut c = CommandBuilder::new("su");
                 c.arg("-l");
                 c.arg(&u.name);
+                c.arg("-c");
+                c.arg(chained);
                 c
             }
             (None, Some(cmd_str)) => {
@@ -365,7 +394,7 @@ impl SessionManager {
                 // working after the process exits (or debug a crash). For
                 // stack services where the user wants the session to follow
                 // the process, they can use `managet kill <name>` to end it.
-                let chained = format!("{}; exec {}", cmd_str, shell);
+                let chained = format!("{cd_prefix}{cmd_str}; exec {shell}");
                 let mut c = CommandBuilder::new(&shell);
                 c.arg("-c");
                 c.arg(chained);
@@ -375,9 +404,17 @@ impl SessionManager {
                 // No user override: spawn the agent's $SHELL as a login
                 // shell so .bash_profile etc. get sourced even when the
                 // agent itself wasn't started from a login context.
-                let mut c = CommandBuilder::new(&shell);
-                c.arg("-l");
-                c
+                if cd_prefix.is_empty() {
+                    let mut c = CommandBuilder::new(&shell);
+                    c.arg("-l");
+                    c
+                } else {
+                    // Same-flavour cd-then-shell when a cwd was supplied.
+                    let mut c = CommandBuilder::new(&shell);
+                    c.arg("-c");
+                    c.arg(format!("{cd_prefix}exec {shell} -l"));
+                    c
+                }
             }
         };
 
@@ -548,4 +585,20 @@ fn now_ms() -> u64 {
 
 fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+}
+
+/// Single-quote a value for safe interpolation into a `sh -c` snippet.
+/// Wraps in `'…'`; any embedded single quotes are escaped via `'\''`.
+fn shell_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str(r"'\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }

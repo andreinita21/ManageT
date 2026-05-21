@@ -40,6 +40,8 @@ export function rowToServer(r: ServerRow): Server {
     sessionRetentionDays: r.sessionRetentionDays,
     maxSessions: r.maxSessions ?? undefined,
     apiUrl: r.apiUrl ?? undefined,
+    barColor: (r.barColor as Server["barColor"]) ?? undefined,
+    barFields: r.barFields ?? undefined,
     createdBy: r.createdBy,
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,

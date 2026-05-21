@@ -112,10 +112,11 @@ async fn handle_client(stream: UnixStream, manager: Arc<SessionManager>) -> Resu
             rows,
             cols,
             user,
+            cwd,
         } => {
             let r = rows.unwrap_or(24);
             let c = cols.unwrap_or(80);
-            match manager.create(name, command, r, c, user) {
+            match manager.create(name, command, r, c, user, cwd) {
                 Ok(sess) => {
                     // Snapshot the name *before* the `await` so we don't
                     // hold a MutexGuard across a suspension point — the

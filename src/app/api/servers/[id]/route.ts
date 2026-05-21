@@ -47,6 +47,17 @@ const updateServerSchema = z.object({
       message: "must start with http:// or https://",
     })
     .optional(),
+  barColor: z
+    .enum(["green", "cyan", "magenta", "yellow", "blue", "red", "white", "gray"])
+    .optional(),
+  // Comma-separated field list. Validate shape but not contents — the
+  // agent silently drops unknown keys.
+  barFields: z
+    .string()
+    .regex(/^[a-z_]+(,[a-z_]+)*$/, {
+      message: "barFields must be comma-separated tokens like 'session,user_host,detach'",
+    })
+    .optional(),
 });
 
 export async function GET(
@@ -133,10 +144,16 @@ export async function PUT(
   const intervalChanging =
     input.heartbeatIntervalSecs !== undefined &&
     input.heartbeatIntervalSecs !== row.heartbeatIntervalSecs;
-  if (urlChanging || intervalChanging) {
+  const barColorChanging =
+    input.barColor !== undefined && input.barColor !== row.barColor;
+  const barFieldsChanging =
+    input.barFields !== undefined && input.barFields !== row.barFields;
+  if (urlChanging || intervalChanging || barColorChanging || barFieldsChanging) {
     const result = await pushAgentReconfigure(id, {
       apiUrl: urlChanging ? input.apiUrl : undefined,
       intervalSecs: intervalChanging ? input.heartbeatIntervalSecs : undefined,
+      barColor: barColorChanging ? input.barColor : undefined,
+      barFields: barFieldsChanging ? input.barFields : undefined,
     });
     if (!result.ok) {
       return NextResponse.json(
@@ -149,6 +166,8 @@ export async function PUT(
       );
     }
     if (urlChanging) updates.apiUrl = input.apiUrl;
+    if (barColorChanging) updates.barColor = input.barColor;
+    if (barFieldsChanging) updates.barFields = input.barFields;
   } else if (input.apiUrl !== undefined) {
     // URL field was sent but is unchanged — write it through to cover
     // the unlikely case where the DB column was NULL and the user just

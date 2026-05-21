@@ -61,16 +61,28 @@ pub async fn run_ls() -> Result<()> {
 /// `managet new [-c CMD] [-n NAME]` — spawn a fresh session and print its id.
 pub async fn run_new(name: Option<String>, command: Option<String>) -> Result<()> {
     let (rows, cols) = local_term_size().unwrap_or((24, 80));
+    // SECURITY: spawn the new session as the invoking user, NOT as
+    // whatever uid the agent process runs as (root on installed hosts).
+    // Previously this passed `user: None`, which silently dropped users
+    // into a root shell — a real footgun. We look up the calling user
+    // by euid via getpwuid(); if that fails for some reason fall back
+    // to `$USER` / `$LOGNAME`. As a last resort we still pass None,
+    // which keeps the agent's behaviour (root) — that's only correct
+    // when the agent IS the user, e.g. someone invoked `managet new` as
+    // root themselves.
+    let invoking_user = invoking_user_name();
+    // Pass through the user's current working directory so the new
+    // session starts where they typed `managet new`, not in $HOME.
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
     let resp = round_trip(&Request::New {
         name,
         command,
         rows: Some(rows),
         cols: Some(cols),
-        // Local `managet new` keeps the legacy behaviour: spawn as
-        // whatever user the agent is running as (root on installed
-        // hosts). The dashboard-side path supplies a real user via the
-        // session:create flow.
-        user: None,
+        user: invoking_user,
+        cwd,
     })
     .await?;
     match resp {
@@ -352,6 +364,31 @@ async fn round_trip(req: &Request) -> Result<Response> {
 // -----------------------------------------------------------------------
 // Terminal helpers
 // -----------------------------------------------------------------------
+
+/// Look up the username corresponding to the calling process's
+/// effective UID. Returns `None` only when neither `getpwuid()` nor the
+/// `$USER`/`$LOGNAME` environment variables produce a usable string —
+/// which on a sane system never happens.
+fn invoking_user_name() -> Option<String> {
+    use nix::unistd::{Uid, User};
+    let uid = Uid::effective();
+    if let Ok(Some(u)) = User::from_uid(uid) {
+        if !u.name.is_empty() {
+            return Some(u.name);
+        }
+    }
+    if let Ok(s) = std::env::var("USER") {
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    if let Ok(s) = std::env::var("LOGNAME") {
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    None
+}
 
 fn local_term_size() -> Option<(u16, u16)> {
     local_term_size_result().ok()

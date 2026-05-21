@@ -104,25 +104,46 @@ impl AgentConfig {
 /// expected to do that. Used by the dashboard's "Dashboard URL" push so
 /// agents can be repointed at a new tunnel URL without a full reinstall.
 pub fn reconfigure(args: crate::cli::ReconfigureArgs) -> anyhow::Result<()> {
-    let mut cfg = AgentConfig::load().context("loading config to reconfigure")?;
-    if let Some(url) = args.api_url {
-        let trimmed = url.trim().trim_end_matches('/').to_string();
-        if trimmed.is_empty() {
-            anyhow::bail!("--api-url cannot be empty");
+    let touched_main = args.api_url.is_some() || args.interval_secs.is_some();
+    let touched_bar = args.bar_color.is_some() || args.bar_fields.is_some();
+
+    if touched_main {
+        let mut cfg = AgentConfig::load().context("loading config to reconfigure")?;
+        if let Some(url) = &args.api_url {
+            let trimmed = url.trim().trim_end_matches('/').to_string();
+            if trimmed.is_empty() {
+                anyhow::bail!("--api-url cannot be empty");
+            }
+            if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+                anyhow::bail!("--api-url must start with http:// or https://");
+            }
+            cfg.api_url = trimmed;
         }
-        if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
-            anyhow::bail!("--api-url must start with http:// or https://");
+        if let Some(interval) = args.interval_secs {
+            if interval == 0 {
+                anyhow::bail!("--interval-secs must be > 0");
+            }
+            cfg.heartbeat_interval_secs = interval;
         }
-        cfg.api_url = trimmed;
+        cfg.save().context("writing updated config")?;
+        println!(
+            "reconfigured: api_url={} interval_secs={}",
+            cfg.api_url, cfg.heartbeat_interval_secs
+        );
     }
-    if let Some(interval) = args.interval_secs {
-        if interval == 0 {
-            anyhow::bail!("--interval-secs must be > 0");
-        }
-        cfg.heartbeat_interval_secs = interval;
+
+    if touched_bar {
+        crate::sessions::bar::save_partial(
+            args.bar_color.as_deref(),
+            args.bar_fields.as_deref(),
+        )
+        .context("updating bar.toml")?;
+        println!("reconfigured: bar settings saved");
     }
-    cfg.save().context("writing updated config")?;
-    println!("reconfigured: api_url={} interval_secs={}", cfg.api_url, cfg.heartbeat_interval_secs);
+
+    if !touched_main && !touched_bar {
+        eprintln!("reconfigure: nothing to do (no flags supplied)");
+    }
     Ok(())
 }
 

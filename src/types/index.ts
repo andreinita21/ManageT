@@ -57,6 +57,14 @@ export interface Server {
    * "unknown" but still lets the user push a new value.
    */
   apiUrl?: string;
+  /** `managet attach` status-bar colour. `undefined` = agent default (green). */
+  barColor?: "green" | "cyan" | "magenta" | "yellow" | "blue" | "red" | "white" | "gray";
+  /**
+   * Comma-separated list of field keys for the status bar, in order
+   * (e.g. `"session,user_host,detach"`). Recognised keys: session,
+   * user_host, duration, detach. `undefined` = agent default.
+   */
+  barFields?: string;
   createdBy: string;
   createdAt: number;
   updatedAt: number;

@@ -188,6 +188,8 @@ export async function updateServer(
     sessionRetentionDays: number;
     maxSessions: number | null;
     apiUrl: string;
+    barColor: Server["barColor"];
+    barFields: string;
   }>
 ): Promise<Server> {
   const res = await fetch(`${API_BASE}/servers/${id}`, {

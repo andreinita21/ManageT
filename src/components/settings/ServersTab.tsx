@@ -57,6 +57,9 @@ export function ServersTab() {
   // Server whose agent settings (heartbeat interval, log level, etc.)
   // are being edited. NULL = modal closed.
   const [agentEditTarget, setAgentEditTarget] = useState<Server | null>(null);
+  // Server whose connection details (name/host/port/user/password) are
+  // being edited. NULL = modal closed.
+  const [serverEditTarget, setServerEditTarget] = useState<Server | null>(null);
 
   const columns = useMemo(
     () => [
@@ -131,6 +134,17 @@ export function ServersTab() {
               variant="ghost"
               onClick={(e) => {
                 e.stopPropagation();
+                setServerEditTarget(s);
+              }}
+              title="Edit connection details (name, host, user, password)"
+            >
+              Edit
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={(e) => {
+                e.stopPropagation();
                 setAgentEditTarget(s);
               }}
               title="Edit per-server agent settings"
@@ -164,6 +178,25 @@ export function ServersTab() {
       await updateServer(target.id, patch);
       toast(`Agent settings saved for ${target.name}`, "success");
       setAgentEditTarget(null);
+      refetch();
+    } catch (err) {
+      toast(err instanceof Error ? err.message : "Save failed", "error");
+    }
+  };
+
+  const handleSaveServer = async (
+    target: Server,
+    patch: ServerEditPatch
+  ) => {
+    try {
+      // Empty `password` from the form means "don't change it" — strip
+      // it so we never send `password: ""` to the API, which would
+      // re-encrypt an empty string as the new password.
+      const cleaned: ServerEditPatch = { ...patch };
+      if (!cleaned.password) delete cleaned.password;
+      await updateServer(target.id, cleaned);
+      toast(`Saved ${target.name}`, "success");
+      setServerEditTarget(null);
       refetch();
     } catch (err) {
       toast(err instanceof Error ? err.message : "Save failed", "error");
@@ -446,7 +479,177 @@ export function ServersTab() {
         onClose={() => setAgentEditTarget(null)}
         onSave={handleSaveAgentConfig}
       />
+
+      <ServerEditModal
+        target={serverEditTarget}
+        onClose={() => setServerEditTarget(null)}
+        onSave={handleSaveServer}
+      />
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Server connection-details modal
+// ---------------------------------------------------------------------------
+
+interface ServerEditPatch {
+  name?: string;
+  host?: string;
+  port?: number;
+  username?: string;
+  authMethod?: "key" | "password";
+  privateKeyPath?: string;
+  password?: string;
+}
+
+function ServerEditModal({
+  target,
+  onClose,
+  onSave,
+}: {
+  target: Server | null;
+  onClose: () => void;
+  onSave: (target: Server, patch: ServerEditPatch) => Promise<void> | void;
+}) {
+  const [name, setName] = useState("");
+  const [host, setHost] = useState("");
+  const [port, setPort] = useState("22");
+  const [username, setUsername] = useState("");
+  const [authMethod, setAuthMethod] = useState<"key" | "password">("key");
+  const [privateKeyPath, setPrivateKeyPath] = useState("");
+  const [password, setPassword] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  React.useEffect(() => {
+    if (!target) return;
+    setName(target.name);
+    setHost(target.host);
+    setPort(String(target.port));
+    setUsername(target.username);
+    setAuthMethod(target.authMethod);
+    setPrivateKeyPath(target.privateKeyPath ?? "");
+    setPassword("");
+    setError(null);
+  }, [target]);
+
+  const handleSave = async () => {
+    if (!target) return;
+    setError(null);
+    if (!name.trim() || !host.trim() || !username.trim()) {
+      setError("Name, host, and username can't be empty.");
+      return;
+    }
+    const portNum = parseInt(port || "22", 10);
+    if (Number.isNaN(portNum) || portNum < 1 || portNum > 65535) {
+      setError("Port must be 1–65535.");
+      return;
+    }
+    if (authMethod === "key" && !privateKeyPath.trim()) {
+      setError("Private key path is required when auth is 'key'.");
+      return;
+    }
+    setSaving(true);
+    try {
+      const patch: ServerEditPatch = {
+        name: name.trim(),
+        host: host.trim(),
+        port: portNum,
+        username: username.trim(),
+        authMethod,
+        // The PUT handler decrypts password into passwordEncrypted; an
+        // empty string is stripped upstream so it won't overwrite the
+        // stored credential when the user just edits other fields.
+        privateKeyPath: authMethod === "key" ? privateKeyPath.trim() : undefined,
+        password: authMethod === "password" ? password : undefined,
+      };
+      await onSave(target, patch);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Modal
+      open={target !== null}
+      onClose={() => {
+        if (!saving) onClose();
+      }}
+      title={`Edit ${target?.name ?? "server"}`}
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose} disabled={saving}>
+            Cancel
+          </Button>
+          <Button onClick={handleSave} loading={saving}>
+            Save
+          </Button>
+        </>
+      }
+    >
+      {target && (
+        <div className="space-y-3">
+          <p className="text-xs text-mg-text-tertiary">
+            Only updates the dashboard's stored connection details — the
+            installed agent isn't touched. If you rename or move the host,
+            the existing agent keeps heartbeating until you change the
+            Dashboard URL or reinstall.
+          </p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Input label="Name" value={name} onChange={(e) => setName(e.target.value)} />
+            <Input
+              label="Host / IP"
+              value={host}
+              onChange={(e) => setHost(e.target.value)}
+            />
+            <Input
+              label="Port"
+              type="number"
+              min={1}
+              max={65535}
+              value={port}
+              onChange={(e) => setPort(e.target.value)}
+            />
+            <Input
+              label="SSH username"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+            />
+            <Select
+              label="Auth method"
+              value={authMethod}
+              onChange={(e) => setAuthMethod(e.target.value as "key" | "password")}
+              options={[
+                { value: "key", label: "Private key" },
+                { value: "password", label: "Password" },
+              ]}
+            />
+            {authMethod === "key" ? (
+              <Input
+                label="Private key path"
+                value={privateKeyPath}
+                onChange={(e) => setPrivateKeyPath(e.target.value)}
+                placeholder="/home/user/.ssh/id_ed25519"
+              />
+            ) : (
+              <Input
+                label="Password (leave blank to keep current)"
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="••••••••"
+              />
+            )}
+          </div>
+          {error && (
+            <div className="text-xs text-mg-danger bg-mg-danger/10 border border-mg-danger/30 rounded-md px-3 py-2">
+              {error}
+            </div>
+          )}
+        </div>
+      )}
+    </Modal>
   );
 }
 
@@ -461,7 +664,27 @@ interface AgentConfigPatch {
   sessionRetentionDays: number;
   maxSessions: number | null;
   apiUrl: string;
+  barColor: NonNullable<Server["barColor"]>;
+  barFields: string;
 }
+
+const BAR_COLORS: Array<{ value: NonNullable<Server["barColor"]>; label: string }> = [
+  { value: "green", label: "green (default)" },
+  { value: "cyan", label: "cyan" },
+  { value: "magenta", label: "magenta" },
+  { value: "yellow", label: "yellow" },
+  { value: "blue", label: "blue" },
+  { value: "red", label: "red" },
+  { value: "white", label: "white" },
+  { value: "gray", label: "gray (dim)" },
+];
+
+const BAR_FIELD_OPTIONS = [
+  { key: "session", label: "Session name" },
+  { key: "user_host", label: "user@host" },
+  { key: "duration", label: "Attach duration" },
+  { key: "detach", label: "Ctrl+A D hint" },
+] as const;
 
 function AgentConfigModal({
   target,
@@ -479,6 +702,10 @@ function AgentConfigModal({
   const [autoUpdate, setAutoUpdate] = useState(false);
   const [retentionDays, setRetentionDays] = useState("30");
   const [maxSessions, setMaxSessions] = useState("");
+  const [barColor, setBarColor] = useState<NonNullable<Server["barColor"]>>("green");
+  const [barFieldsSet, setBarFieldsSet] = useState<Set<string>>(
+    new Set(["session", "user_host", "detach"])
+  );
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -491,6 +718,15 @@ function AgentConfigModal({
     setRetentionDays(String(target.sessionRetentionDays));
     setMaxSessions(
       target.maxSessions != null ? String(target.maxSessions) : ""
+    );
+    setBarColor((target.barColor as NonNullable<Server["barColor"]>) ?? "green");
+    setBarFieldsSet(
+      new Set(
+        (target.barFields ?? "session,user_host,detach")
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean)
+      )
     );
     setError(null);
   }, [target]);
@@ -527,6 +763,16 @@ function AgentConfigModal({
         return;
       }
     }
+    // Bar fields are serialised back into the same comma-separated
+    // string the agent expects. Preserve the BAR_FIELD_OPTIONS order
+    // so the bar's left-to-right layout matches the checklist order.
+    const barFieldsStr = BAR_FIELD_OPTIONS.filter((o) => barFieldsSet.has(o.key))
+      .map((o) => o.key)
+      .join(",");
+    if (!barFieldsStr) {
+      setError("Pick at least one bar field — otherwise the bar would be empty.");
+      return;
+    }
     setSaving(true);
     try {
       await onSave(target, {
@@ -536,10 +782,21 @@ function AgentConfigModal({
         autoUpdate,
         sessionRetentionDays: ret,
         maxSessions: cap,
+        barColor,
+        barFields: barFieldsStr,
       });
     } finally {
       setSaving(false);
     }
+  };
+
+  const toggleBarField = (key: string, on: boolean) => {
+    setBarFieldsSet((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(key);
+      else next.delete(key);
+      return next;
+    });
   };
 
   return (
@@ -638,6 +895,55 @@ function AgentConfigModal({
               restart on each agent boot.
             </span>
           </label>
+
+          {/* `managet attach` status bar */}
+          <div className="border-t border-mg-border pt-3 space-y-3">
+            <div>
+              <p className="text-sm font-medium text-mg-text">
+                Status bar (managet attach)
+              </p>
+              <p className="text-xs text-mg-text-tertiary mt-0.5">
+                Customise the one-line bar shown at the bottom of a terminal
+                when a user runs `managet attach` directly on this host.
+                Doesn't affect the web terminal.
+              </p>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <Select
+                label="Colour"
+                value={barColor}
+                onChange={(e) =>
+                  setBarColor(e.target.value as NonNullable<Server["barColor"]>)
+                }
+                options={BAR_COLORS.map((c) => ({ value: c.value, label: c.label }))}
+              />
+              <div className="flex flex-col gap-1.5">
+                <span className="text-sm text-mg-text-secondary font-medium">
+                  Fields (order matches the list)
+                </span>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {BAR_FIELD_OPTIONS.map((opt) => {
+                    const checked = barFieldsSet.has(opt.key);
+                    return (
+                      <label
+                        key={opt.key}
+                        className="flex items-center gap-2 text-xs text-mg-text-secondary cursor-pointer"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={(e) => toggleBarField(opt.key, e.target.checked)}
+                          className="accent-mg-accent"
+                        />
+                        {opt.label}
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          </div>
+
           {error && (
             <div className="text-xs text-mg-danger bg-mg-danger/10 border border-mg-danger/30 rounded-md px-3 py-2">
               {error}
