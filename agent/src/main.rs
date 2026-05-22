@@ -31,7 +31,13 @@ async fn main() -> Result<()> {
         Command::Uninstall => installer::run_uninstall().await,
         Command::Status => collector::print_status_snapshot(),
         Command::Ls => sessions::client::run_ls().await,
-        Command::New { name, command } => sessions::client::run_new(name, command).await,
+        Command::New { name, name_flag, command, no_attach } => {
+            // Positional name wins if both are given (defensible default
+            // when an old script with `-n foo` is invoked alongside a
+            // new positional). Falls back to the flag if only that's set.
+            let resolved = name.or(name_flag);
+            sessions::client::run_new(resolved, command, no_attach).await
+        }
         Command::Attach { id } => sessions::client::run_attach(id).await,
         Command::Kill { id } => sessions::client::run_kill(id).await,
         Command::Reconfigure(args) => config::reconfigure(args),

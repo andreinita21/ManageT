@@ -36,14 +36,34 @@ pub enum Command {
     /// List active terminal sessions managed by this host's agent.
     Ls,
 
-    /// Spawn a new persistent terminal session.
+    /// Spawn a new persistent terminal session and attach to it.
+    ///
+    /// By default attaches automatically if stdout is a TTY, so
+    /// `managet new myproject` is a one-step "create and enter".
+    /// Scripts that just want to spawn a session non-interactively
+    /// (via `ssh host "managet new …"`) keep their old behaviour
+    /// because stdout isn't a TTY in that case — the command falls
+    /// back to printing the attach hint and exiting.
     New {
         /// Friendly name for the session (default: `session-<short-id>`).
-        #[arg(short, long)]
+        /// Positional — e.g. `managet new devproject`.
         name: Option<String>,
+
+        /// Same as the positional name, kept for backwards compat with
+        /// `managet new -n foo` invocations in older scripts. Hidden
+        /// from --help so new users see the positional form first.
+        #[arg(short = 'n', long = "name", hide = true)]
+        name_flag: Option<String>,
+
         /// Command to run (default: `$SHELL`).
         #[arg(short, long)]
         command: Option<String>,
+
+        /// Don't auto-attach after creating. Useful for scripting
+        /// from an interactive shell where you want to spawn the
+        /// session but stay in the current terminal.
+        #[arg(long)]
+        no_attach: bool,
     },
 
     /// Attach to an existing session by id (or unique prefix / name).

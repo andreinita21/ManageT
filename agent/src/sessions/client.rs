@@ -57,18 +57,18 @@ pub async fn run_ls() -> Result<()> {
     Ok(())
 }
 
-/// `managet new [-c CMD] [-n NAME]` — spawn a fresh session and print its id.
-pub async fn run_new(name: Option<String>, command: Option<String>) -> Result<()> {
+/// `managet new [NAME] [-c CMD] [--no-attach]` — spawn a fresh session
+/// and (by default, when stdout is a TTY) attach to it in one step.
+pub async fn run_new(
+    name: Option<String>,
+    command: Option<String>,
+    no_attach: bool,
+) -> Result<()> {
     let (rows, cols) = local_term_size().unwrap_or((24, 80));
     // SECURITY: spawn the new session as the invoking user, NOT as
     // whatever uid the agent process runs as (root on installed hosts).
-    // Previously this passed `user: None`, which silently dropped users
-    // into a root shell — a real footgun. We look up the calling user
-    // by euid via getpwuid(); if that fails for some reason fall back
-    // to `$USER` / `$LOGNAME`. As a last resort we still pass None,
-    // which keeps the agent's behaviour (root) — that's only correct
-    // when the agent IS the user, e.g. someone invoked `managet new` as
-    // root themselves.
+    // We look up the calling user by euid via getpwuid(); if that
+    // fails fall back to `$USER`/`$LOGNAME`, then None (= agent's uid).
     let invoking_user = invoking_user_name();
     // Pass through the user's current working directory so the new
     // session starts where they typed `managet new`, not in $HOME.
@@ -84,14 +84,24 @@ pub async fn run_new(name: Option<String>, command: Option<String>) -> Result<()
         cwd,
     })
     .await?;
-    match resp {
-        Response::Created { id, name } => {
-            println!("Created session {} ({})", short_id(&id), name);
-            println!("Attach with: managet attach {}", short_id(&id));
-            Ok(())
-        }
-        Response::Error { message } => Err(anyhow!(message)),
-        other => Err(anyhow!("unexpected response: {other:?}")),
+    let (id, name) = match resp {
+        Response::Created { id, name } => (id, name),
+        Response::Error { message } => return Err(anyhow!(message)),
+        other => return Err(anyhow!("unexpected response: {other:?}")),
+    };
+
+    // Auto-attach when stdout is an actual TTY and the caller didn't
+    // opt out. Scripts running over `ssh host "managet new …"` don't
+    // get a TTY by default — they keep the legacy "create-and-print"
+    // behaviour, which is what existing automation (test scripts,
+    // ssh-piped tooling) needs.
+    let should_attach = !no_attach && std::io::stdout().is_terminal();
+    if should_attach {
+        run_attach(id).await
+    } else {
+        println!("Created session {} ({})", short_id(&id), name);
+        println!("Attach with: managet attach {}", short_id(&id));
+        Ok(())
     }
 }
 

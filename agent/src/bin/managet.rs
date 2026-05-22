@@ -5,7 +5,8 @@
 //! and survive any browser/dashboard activity — same model as tmux,
 //! same UX:
 //!
-//!   managet new [-n NAME] [-c CMD]   # spawn a session
+//!   managet new [NAME] [-c CMD]      # spawn AND attach
+//!   managet new [NAME] --no-attach   # spawn without attaching
 //!   managet ls                       # list sessions on this host
 //!   managet attach <id|name>         # attach (Ctrl-A d to detach)
 //!   managet kill <id|name>           # SIGTERM the child
@@ -36,14 +37,28 @@ enum Command {
     /// List active terminal sessions managed by this host's agent.
     Ls,
 
-    /// Spawn a new persistent terminal session.
+    /// Spawn a new persistent terminal session and attach to it.
+    ///
+    /// `managet new devproject` creates a session named `devproject`
+    /// and attaches in one step. With no name argument a random
+    /// `session-<id>` is used. Pass `--no-attach` to spawn without
+    /// entering; ssh-driven scripts (no TTY) get that behaviour
+    /// automatically.
     New {
-        /// Friendly name (default: `session-<short-id>`).
-        #[arg(short, long)]
+        /// Friendly name (default: `session-<short-id>`). Positional.
         name: Option<String>,
+
+        /// Backwards-compatible alias for the positional name.
+        #[arg(short = 'n', long = "name", hide = true)]
+        name_flag: Option<String>,
+
         /// Command to run in the new session (default: `$SHELL`).
         #[arg(short, long)]
         command: Option<String>,
+
+        /// Don't auto-attach after creating.
+        #[arg(long)]
+        no_attach: bool,
     },
 
     /// Attach to an existing session by id, name, or unique prefix.
@@ -74,7 +89,10 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Ls => sessions::client::run_ls().await,
-        Command::New { name, command } => sessions::client::run_new(name, command).await,
+        Command::New { name, name_flag, command, no_attach } => {
+            let resolved = name.or(name_flag);
+            sessions::client::run_new(resolved, command, no_attach).await
+        }
         Command::Attach { id } => sessions::client::run_attach(id).await,
         Command::Kill { id } => sessions::client::run_kill(id).await,
     }
