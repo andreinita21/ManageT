@@ -9,7 +9,7 @@
 [![SQLite + Drizzle](https://img.shields.io/badge/db-SQLite-blue?logo=sqlite)](https://orm.drizzle.team)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](#license)
 
-[Features](#features) · [Architecture](#architecture) · [Quick start](#quick-start) · [Production deployment](#production-deployment) · [CLI](#host-side-cli) · [Themes](#theming) · [Roadmap](#roadmap)
+[Features](#features) · [Architecture](#architecture) · [Quick start](#quick-start) · [Production deployment](#production-deployment) · [Command palette](#host-side-command-palette) · [Themes](#theming) · [Roadmap](#roadmap)
 
 </div>
 
@@ -164,24 +164,170 @@ git pull && npm ci && npm run build && sudo systemctl restart managet
 
 `.env.local` is the Next.js convention; `scripts/seed.ts` will write a key on first run if one isn't already present.
 
-## Host-side CLI
+## Host-side command palette
 
-The Rust agent installs as `managet-agent` on the host. It also installs a friendlier alias, `managet`, for the day-to-day verbs:
+The Rust agent installs two binaries on every managed host:
+
+- **`managet`** — the day-to-day verbs for working with terminal sessions. Designed to feel like `tmux` if `tmux` knew about your dashboard.
+- **`managet-agent`** — the long-running service binary and low-level admin verbs (install, run, uninstall, reconfigure). You rarely invoke this directly; the dashboard drives it for you when you click Add Server / Delete / Save in the Agent settings modal.
+
+Detach from any attached session with **Ctrl+A then D** (tmux-style). To send a literal Ctrl+A through to your shell (readline's beginning-of-line), press **Ctrl+A then Ctrl+A**.
+
+---
+
+### `managet new [NAME] [-c CMD] [--no-attach]`
+
+Create a persistent session **and attach to it in one step**. The session lives inside the agent process, survives detach / SSH disconnects / dashboard restarts, and is reachable from both this CLI and the web UI.
 
 ```bash
-managet ls            # list sessions on this host
-managet attach <id>   # attach to a session by id or unambiguous prefix
-managet new -c "npm run dev" --name api    # spawn a new PTY session
-managet kill <id>     # terminate a session (see "Roadmap" caveat)
-managet status        # heartbeat config + one-shot snapshot
-
-# Same agent, lower-level subcommands
-managet-agent install [--api-url URL --server-id ID --non-interactive]
-managet-agent run                 # service entrypoint, never exits
-managet-agent uninstall           # stop + remove service + binary + config
+managet new                                  # random name, auto-attach
+managet new devproject                       # named, auto-attach
+managet new logs -c "tail -F /var/log/syslog"   # run a command, auto-attach
+managet new build -c "cargo watch -x test" --no-attach   # spawn, stay put
 ```
 
-See [`agent/README.md`](./agent/README.md) for the full agent reference.
+| Situation | Default behaviour |
+|---|---|
+| **stdout is a TTY** (interactive shell) | Auto-attach — green banner + fresh shell. |
+| **stdout is NOT a TTY** (`ssh host "managet new …"`, CI, automation) | Skip the attach. Prints `Created session <id>` and the attach hint, exits. |
+| **`--no-attach`** | Force the no-attach path even from a TTY. |
+| **`-c "<cmd>"`** | Runs `<cmd>` inside the new session, then drops into your login shell so the session stays alive after `<cmd>` exits. |
+| **No name argument** | Auto-generated `session-<short-id>`. |
+| **Working directory** | The new session starts in **the directory you ran `managet new` from**, not in `$HOME`. |
+| **User identity** | The session runs as **you** (the invoking user), not as root — even though the agent itself runs as root. The drop is via `su -l <you> --session-command …` so PAM env + a real login shell + full job control all come along for the ride. |
+
+The legacy `-n / --name` long flag is still accepted (e.g. `managet new -n foo`) so older scripts keep working, but new invocations don't need it.
+
+---
+
+### `managet ls`
+
+List every session the agent is currently managing on this host. Detached sessions stay listed until they're explicitly killed or their child exits.
+
+```bash
+$ managet ls
+ID          NAME            AGE                     STATUS
+3b0e1f24    devproject      2m13s                   attached×1
+9a44f5e1    logs            45s                     detached
+e8c0a719    session-abc     0s                      detached
+```
+
+`attached×N` means **N clients** (any mix of CLI + browser tabs) are watching the session live; `detached` means nobody is. Closing your browser tab does **not** count as killing the session — it just decrements the attach count.
+
+---
+
+### `managet attach <id|name>`
+
+Attach to an existing session by short id, full id, or session name. Detach with **Ctrl+A then D**.
+
+```bash
+managet attach devproject
+managet attach 3b0e1f24
+managet attach 3b           # any unambiguous prefix
+```
+
+While attached you get:
+
+- A **one-line green banner** at the top so the entry is unmissable: `❯ managet · session devproject · andrei@markI · Ctrl+A D to detach`. Scrolls naturally with the rest of the session.
+- The terminal's **window/tab title** is set to `managet: <session>@<host>` — a persistent reminder that you're inside managet, visible in your terminal emulator's tab bar / titlebar.
+- **Native scrollback** works exactly like a normal SSH shell. Shift+PgUp, mouse wheel, and your terminal's "find" all do what you'd expect over the full session history.
+- **Multi-client attach**: someone in the dashboard browser tab + you in `managet attach` see the same live PTY. Type in one, the other sees it too.
+
+The banner's colour and which fields it shows are configurable per host — see [`managet-agent reconfigure`](#managet-agent-reconfigure--api-url-url---interval-secs-n---bar-color-color---bar-fields-list) below, or set them from the dashboard at **Settings → Servers → Agent**.
+
+---
+
+### `managet kill <id|name>`
+
+Send SIGTERM to the session's root process. Once the child exits, the session row is cleared from `managet ls` and from the dashboard.
+
+```bash
+managet kill devproject
+managet kill 3b0e1f24
+```
+
+There's a known edge case with shells started via `su -l` that survive a single SIGTERM (see [Roadmap](#roadmap)); the dashboard's reconciler + `scripts/cleanup-orphan-sessions.ts` work around this until the agent-side proper fix lands.
+
+---
+
+### `managet-agent install [--api-url URL --server-id ID --token TOKEN] [--non-interactive]`
+
+The first-time installer. Normally **you don't run this by hand** — the dashboard SSHes in and runs it on your behalf when you add a server. The interactive TUI mode (`managet-agent install` with no flags) is useful for sneakernet installs onto an air-gapped host where you can't reach the dashboard.
+
+---
+
+### `managet-agent run`
+
+The long-running service entrypoint. systemd / launchd invokes this — not you. If you find yourself running it directly, you probably want `managet-agent status` instead.
+
+---
+
+### `managet-agent uninstall`
+
+Stop the service, remove the service unit / plist, delete the config and binary, and exit. Run by the dashboard automatically when you click Delete on a server; you can also run it locally to undo a manual install.
+
+---
+
+### `managet-agent status`
+
+Print the loaded config + one resource snapshot, then exit. Useful for debugging when heartbeats aren't landing in the dashboard.
+
+```bash
+$ sudo managet-agent status
+config:
+  api_url:   https://managet.example.com
+  server_id: 87b03f46-77eb-44a3-bed7-22c3c4d5e600
+  interval:  10s
+snapshot:
+  cpu_percent:    14.2
+  memory_used_mb: 1840 / 8192
+  disk_used_pct:  43.7
+  …
+```
+
+---
+
+### `managet-agent reconfigure [--api-url URL] [--interval-secs N] [--bar-color COLOR] [--bar-fields LIST]`
+
+Mutate the on-disk config files (`/etc/managet-agent/config.toml` for the daemon, `/etc/managet-agent/bar.toml` for the attach banner) **without** running the full installer again. The dashboard uses this for the per-server "Dashboard URL", heartbeat-interval, and bar-customisation flows; you can also run it directly.
+
+```bash
+# Re-point an agent at a new dashboard URL — e.g. swap a LAN IP for a Cloudflare tunnel
+sudo managet-agent reconfigure --api-url https://managet.example.com
+
+# Slow the heartbeat down to once every 30 seconds
+sudo managet-agent reconfigure --interval-secs 30
+
+# Customise the banner shown when you `managet attach`
+sudo managet-agent reconfigure --bar-color cyan \
+                               --bar-fields session,user_host,duration,detach
+```
+
+| Flag | What it touches | Restart needed? |
+|---|---|---|
+| `--api-url URL` | `config.toml: api_url` | **Yes** — restart `managet-agent`. |
+| `--interval-secs N` | `config.toml: heartbeat_interval_secs` | **Yes** — restart `managet-agent`. |
+| `--bar-color COLOR` | `bar.toml: color` — one of `green` (default), `cyan`, `magenta`, `yellow`, `blue`, `red`, `white`, `gray`. | No — re-read on next `managet attach`. |
+| `--bar-fields LIST` | `bar.toml: fields` — comma-separated, in order. Recognised keys: `session`, `user_host`, `duration`, `detach`. | No — re-read on next `managet attach`. |
+
+The dashboard's push flow restarts the service for you whenever it issues a restart-required flag, so if you're driving this from **Settings → Servers → Agent** you don't have to think about it.
+
+---
+
+### Where things live on disk
+
+| Path | Purpose |
+|---|---|
+| `/usr/local/bin/managet-agent` | Service binary (run by systemd / launchd). |
+| `/usr/local/bin/managet` | User-facing CLI (what you actually type). |
+| `/etc/managet-agent/config.toml` (Linux) | Dashboard URL, server id, token, heartbeat interval. `0600` root-only. |
+| `/usr/local/etc/managet-agent/config.toml` (macOS) | Same, macOS path. |
+| `/etc/managet-agent/bar.toml` | Attach banner colour + field order. |
+| `/var/run/managet/agent.sock` | Unix socket the CLI + dashboard speak the agent protocol over. |
+| `/etc/systemd/system/managet-agent.service` (Linux) | systemd unit. |
+| `/Library/LaunchDaemons/com.managet.agent.plist` (macOS) | launchd plist. |
+
+See [`agent/README.md`](./agent/README.md) for the agent's internal protocol and the full subcommand reference if you're hacking on the binary itself.
 
 ## Theming
 
