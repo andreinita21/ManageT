@@ -39,10 +39,42 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/managet-agent run
+# KillSignal=SIGTERM gives our reporter loop a chance to broadcast
+# the shutdown pulse to attached clients (so they see "[managet] agent
+# is shutting down" instead of a frozen terminal). TimeoutStopSec=5
+# bounds how long we wait before systemd escalates to SIGKILL — the
+# pulse broadcaster only sleeps 200ms, so 5s is comfortable.
+KillSignal=SIGTERM
+TimeoutStopSec=5
 Restart=on-failure
 RestartSec=5s
 User=root
+
+# --- Sandboxing -----------------------------------------------------
+# Anything stronger (ProtectHome, ProtectSystem=strict, …) is unsafe
+# here because the agent hosts user PTYs that need to touch arbitrary
+# paths under /home, /opt, /srv, etc. — locking those down silently
+# breaks `managet new -c "python3 /home/u/x.py"`. See the comment in
+# the previous unit-template iteration in git history.
+#
+# These flags are surgical: they harden the daemon's own runtime
+# (block setuid escalation, kernel module loading, raw IPC families)
+# without restricting what the PTY children can read or write. None
+# of them affect the user's shell experience.
 NoNewPrivileges=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+# Allow only the address families we actually use: UNIX for the
+# control socket, INET/INET6 for heartbeats. NETLINK is needed by
+# sysinfo's load-average collection on some kernels — leaving it on
+# the deny side broke metrics for Pi users in an earlier dogfooding
+# pass.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 # RuntimeDirectory creates /run/managet at service start (owned by User,
 # mode 0755) and removes it at stop. The control socket lives there.
 RuntimeDirectory=managet

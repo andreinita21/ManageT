@@ -35,9 +35,9 @@
 import { WebSocketServer, WebSocket } from "ws";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
-import { parse as parseUrl } from "node:url";
 import { StringDecoder } from "node:string_decoder";
 import { eq } from "drizzle-orm";
+import { getToken } from "next-auth/jwt";
 
 import { db } from "@/lib/db";
 import { servers, sessions } from "@/lib/db/schema";
@@ -485,28 +485,57 @@ function handleDisconnect(ws: WebSocket): void {
 // Auth
 // ---------------------------------------------------------------------------
 
-function extractUserId(req: IncomingMessage): string | null {
-  const cookieHeader = req.headers.cookie;
-  if (cookieHeader) {
-    const cookies: Record<string, string> = {};
-    cookieHeader.split(";").forEach((part) => {
-      const [key, ...rest] = part.trim().split("=");
-      if (key) cookies[key.trim()] = rest.join("=");
+/**
+ * Validate the upgrade request against the NextAuth session cookie and
+ * return the authenticated user id, or `null` if the request isn't
+ * a logged-in user.
+ *
+ * Previous version of this function trusted the raw cookie value as
+ * the user id and also accepted *any* non-empty `?token=` query param
+ * — so any external client that knew or guessed the WS URL could
+ * upgrade and start spawning shells. We now:
+ *
+ *   1. Drop the `?token=` escape hatch entirely. It existed for early
+ *      WS-from-CLI experiments that never shipped, and it bypasses
+ *      cookie-based auth completely. Anything legitimate that needs
+ *      to call into the WS layer can carry the standard session
+ *      cookie.
+ *   2. Run the cookie through `getToken` from `next-auth/jwt`, which
+ *      verifies the JWT/JWE signature against `AUTH_SECRET` and
+ *      returns the decoded payload only on success.
+ *   3. Pull the `id` claim our `jwt` callback in `lib/auth/index.ts`
+ *      sets — that's the real users.id, not the cookie blob.
+ *
+ * On any error (missing secret, bad cookie, expired token) the
+ * function returns `null` and the upgrade is refused. Fail-closed.
+ */
+async function extractUserId(req: IncomingMessage): Promise<string | null> {
+  const secret = process.env.AUTH_SECRET ?? process.env.NEXTAUTH_SECRET;
+  if (!secret) {
+    // Server is misconfigured; refusing the upgrade is the safest
+    // behaviour. A loud log line surfaces it during deploys.
+    console.error(
+      "[WS] AUTH_SECRET / NEXTAUTH_SECRET not set — refusing every upgrade"
+    );
+    return null;
+  }
+  try {
+    // `getToken` accepts a Node IncomingMessage; it parses the
+    // cookie header itself and tries every known authjs cookie
+    // name. Casts because @auth/core's overload set was written
+    // around the Web Request type.
+    const jwt = await getToken({
+      req: req as unknown as Request,
+      secret,
     });
-    const sessionToken =
-      cookies["authjs.session-token"] ||
-      cookies["next-auth.session-token"] ||
-      cookies["__Secure-authjs.session-token"];
-    if (sessionToken && sessionToken.length > 0) {
-      return sessionToken;
-    }
+    if (!jwt) return null;
+    const userId = (jwt.id as string | undefined) ?? (jwt.sub as string | undefined);
+    return userId ?? null;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.warn(`[WS] auth validation failed: ${msg}`);
+    return null;
   }
-  const parsed = parseUrl(req.url || "", true);
-  const token = parsed.query.token;
-  if (typeof token === "string" && token.length > 0) {
-    return token;
-  }
-  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -537,21 +566,77 @@ wss.on("connection", (ws: WebSocket) => {
 // Unused export kept for compatibility with any old import sites.
 export type _SessionForAttach = Session;
 
+/**
+ * Reject upgrade requests whose Origin header doesn't match the host
+ * we're listening on. Without this, a malicious site could open a
+ * WebSocket from the user's browser (the cookies tag along
+ * automatically), guess a session id, and start running shells. The
+ * Same-Origin Policy doesn't apply to WebSocket connect itself —
+ * only to the data read back over them — so this manual check is
+ * the standard CSRF defence.
+ *
+ * `NEXTAUTH_URL` (when set, e.g. behind a proxy) plus the request's
+ * own Host header are both accepted. Connections without an Origin
+ * header (non-browser clients like `wscat`) are allowed when
+ * `WS_ALLOW_NO_ORIGIN=1` — defaults to refuse, because real browsers
+ * always send one.
+ */
+function isOriginAllowed(req: IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  if (!origin) {
+    return process.env.WS_ALLOW_NO_ORIGIN === "1";
+  }
+  let originHost: string;
+  try {
+    originHost = new URL(origin).host;
+  } catch {
+    return false;
+  }
+  const reqHost = req.headers.host;
+  if (reqHost && originHost === reqHost) return true;
+
+  const configured = process.env.NEXTAUTH_URL ?? process.env.AUTH_URL;
+  if (configured) {
+    try {
+      if (new URL(configured).host === originHost) return true;
+    } catch {
+      /* fall through */
+    }
+  }
+  return false;
+}
+
 export function handleUpgrade(
   req: IncomingMessage,
   socket: Duplex,
   head: Buffer
 ): void {
-  const userId = extractUserId(req);
-  if (!userId) {
-    console.log("[WS] upgrade rejected: no auth token");
-    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+  if (!isOriginAllowed(req)) {
+    console.log(
+      `[WS] upgrade rejected: origin '${req.headers.origin ?? "<none>"}' not allowed for host '${req.headers.host ?? "<none>"}'`
+    );
+    socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
     socket.destroy();
     return;
   }
-  wss.handleUpgrade(req, socket, head, (ws: WebSocket) => {
-    wsToUser.set(ws, userId);
-    console.log("[WS] client authenticated");
-    wss.emit("connection", ws, req);
-  });
+  // `extractUserId` is now async (it verifies the JWT). The upgrade
+  // handler is sync per Node's `'upgrade'` event contract, so we kick
+  // off the validation and await it inside a small wrapper. The
+  // socket stays untouched until we have a verdict; failure → 401 +
+  // destroy. We don't keep-alive the socket on rejection because a
+  // legitimate browser will reconnect over a fresh TCP handshake.
+  void (async () => {
+    const userId = await extractUserId(req);
+    if (!userId) {
+      console.log("[WS] upgrade rejected: invalid or missing session");
+      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws: WebSocket) => {
+      wsToUser.set(ws, userId);
+      console.log(`[WS] client authenticated (user=${userId})`);
+      wss.emit("connection", ws, req);
+    });
+  })();
 }

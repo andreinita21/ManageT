@@ -125,8 +125,35 @@ async fn handle_client(stream: UnixStream, manager: Arc<SessionManager>) -> Resu
             user,
             cwd,
         } => {
-            let r = rows.unwrap_or(24);
-            let c = cols.unwrap_or(80);
+            // Clamp + default the PTY dimensions. Bad upstream
+            // clients (or a malicious caller) sending rows/cols=u16
+            // max would have us allocating a 65k×65k cell grid
+            // somewhere downstream (xterm.js or any other consumer)
+            // — better to refuse silly values up front. 8×8 is the
+            // smallest size where any real shell still works; 500×500
+            // covers every legitimate window we've seen and is well
+            // under the kernel's TIOCSWINSZ limits.
+            let r = rows.unwrap_or(24).clamp(8, 500);
+            let c = cols.unwrap_or(80).clamp(8, 500);
+            // Refuse names with embedded NUL / control chars or
+            // path-traversal-shaped prefixes. The name surfaces in
+            // dashboards, log files, and CLI tables — keeping it to
+            // a printable subset avoids surprises everywhere
+            // downstream and stops a malicious creator from
+            // smuggling control sequences into other operators'
+            // terminals via `managet ls`.
+            if let Some(ref n) = name {
+                if !is_safe_session_name(n) {
+                    send_resp(
+                        &mut wr,
+                        &Response::Error {
+                            message: "session name contains disallowed characters".into(),
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
             match manager.create(name, command, r, c, user, cwd) {
                 Ok(sess) => {
                     // Snapshot the name *before* the `await` so we don't
@@ -171,9 +198,16 @@ async fn handle_client(stream: UnixStream, manager: Arc<SessionManager>) -> Resu
             Ok(())
         }
         Request::Resize { id, rows, cols } => {
+            // Same clamp as `New`. Resize is also the path xterm.js
+            // hits every time the user drags the browser window edge,
+            // so a runaway client (or a deliberately-crafted message)
+            // could otherwise force the agent to push a huge WINSZ
+            // into the PTY on every event.
+            let r = rows.clamp(8, 500);
+            let c = cols.clamp(8, 500);
             match manager.resolve(&id) {
                 Ok(sess) => {
-                    sess.resize(rows, cols).await;
+                    sess.resize(r, c).await;
                     send_resp(&mut wr, &Response::Ok).await?;
                 }
                 Err(e) => {
@@ -219,9 +253,37 @@ async fn handle_client(stream: UnixStream, manager: Arc<SessionManager>) -> Resu
                     return Ok(());
                 }
             };
+            // Cap concurrent attaches per session so a runaway dashboard
+            // (or a malicious caller) can't fan-out a single PTY into
+            // thousands of broadcast subscribers and balloon memory.
+            // The broadcast channel has a small capacity, so each
+            // subscriber holds at most OUTPUT_CHAN_CAP messages — but
+            // many subscribers × many messages is still meaningful.
+            // 32 is generous (CLI + a handful of browser tabs is the
+            // realistic upper bound) and surfaces the issue with a
+            // clear message if it's ever hit.
+            const MAX_ATTACHES_PER_SESSION: usize = 32;
+            if sess.attached.load(Ordering::SeqCst) >= MAX_ATTACHES_PER_SESSION {
+                send_resp(
+                    &mut wr,
+                    &Response::Error {
+                        message: format!(
+                            "session has {} attaches already (cap={}); detach somewhere first",
+                            sess.attached.load(Ordering::SeqCst),
+                            MAX_ATTACHES_PER_SESSION
+                        ),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
             // Apply the caller's terminal size up front so vim/tmux/htop
             // render at the right shape from the very first repaint.
+            // Clamped the same way as Request::Resize so a bad client
+            // can't push a huge WINSZ down our throat at attach time.
             if let (Some(r), Some(c)) = (rows, cols) {
+                let r = r.clamp(8, 500);
+                let c = c.clamp(8, 500);
                 sess.resize(r, c).await;
             }
             let name_snapshot = sess.name.lock().unwrap().clone();
@@ -379,6 +441,32 @@ async fn stream_attached(
 
     sess.attached.fetch_sub(1, Ordering::SeqCst);
     Ok(())
+}
+
+/// Strict allow-list for session names: printable ASCII, no spaces at
+/// the boundaries, max 80 chars, no path separators or control codes.
+/// The hard cap on length is the same we use server-side in the
+/// dashboard's `updateSessionSchema` so the two views agree.
+fn is_safe_session_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 80 {
+        return false;
+    }
+    if name.starts_with(' ') || name.ends_with(' ') {
+        return false;
+    }
+    name.chars().all(|c| match c {
+        // Printable ASCII minus path separators and shell glob metacharacters
+        // that have caused issues in other UIs we've shipped (the file path
+        // backslash, the unix path slash, raw control characters).
+        c if (c.is_ascii_graphic() || c == ' ')
+            && c != '/'
+            && c != '\\'
+            && c != '\0' =>
+        {
+            true
+        }
+        _ => false,
+    })
 }
 
 async fn send_resp(
