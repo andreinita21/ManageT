@@ -139,7 +139,37 @@ export default function SessionsPage() {
     }
   };
 
+  /** Pulls the server's current agentStatus and returns a friendly
+   *  reason string when the operator can't open a terminal on it.
+   *  Null means "go ahead". Kept inline (small + only used here) to
+   *  avoid a separate util file. */
+  const blockedReasonForServer = (serverId: string): string | null => {
+    const srv = serverById.get(serverId);
+    if (!srv) return null;
+    if (srv.agentStatus === "manually_stopped") {
+      return (
+        "Server is currently stopped (via `managet stop`). Run " +
+        "`managet start` on the host to resume."
+      );
+    }
+    if (
+      srv.agentStatus === "not_installed" ||
+      srv.agentStatus === "installing" ||
+      srv.agentStatus === "install_failed" ||
+      srv.agentStatus === "uninstalling" ||
+      srv.agentStatus === "uninstall_failed"
+    ) {
+      return `Agent is '${srv.agentStatus}'; terminal is unavailable until it's healthy.`;
+    }
+    return null;
+  };
+
   const handleView = (session: Session) => {
+    const reason = blockedReasonForServer(session.serverId);
+    if (reason) {
+      toast(reason, "warning");
+      return;
+    }
     router.push(`/terminal?session=${session.id}`);
   };
 

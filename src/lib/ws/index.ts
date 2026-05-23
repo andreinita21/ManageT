@@ -47,6 +47,44 @@ import {
   killSession,
   resizeSession,
 } from "@/lib/ssh/session-manager";
+
+/** Server states that block terminal interactions from the browser.
+ *  `manually_stopped` is the operator-initiated freeze we want a clear
+ *  message on; the others are pre-/post-deploy states where the
+ *  agent socket simply isn't there to talk to. */
+const TERMINAL_BLOCKED_STATUSES: ReadonlyArray<string> = [
+  "manually_stopped",
+  "not_installed",
+  "installing",
+  "install_failed",
+  "uninstalling",
+  "uninstall_failed",
+];
+
+/** Look up just enough server state to decide whether terminal-shaped
+ *  WS operations should be allowed. Returns null when no server with
+ *  that id exists (caller should bubble up an error). */
+async function serverGate(
+  serverId: string
+): Promise<{ agentStatus: string } | null> {
+  const rows = await db
+    .select({ agentStatus: servers.agentStatus })
+    .from(servers)
+    .where(eq(servers.id, serverId))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+function blockedReason(status: string): string {
+  if (status === "manually_stopped") {
+    return (
+      "This server is temporarily not accessible because the " +
+      "`managet stop` command was issued. Run `managet start` on " +
+      "the host to resume receiving data."
+    );
+  }
+  return `Agent is currently '${status}'; terminal operations are unavailable.`;
+}
 import type { Session, SessionSnapshot } from "@/types";
 
 const WS_OPEN = WebSocket.OPEN;
@@ -285,6 +323,30 @@ async function handleMessage(ws: WebSocket, raw: string): Promise<void> {
   switch (msg.type) {
     case "session:create": {
       try {
+        // Refuse to spawn on a server the operator has manually
+        // stopped (or one that's not in a state where the agent
+        // socket is reachable). The browser disables the New
+        // Terminal button when it sees the same status, but the
+        // server-side check is the authoritative one in case the
+        // client misses a refresh.
+        const gate = await serverGate(msg.serverId);
+        if (!gate) {
+          sendJson(ws, {
+            type: "session:lost",
+            sessionId: "",
+            reason: `Unknown server ${msg.serverId}`,
+          });
+          break;
+        }
+        if (TERMINAL_BLOCKED_STATUSES.includes(gate.agentStatus)) {
+          sendJson(ws, {
+            type: "session:lost",
+            sessionId: "",
+            reason: blockedReason(gate.agentStatus),
+          });
+          break;
+        }
+
         // Resolve the configured Unix user for this server so the agent
         // can spawn the shell as that user instead of as root. We look
         // it up here (not in the agent) because the dashboard is the
@@ -319,6 +381,15 @@ async function handleMessage(ws: WebSocket, raw: string): Promise<void> {
     }
     case "session:attach": {
       try {
+        const gate = await serverGate(msg.serverId);
+        if (gate && TERMINAL_BLOCKED_STATUSES.includes(gate.agentStatus)) {
+          sendJson(ws, {
+            type: "session:lost",
+            sessionId: msg.sessionId,
+            reason: blockedReason(gate.agentStatus),
+          });
+          break;
+        }
         await handleAttachLifecycle(ws, msg.serverId, msg.sessionId);
       } catch (err) {
         const m = err instanceof Error ? err.message : String(err);

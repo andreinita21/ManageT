@@ -58,6 +58,17 @@ const STATUS: Record<
     text: "text-mg-warning",
     ring: "ring-mg-warning/40",
   },
+  manually_stopped: {
+    label: "Stopped",
+    // Slate / grey tone to read as "deliberately offline" — neither
+    // alarming (no red/amber) nor healthy (no green). The "stopped"
+    // word + this colour together signal "this is intentional, run
+    // `managet start` on the host to bring it back".
+    dot: "bg-mg-text-tertiary",
+    bg: "bg-mg-text-tertiary/15",
+    text: "text-mg-text-secondary",
+    ring: "ring-mg-text-tertiary/40",
+  },
   uninstalling: {
     label: "Uninstalling",
     dot: "bg-mg-text-tertiary animate-pulse",
@@ -127,6 +138,14 @@ export function AgentStatusBadge({
     detail = installError ?? "install failed";
   } else if (status === "unreachable" && age) {
     detail = `no heartbeat for ${age}`;
+  } else if (status === "manually_stopped") {
+    // installError carries the reason string the agent sent on its
+    // /api/agent/lifecycle POST (or the default). Always include the
+    // recovery hint so anyone landing on the page understands what
+    // to do without having to dig into docs.
+    detail = installError
+      ? `${installError} Run \`managet start\` on the host to resume.`
+      : "Stopped via `managet stop`. Run `managet start` on the host to resume.";
   } else if (status === "uninstalling" && installStage) {
     detail = installStage;
   } else if (status === "uninstall_failed") {

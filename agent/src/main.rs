@@ -8,7 +8,7 @@
 use anyhow::Result;
 use clap::Parser;
 use managet_agent::cli::{Cli, Command};
-use managet_agent::{collector, config, installer, reporter, sessions};
+use managet_agent::{collector, config, installer, reporter, service, sessions};
 
 fn init_tracing() {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -41,5 +41,15 @@ async fn main() -> Result<()> {
         Command::Attach { id } => sessions::client::run_attach(id).await,
         Command::Kill { id } => sessions::client::run_kill(id).await,
         Command::Reconfigure(args) => config::reconfigure(args),
+        Command::Service { action } => {
+            // service::control uses the blocking reqwest client (so it
+            // doesn't need a tokio runtime to POST the lifecycle
+            // signal — keeps the path independent of the long-running
+            // service binary's runtime). Defer to spawn_blocking so we
+            // don't park the multi-thread runtime's worker.
+            tokio::task::spawn_blocking(move || service::control::run(action))
+                .await
+                .map_err(|e| anyhow::anyhow!("service control task panicked: {e}"))?
+        }
     }
 }

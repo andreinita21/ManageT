@@ -3,6 +3,7 @@
 //! Picks systemd on Linux and launchd on macOS. Other platforms return
 //! an error from `platform_manager()`.
 
+pub mod control;
 pub mod launchd;
 pub mod systemd;
 
@@ -22,6 +23,20 @@ pub trait ServiceManager {
     fn start(&self) -> Result<()>;
     /// Stop the service.
     fn stop(&self) -> Result<()>;
+    /// Restart the service. Default impl is stop+start; platforms with
+    /// a native one-shot restart (systemctl) can override.
+    fn restart(&self) -> Result<()> {
+        self.stop()?;
+        self.start()
+    }
+    /// Run the service-manager's "status" command, streaming output to
+    /// the user's stdout/stderr. Used by `managet service status`.
+    /// Default impl prints the hint and returns Ok — concrete managers
+    /// override to exec systemctl / launchctl directly.
+    fn print_status(&self) -> Result<()> {
+        println!("Run: {}", self.status_command_hint());
+        Ok(())
+    }
     /// Human-readable command the user can run to inspect the service.
     fn status_command_hint(&self) -> &'static str;
 }

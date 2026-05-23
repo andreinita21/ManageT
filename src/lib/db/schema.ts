@@ -44,6 +44,15 @@ export const servers = sqliteTable("servers", {
       "unreachable",
       "uninstalling",
       "uninstall_failed",
+      // Operator-initiated stop via `managet stop` on the host. Distinct
+      // from `unreachable` (which means "we lost the heartbeat and we
+      // don't know why"). The agent POSTs to /api/agent/lifecycle
+      // immediately before signalling systemd to stop, so the dashboard
+      // can disable session attach/create with a precise message
+      // instead of the generic "unreachable" warning. Cleared back to
+      // `healthy` by the next heartbeat the agent sends when it's
+      // restarted via `managet start`.
+      "manually_stopped",
     ],
   })
     .notNull()

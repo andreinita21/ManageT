@@ -43,6 +43,27 @@ const OUTPUT_CHAN_CAP: usize = 256;
 /// Backpressure on the per-session input channel.
 const INPUT_CHAN_CAP: usize = 64;
 
+/// Magic OSC byte sequence the wrapper script emits between shell respawns.
+///
+/// When the user types `exit` inside an attached session, the wrapper
+/// shell prints this and immediately spawns a fresh shell. The PTY
+/// reader detects the sequence, strips it from the output stream (so
+/// neither the CLI nor xterm.js ever sees the raw escape), and pulses
+/// `detach_pulse_tx` to signal every attached client that the user
+/// asked to detach. The session itself stays alive — the wrapper keeps
+/// the PTY pinned and serves up a fresh shell on next attach.
+///
+/// OSC 7777 is unallocated in xterm/iTerm2's directory; the long ASCII
+/// payload makes accidental collision with real terminal output
+/// effectively impossible. BEL (`\x07`) terminates the OSC string — the
+/// agent never lets it through, so the choice between BEL and ST is
+/// internal-only.
+const DETACH_MARKER: &[u8] = b"\x1b]7777;MANAGET_DETACH\x07";
+/// `printf`-safe rendering of `DETACH_MARKER` used inside the wrapper
+/// `sh -c "…"` snippet. Kept literal (single-quoted in shell) so the
+/// payload can't be re-interpreted by the user's `$IFS`/`$PS1`/etc.
+const DETACH_MARKER_PRINTF: &str = r"\033]7777;MANAGET_DETACH\007";
+
 pub struct Session {
     pub id: String,
     /// Display name shown by `managet list` / `managet attach <name>` and
@@ -58,6 +79,22 @@ pub struct Session {
     /// Live output broadcast — every attached client gets a `subscribe()`
     /// receiver and reads new bytes from there.
     output_tx: broadcast::Sender<Bytes>,
+
+    /// Pulse channel for "user asked to detach (typed `exit`)" events.
+    /// The PTY reader sends a single `()` every time it strips the
+    /// `DETACH_MARKER` out of the byte stream; every attached client
+    /// receives it and closes its connection cleanly. The session
+    /// itself stays alive because the wrapper script respawns the
+    /// shell — reattaching gives the user a fresh prompt.
+    detach_pulse_tx: broadcast::Sender<()>,
+
+    /// Pulse channel for "agent is shutting down" events. Fired by
+    /// `SessionManager::broadcast_shutdown()` from the SIGTERM
+    /// handler in the reporter. Carries a different visual banner
+    /// than the detach pulse so the user understands they were
+    /// kicked off because the daemon is going down, not because they
+    /// typed `exit`.
+    shutdown_pulse_tx: broadcast::Sender<()>,
 
     /// Drainable input channel. Cloning the sender lets multiple attached
     /// clients fan keystrokes into the same PTY.
@@ -125,6 +162,22 @@ impl Session {
         self.output_tx.subscribe()
     }
 
+    /// Subscribe to detach-pulse notifications. A `recv()` resolves
+    /// every time the PTY reader observes the `DETACH_MARKER` (i.e.
+    /// the wrapper printed it because the inner shell just exited).
+    /// Attach handlers use this to disconnect their client without
+    /// teardown of the session.
+    pub fn detach_pulse_receiver(&self) -> broadcast::Receiver<()> {
+        self.detach_pulse_tx.subscribe()
+    }
+
+    /// Subscribe to shutdown-pulse notifications. A `recv()` resolves
+    /// when the manager broadcasts a daemon shutdown so attach
+    /// handlers can write a goodbye banner and close cleanly.
+    pub fn shutdown_pulse_receiver(&self) -> broadcast::Receiver<()> {
+        self.shutdown_pulse_tx.subscribe()
+    }
+
     pub async fn resize(&self, rows: u16, cols: u16) {
         let _ = self.resize_tx.send((rows, cols)).await;
     }
@@ -183,13 +236,28 @@ impl Session {
 
 pub struct SessionManager {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
+    /// Shared shutdown broadcaster. Each session gets a clone in its
+    /// `shutdown_pulse_tx` field; calling `broadcast_shutdown()` on
+    /// the manager pulses every attached handler at once.
+    shutdown_pulse_tx: broadcast::Sender<()>,
 }
 
 impl SessionManager {
     pub fn new() -> Self {
+        let (shutdown_pulse_tx, _) = broadcast::channel::<()>(8);
         Self {
             sessions: Mutex::new(HashMap::new()),
+            shutdown_pulse_tx,
         }
+    }
+
+    /// Pulse the shutdown broadcaster so every attach handler can
+    /// flush a "service stopping" banner and close cleanly. Idempotent
+    /// and cheap — safe to call from a signal handler context. The
+    /// caller is expected to sleep briefly afterwards to give the
+    /// pulse time to reach attach tasks before the process exits.
+    pub fn broadcast_shutdown(&self) {
+        let _ = self.shutdown_pulse_tx.send(());
     }
 
     pub fn list(&self) -> Vec<SessionInfo> {
@@ -347,7 +415,26 @@ impl SessionManager {
             _ => String::new(),
         };
 
-        let mut cmd = match (resolved_user.as_ref(), command.as_deref()) {
+        // We build a single sh -c "<session_body>" expression that becomes
+        // the long-lived child of the PTY. The body is then wrapped in
+        // a respawn loop so the user typing `exit` (or hitting Ctrl-D)
+        // doesn't tear down the session — instead the inner shell
+        // exits, the wrapper prints DETACH_MARKER (which the agent
+        // reader strips + uses to signal attached clients to detach),
+        // and the loop spawns a fresh shell ready for the next attach.
+        //
+        // The wrapper itself only dies if it's signalled externally
+        // (e.g. via `managet kill <id>`, agent shutdown, kill -9). In
+        // those cases `running` flips false and cleanup_dead() culls
+        // the row on the next sweep.
+        //
+        // We use `exec` for the inner shell where possible so the
+        // shell becomes the wrapper's only child — keeps the process
+        // tree shallow and gives `request_kill()`'s SIGTERM-the-PG a
+        // clean target. The chained-command case can't use exec for
+        // the user command (it has to run inside `sh -c '…'`) but does
+        // exec the follow-up shell.
+        let session_body = match (resolved_user.as_ref(), command.as_deref()) {
             (Some(u), Some(cmd_str)) => {
                 // Run the user-supplied command as the target user, then
                 // drop into their login shell so the session stays alive
@@ -367,19 +454,16 @@ impl SessionManager {
                     u.shell.to_string_lossy().into_owned()
                 };
                 let chained = format!("{cd_prefix}{cmd_str}; exec {user_shell} -l");
-                let mut c = CommandBuilder::new("su");
-                c.arg("-l");
-                c.arg(&u.name);
-                c.arg("--session-command");
-                c.arg(chained);
-                c
+                format!(
+                    "su -l {user} --session-command {payload}",
+                    user = shell_single_quote(&u.name),
+                    payload = shell_single_quote(&chained),
+                )
             }
             (Some(u), None) => {
-                // Interactive shell as the target user. We still go through
-                // `su -l … --session-command "cd …; exec <shell> -l"`
-                // rather than plain `su -l` so the cwd takes effect, and
-                // we use `--session-command` (not `-c`) to keep the
-                // controlling terminal — see the rationale above.
+                // Interactive shell as the target user. Same `su -l …
+                // --session-command` plumbing as above so the cwd takes
+                // effect and the controlling terminal is preserved.
                 let user_shell = if u.shell.as_os_str().is_empty() {
                     "/bin/sh".to_string()
                 } else {
@@ -390,42 +474,77 @@ impl SessionManager {
                 } else {
                     format!("{cd_prefix}exec {user_shell} -l")
                 };
-                let mut c = CommandBuilder::new("su");
-                c.arg("-l");
-                c.arg(&u.name);
-                c.arg("--session-command");
-                c.arg(chained);
-                c
+                format!(
+                    "su -l {user} --session-command {payload}",
+                    user = shell_single_quote(&u.name),
+                    payload = shell_single_quote(&chained),
+                )
             }
             (None, Some(cmd_str)) => {
                 // `<shell> -c "<cmd_str>; exec <shell>"` — run the command,
                 // then drop into an interactive shell so the user can keep
-                // working after the process exits (or debug a crash). For
-                // stack services where the user wants the session to follow
-                // the process, they can use `managet kill <name>` to end it.
+                // working after the process exits (or debug a crash).
                 let chained = format!("{cd_prefix}{cmd_str}; exec {shell}");
-                let mut c = CommandBuilder::new(&shell);
-                c.arg("-c");
-                c.arg(chained);
-                c
+                format!(
+                    "{shell} -c {payload}",
+                    shell = shell_single_quote(&shell),
+                    payload = shell_single_quote(&chained),
+                )
             }
             (None, None) => {
                 // No user override: spawn the agent's $SHELL as a login
                 // shell so .bash_profile etc. get sourced even when the
                 // agent itself wasn't started from a login context.
+                //
+                // Critically: NO outer `exec` here. `exec` would replace
+                // the wrapper-sh process with bash, and the while-loop
+                // would silently never iterate — typing `exit` would
+                // close the session instead of detaching. The bash
+                // process forks the normal way and `while` collects its
+                // exit cleanly.
                 if cd_prefix.is_empty() {
-                    let mut c = CommandBuilder::new(&shell);
-                    c.arg("-l");
-                    c
+                    format!("{shell} -l", shell = shell_single_quote(&shell))
                 } else {
-                    // Same-flavour cd-then-shell when a cwd was supplied.
-                    let mut c = CommandBuilder::new(&shell);
-                    c.arg("-c");
-                    c.arg(format!("{cd_prefix}exec {shell} -l"));
-                    c
+                    let chained = format!("{cd_prefix}exec {shell} -l");
+                    format!(
+                        "{shell} -c {payload}",
+                        shell = shell_single_quote(&shell),
+                        payload = shell_single_quote(&chained),
+                    )
                 }
             }
         };
+
+        // Wrap so the session survives `exit` / Ctrl-D. After each
+        // inner shell exits, emit DETACH_MARKER (single-quoted so the
+        // outer sh can't expand it) and loop back. `printf` is a
+        // POSIX shell builtin in every shell we'd reach for, so this
+        // stays free of an extra exec per detach.
+        //
+        // The body runs inside a `( … )` subshell so any stray `exec`
+        // in user-supplied commands or in `su`'s chained string can
+        // only replace the subshell, not the wrapper. That keeps the
+        // loop intact regardless of what the inner command does.
+        //
+        // Bounded backoff prevents a runaway respawn if the body
+        // immediately fails (e.g. su denied, /tmp full, missing
+        // shell). After 200 instant failures we surface a clear
+        // message and exit; the session is then cleaned up normally.
+        let wrapped = format!(
+            "i=0; while :; do ({body}); printf '{marker}'; \
+             i=$((i+1)); \
+             if [ $i -gt 200 ]; then \
+                 printf '\\n[managet] inner shell respawned 200 times in a row — giving up\\n'; \
+                 exit 1; \
+             fi; \
+             done",
+            body = session_body,
+            marker = DETACH_MARKER_PRINTF,
+        );
+
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-c");
+        cmd.arg(wrapped);
 
         // Working directory + base env. When switching to a target user,
         // `su -l` overwrites HOME/USER/LOGNAME/SHELL itself; but we set
@@ -485,6 +604,12 @@ impl SessionManager {
         let (output_tx, _) = broadcast::channel::<Bytes>(OUTPUT_CHAN_CAP);
         let (input_tx, mut input_rx) = mpsc::channel::<Bytes>(INPUT_CHAN_CAP);
         let (resize_tx, mut resize_rx) = mpsc::channel::<(u16, u16)>(8);
+        // Small capacity is fine — pulses are fired once per event,
+        // attach handlers consume them immediately.
+        let (detach_pulse_tx, _) = broadcast::channel::<()>(8);
+        // Shared shutdown sender from the manager, so a single
+        // `broadcast_shutdown()` call reaches every session.
+        let shutdown_pulse_tx = self.shutdown_pulse_tx.clone();
 
         let session = Arc::new(Session {
             id: id.clone(),
@@ -493,6 +618,8 @@ impl SessionManager {
             created_at_ms: now_ms(),
             scrollback: Mutex::new(VecDeque::new()),
             output_tx: output_tx.clone(),
+            detach_pulse_tx: detach_pulse_tx.clone(),
+            shutdown_pulse_tx,
             input_tx,
             resize_tx,
             kill_handle: Mutex::new(Some(kill_handle)),
@@ -501,7 +628,14 @@ impl SessionManager {
             root_pid,
         });
 
-        // Reader: blocking read on master, fan out to subscribers + scrollback.
+        // Reader: blocking read on master, fan out to subscribers +
+        // scrollback. As bytes flow we also scan for DETACH_MARKER
+        // (emitted by the wrapper between shell respawns). Any
+        // occurrence is stripped from the stream and triggers a
+        // detach pulse; everything before and after is forwarded
+        // normally. The marker can straddle two read() calls, so we
+        // keep up to MARKER.len()-1 trailing bytes as carry-over and
+        // prepend them to the next chunk before scanning.
         let reader = pair
             .master
             .try_clone_reader()
@@ -511,24 +645,65 @@ impl SessionManager {
             tokio::task::spawn_blocking(move || {
                 let mut reader = reader;
                 let mut buf = [0u8; 4096];
+                let mut carry: Vec<u8> = Vec::with_capacity(DETACH_MARKER.len());
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => {
+                            // Flush any buffered prefix as-is — at EOF
+                            // it can't be a real marker, just trailing
+                            // bytes the wrapper hadn't finished
+                            // emitting. Forwarding them keeps final
+                            // output of the inner command visible.
+                            if !carry.is_empty() {
+                                let data: Bytes = Bytes::copy_from_slice(&carry);
+                                session.append_scrollback(&data);
+                                let _ = session.output_tx.send(data);
+                            }
                             debug!(id = %session.id, "pty reader EOF");
                             break;
                         }
                         Err(e) => {
-                            // EIO when slave is closed is normal at shutdown.
                             debug!(id = %session.id, error = %e, "pty reader error");
                             break;
                         }
                         Ok(n) => {
-                            let data: Bytes = Bytes::copy_from_slice(&buf[..n]);
-                            session.append_scrollback(&data);
-                            // Best-effort broadcast — if no one is listening
-                            // (no attach yet), the send returns Err which we
-                            // ignore. The scrollback still captures it.
-                            let _ = session.output_tx.send(data);
+                            // Combine carry + new bytes for matching.
+                            let mut combined: Vec<u8> =
+                                Vec::with_capacity(carry.len() + n);
+                            combined.extend_from_slice(&carry);
+                            combined.extend_from_slice(&buf[..n]);
+                            carry.clear();
+
+                            // Find all marker occurrences in order.
+                            // Forward the pre-marker slice, swallow
+                            // the marker, pulse detach, repeat.
+                            let mut cursor = 0usize;
+                            while let Some(rel) =
+                                find_subslice(&combined[cursor..], DETACH_MARKER)
+                            {
+                                let abs = cursor + rel;
+                                if abs > cursor {
+                                    emit_bytes(&session, &combined[cursor..abs]);
+                                }
+                                // Pulse — receivers may not exist (no
+                                // current attach), that's fine.
+                                let _ = session.detach_pulse_tx.send(());
+                                cursor = abs + DETACH_MARKER.len();
+                            }
+
+                            // Forward the remainder, except for a tail
+                            // that *could* be the start of a marker
+                            // spilling into the next chunk. The tail
+                            // can be at most MARKER.len()-1 bytes long.
+                            let remaining = &combined[cursor..];
+                            let keep_tail = DETACH_MARKER.len().saturating_sub(1);
+                            if remaining.len() > keep_tail {
+                                let emit_end = remaining.len() - keep_tail;
+                                emit_bytes(&session, &remaining[..emit_end]);
+                                carry.extend_from_slice(&remaining[emit_end..]);
+                            } else {
+                                carry.extend_from_slice(remaining);
+                            }
                         }
                     }
                 }
@@ -583,6 +758,38 @@ impl SessionManager {
             .insert(id.clone(), session.clone());
         Ok(session)
     }
+}
+
+/// Push `data` to scrollback + broadcast (the original reader's
+/// inner loop, factored out for reuse by the marker-stripping path).
+fn emit_bytes(session: &Arc<Session>, data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    let bytes: Bytes = Bytes::copy_from_slice(data);
+    session.append_scrollback(&bytes);
+    // Broadcast send returns Err when no receivers are subscribed
+    // (e.g. detached session). That's fine — scrollback still has it.
+    let _ = session.output_tx.send(bytes);
+}
+
+/// Locate the first occurrence of `needle` inside `haystack` and
+/// return its starting offset, or `None` if not found.
+///
+/// Naive O(n·m) scan; both inputs are short (chunks ≤ 4096+marker, marker
+/// = 24 bytes) so the constant factor doesn't justify a smarter
+/// algorithm.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    let last = haystack.len() - needle.len();
+    for i in 0..=last {
+        if haystack[i..i + needle.len()] == *needle {
+            return Some(i);
+        }
+    }
+    None
 }
 
 fn now_ms() -> u64 {

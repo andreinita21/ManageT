@@ -86,12 +86,48 @@ export async function POST(
     // landed users in a root shell — see the WS handler for the
     // original rationale.
     const serverRows = await db
-      .select({ username: servers.username, maxSessions: servers.maxSessions })
+      .select({
+        username: servers.username,
+        maxSessions: servers.maxSessions,
+        agentStatus: servers.agentStatus,
+      })
       .from(servers)
       .where(eq(servers.id, serverId))
       .limit(1);
     const username = serverRows[0]?.username;
     const maxSessions = serverRows[0]?.maxSessions ?? null;
+    const agentStatus = serverRows[0]?.agentStatus;
+
+    // Refuse on operator-stopped or pre-/post-deploy states so the
+    // REST path matches the WS path's gate. The UI also disables the
+    // "+ New terminal" affordance based on the same status, but the
+    // server-side check is the authoritative one (handles a stale
+    // page or an external API caller).
+    if (agentStatus === "manually_stopped") {
+      return NextResponse.json(
+        {
+          error:
+            "This server is temporarily not accessible because the " +
+            "`managet stop` command was issued. Run `managet start` " +
+            "on the host to resume.",
+        },
+        { status: 409 }
+      );
+    }
+    if (
+      agentStatus === "not_installed" ||
+      agentStatus === "installing" ||
+      agentStatus === "install_failed" ||
+      agentStatus === "uninstalling" ||
+      agentStatus === "uninstall_failed"
+    ) {
+      return NextResponse.json(
+        {
+          error: `Agent is currently '${agentStatus}'; cannot create sessions until it's healthy.`,
+        },
+        { status: 409 }
+      );
+    }
 
     // Per-server session cap (Settings → server → Agent settings).
     // Counts every row that isn't `closed` — active, disconnected,

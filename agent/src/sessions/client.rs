@@ -208,6 +208,17 @@ pub async fn run_attach(id: String) -> Result<()> {
 
 /// Heart of `attach`: copies bytes both ways, watches for the detach
 /// escape, exits cleanly when either side closes.
+///
+/// Three ways the loop ends:
+///   1. **Local detach key (Ctrl-A d)** — user wants to leave; we
+///      write `[managet] detached.` and return.
+///   2. **Server-initiated detach** — the user typed `exit` inside
+///      the inner shell. The server writes its own farewell banner
+///      via the byte stream and then closes the socket. We just see
+///      `socket EOF` and return without printing anything extra so
+///      the server's banner is the last thing on screen.
+///   3. **Hard error** — socket read fails, stdin fails, etc. Bubble
+///      the error up; the RawMode guard restores the terminal.
 async fn pipe_attach(
     mut socket_reader: BufReader<tokio::net::unix::OwnedReadHalf>,
     mut socket_writer: tokio::net::unix::OwnedWriteHalf,

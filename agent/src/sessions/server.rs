@@ -33,7 +33,18 @@ use super::protocol::{Request, Response};
 /// Default path for the agent's local control socket. Linux + macOS
 /// both honour `/var/run/managet/agent.sock` since the agent runs as
 /// root.
+///
+/// Override via `MANAGET_SOCKET_PATH` for development / testing — both
+/// the daemon and the `managet` CLI pick up the same env var, so a
+/// non-root developer can run `MANAGET_SOCKET_PATH=/tmp/managet.sock
+/// managet-agent run` in one terminal and `MANAGET_SOCKET_PATH=…
+/// managet ls` in another without touching `/var/run`.
 pub fn socket_path() -> PathBuf {
+    if let Ok(p) = std::env::var("MANAGET_SOCKET_PATH") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
     PathBuf::from("/var/run/managet/agent.sock")
 }
 
@@ -233,6 +244,14 @@ async fn handle_client(stream: UnixStream, manager: Arc<SessionManager>) -> Resu
 ///   broadcast subscription (PTY output → us → client)
 /// Plus an upfront scrollback replay so the user sees what they
 /// already saw in the same session.
+///
+/// Also subscribes to the session's `detach_pulse` channel, which
+/// fires when the user types `exit` inside the inner shell (the
+/// wrapper emits `DETACH_MARKER` between respawns and the PTY reader
+/// translates it into a pulse). On pulse we write a friendly farewell
+/// banner, shut down the write half, and return — the client side
+/// then exits raw mode cleanly. The PTY itself stays alive and is
+/// reattachable.
 async fn stream_attached(
     mut reader: BufReader<tokio::net::unix::OwnedReadHalf>,
     mut wr: tokio::net::unix::OwnedWriteHalf,
@@ -248,28 +267,77 @@ async fn stream_attached(
 
     let input_tx = sess.input_sender();
     let mut output_rx = sess.output_receiver();
+    let mut detach_rx = sess.detach_pulse_receiver();
+    let mut shutdown_rx = sess.shutdown_pulse_receiver();
 
-    // Output task: forward broadcast messages to the client. Exits when
-    // the client side closes (write fails) or when the broadcast channel
-    // closes (session gone).
+    // Output task: forward broadcast messages to the client AND watch
+    // the detach + shutdown pulse channels. Whichever fires first wins.
+    // On detach/shutdown we emit a labelled CR-prefixed line so it
+    // lands at column 0 of the client's raw-mode terminal.
     let mut output_handle = tokio::spawn(async move {
         loop {
-            match output_rx.recv().await {
-                Ok(data) => {
-                    if wr.write_all(&data).await.is_err() {
-                        break;
+            tokio::select! {
+                // Output bytes from PTY.
+                msg = output_rx.recv() => {
+                    match msg {
+                        Ok(data) => {
+                            if wr.write_all(&data).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            // We dropped some messages because the client was
+                            // slow. The PTY output is in scrollback; on next
+                            // attach we'd replay. For now, just keep going.
+                            continue;
+                        }
                     }
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    // We dropped some messages because the client was
-                    // slow. The PTY output is in scrollback; on next
-                    // attach we'd replay. For now, just keep going.
-                    continue;
+                // Detach pulse — user typed `exit`. Write a small
+                // banner so the user understands why their connection
+                // dropped, then return so the connection closes. The
+                // session keeps running on the agent side; reattach
+                // gets a fresh shell.
+                pulse = detach_rx.recv() => {
+                    match pulse {
+                        Ok(()) => {
+                            // \r\n so it lands at col 0 in raw mode.
+                            // Bold yellow for visibility against any
+                            // theme; ESC[0m resets to terminal default.
+                            let msg = b"\r\n\x1b[1;33m[managet] shell exited \
+\xe2\x80\x94 detached. Session stays alive; reattach with \
+`managet attach`.\x1b[0m\r\n";
+                            let _ = wr.write_all(msg).await;
+                            let _ = wr.shutdown().await;
+                            break;
+                        }
+                        // Channel closed or we lagged a pulse —
+                        // either way, fall back to normal close.
+                        Err(_) => break,
+                    }
+                }
+                // Shutdown pulse — operator ran `managet stop` (or
+                // the agent is otherwise going down via SIGTERM). The
+                // session itself won't survive; we just want to leave
+                // the user with a clear note instead of a frozen
+                // terminal. Cyan to distinguish from the yellow
+                // detach banner.
+                pulse = shutdown_rx.recv() => {
+                    match pulse {
+                        Ok(()) => {
+                            let msg = b"\r\n\x1b[1;36m[managet] agent is shutting down \
+\xe2\x80\x94 disconnected. Run `managet start` on the host to bring it back.\x1b[0m\r\n";
+                            let _ = wr.write_all(msg).await;
+                            let _ = wr.shutdown().await;
+                            break;
+                        }
+                        Err(_) => break,
+                    }
                 }
             }
         }
-        // Return wr so the parent can close it on shutdown.
+        // Best-effort close in case we exited via the output branch.
         let _ = wr.shutdown().await;
     });
 

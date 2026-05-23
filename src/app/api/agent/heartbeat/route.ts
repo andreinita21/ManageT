@@ -104,6 +104,12 @@ export async function POST(request: Request) {
   // Update the server row. If the server is already marked pending
   // uninstall, we still accept one more heartbeat so we can return the
   // directive — but we do NOT flip agent_status to "healthy" in that case.
+  //
+  // A heartbeat from a server currently in `manually_stopped` state is
+  // also legitimate: the operator ran `managet start` and the agent
+  // came back. We treat it the same as any other healthy heartbeat
+  // below (the install_error subtitle from the stop signal is cleared
+  // alongside the regular install_error reset).
   const wasPendingUninstall = server.pendingUninstall === 1;
   if (!wasPendingUninstall) {
     // Healthy heartbeat — also wipe any leftover install_error /

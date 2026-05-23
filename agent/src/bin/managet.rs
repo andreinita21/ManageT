@@ -16,7 +16,8 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use managet_agent::sessions;
+use managet_agent::cli::ServiceAction;
+use managet_agent::{service, sessions};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -67,6 +68,27 @@ enum Command {
 
     /// Send SIGTERM to a session's child process.
     Kill { id: String },
+
+    /// Lifecycle control for the local managet-agent service.
+    /// `managet service stop` POSTs a `manually_stopped` signal to the
+    /// dashboard before bringing the systemd / launchd unit down, so
+    /// the dashboard shows the server as "Stopped" instead of
+    /// "Unreachable". `managet service start` brings it back up and
+    /// the next heartbeat clears the state.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+
+    /// Shorthand for `managet service stop`. Common enough that we
+    /// give it a top-level verb.
+    Stop,
+
+    /// Shorthand for `managet service start`.
+    Start,
+
+    /// Shorthand for `managet service restart`.
+    Restart,
 }
 
 fn init_tracing() {
@@ -95,5 +117,9 @@ async fn main() -> Result<()> {
         }
         Command::Attach { id } => sessions::client::run_attach(id).await,
         Command::Kill { id } => sessions::client::run_kill(id).await,
+        Command::Service { action } => service::control::run(action),
+        Command::Stop => service::control::run(ServiceAction::Stop),
+        Command::Start => service::control::run(ServiceAction::Start),
+        Command::Restart => service::control::run(ServiceAction::Restart),
     }
 }

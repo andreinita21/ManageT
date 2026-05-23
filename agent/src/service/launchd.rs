@@ -194,6 +194,22 @@ impl ServiceManager for LaunchdManager {
         Ok(())
     }
 
+    fn restart(&self) -> Result<()> {
+        // `kickstart -k` is launchd's native "stop the running job
+        // and start it fresh" — the -k flag means SIGKILL the
+        // currently running instance first. We use it here instead of
+        // bootout+bootstrap because the latter has the EIO flake we
+        // mitigate in `enable()` and isn't needed for a plain restart.
+        let target = format!("system/{LABEL}");
+        self.launchctl(&["kickstart", "-k", &target])
+    }
+
+    fn print_status(&self) -> Result<()> {
+        let target = format!("system/{LABEL}");
+        let _ = Command::new("launchctl").args(["print", &target]).status();
+        Ok(())
+    }
+
     fn status_command_hint(&self) -> &'static str {
         "sudo launchctl print system/com.managet.agent"
     }

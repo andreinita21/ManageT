@@ -84,6 +84,32 @@ pub enum Command {
     /// `systemctl restart managet-agent`) so the running process picks
     /// up the new values.
     Reconfigure(ReconfigureArgs),
+
+    /// Lifecycle control: start / stop / restart / status the local
+    /// agent service. `stop` and `restart` POST a `manually_stopped`
+    /// lifecycle signal to the dashboard *before* tearing the service
+    /// down so the dashboard can distinguish operator-initiated
+    /// pauses from real outages.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServiceAction {
+    /// Start the managet-agent service.
+    Start,
+    /// Stop the managet-agent service. Signals the dashboard first so
+    /// the server shows up as "Stopped" (intentional) rather than
+    /// "Unreachable" (failure).
+    Stop,
+    /// Restart the managet-agent service. The next heartbeat clears
+    /// the manually-stopped state automatically.
+    Restart,
+    /// Print the service-manager's view of the agent
+    /// (`systemctl status` / `launchctl print`).
+    Status,
 }
 
 #[derive(Debug, Args)]

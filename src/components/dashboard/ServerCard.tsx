@@ -50,6 +50,13 @@ const dotByAgentStatus: Record<Server["agentStatus"], { color: string; glow: str
     color: "bg-mg-text-tertiary",
     glow: "shadow-[0_0_8px_var(--color-mg-text-tertiary)]",
   },
+  manually_stopped: {
+    // No glow — it's intentionally down, not failing. Quiet grey dot
+    // matches the badge's "Stopped" pill so the card and the badge
+    // tell the same story at a glance.
+    color: "bg-mg-text-tertiary",
+    glow: "shadow-none",
+  },
 };
 
 export function ServerCard({ server, cpuHistory = [], memoryUsedMb, memoryTotalMb, alertCount = 0 }: ServerCardProps) {

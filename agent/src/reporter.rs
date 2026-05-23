@@ -55,6 +55,26 @@ pub async fn run_loop() -> Result<()> {
         });
     }
 
+    // Periodic dead-session reaper. The wrapper script keeps `running`
+    // true across normal `exit` typing, so the only path to dead is
+    // wrapper crash / kill / agent shutdown. We don't need the reaper
+    // to fire every second — once a minute is plenty, and we already
+    // also cull lazily inside the `list` handler.
+    {
+        let sm = session_manager.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            // Don't fire immediately on startup — nothing has had time
+            // to die yet, and an immediate sweep would log no-op work
+            // every restart.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                sm.cleanup_dead();
+            }
+        });
+    }
+
     let client = Client::builder()
         .user_agent(format!("managet-agent/{}", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(15))
@@ -68,6 +88,17 @@ pub async fn run_loop() -> Result<()> {
         tokio::select! {
             _ = shutdown.recv() => {
                 info!("received shutdown signal, exiting");
+                // Notify every attached client so the user gets a
+                // labelled banner instead of a frozen terminal when
+                // systemd / launchd brings the daemon down. Best-
+                // effort: the pulse may not reach a client whose
+                // attach task is still doing its handshake. A short
+                // sleep gives the broadcast a fighting chance to flush
+                // before the process exits and Linux yanks the
+                // sockets out from under everyone. 200ms is small
+                // enough that operators barely notice it on a stop.
+                session_manager.broadcast_shutdown();
+                sleep(Duration::from_millis(200)).await;
                 return Ok(());
             }
             _ = sleep(Duration::from_secs(cfg.heartbeat_interval_secs)) => {}

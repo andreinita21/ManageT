@@ -20,7 +20,13 @@ export type AgentStatus =
   | "healthy"
   | "unreachable"
   | "uninstalling"
-  | "uninstall_failed";
+  | "uninstall_failed"
+  /** Operator-initiated stop via `managet stop` on the host. Distinct
+   *  from `unreachable` (which means the heartbeat just went missing).
+   *  While in this state the UI must disable session attach/create
+   *  with a precise message. Cleared back to `healthy` by the next
+   *  heartbeat after `managet start`. */
+  | "manually_stopped";
 
 export interface Server {
   id: string;

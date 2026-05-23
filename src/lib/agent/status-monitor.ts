@@ -57,6 +57,18 @@ export async function runStatusSweep(): Promise<void> {
   const awaitingCutoff = now - AWAITING_HEARTBEAT_TIMEOUT_MS;
 
   try {
+    // Only flip rows whose last-known state was `healthy`. We
+    // deliberately leave `manually_stopped` alone: the operator told
+    // us the agent is intentionally down via `managet stop`, and
+    // dropping it to `unreachable` would muddle the message and force
+    // the UI to re-explain the situation. The transition back to
+    // healthy is driven by the heartbeat route the moment the agent
+    // restarts — no sweeper involvement needed.
+    //
+    // The `not(pendingUninstall = 1)` guard also stays so a server in
+    // the middle of being uninstalled doesn't briefly flicker to
+    // `unreachable` between its last heartbeat and the row being
+    // hard-deleted.
     await db
       .update(servers)
       .set({
@@ -68,7 +80,6 @@ export async function runStatusSweep(): Promise<void> {
         and(
           eq(servers.agentStatus, "healthy"),
           lt(servers.agentLastHeartbeatAt, staleCutoff),
-          // Don't override uninstalls-in-progress.
           not(eq(servers.pendingUninstall, 1))
         )
       );

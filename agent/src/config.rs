@@ -30,7 +30,20 @@ fn default_interval() -> u64 {
 
 impl AgentConfig {
     /// Load config from the standard location. Errors if missing or malformed.
+    ///
+    /// Honours `MANAGET_CONFIG_PATH` if set in the environment. That's a
+    /// dev / test escape hatch — production installs always read from
+    /// the platform-specific path under `/etc` (or `/usr/local/etc` on
+    /// macOS). Lets a non-root developer run the agent with
+    /// `MANAGET_CONFIG_PATH=/tmp/managet.toml
+    /// MANAGET_SOCKET_PATH=/tmp/managet.sock managet-agent run`
+    /// without touching system directories.
     pub fn load() -> Result<Self> {
+        if let Ok(p) = std::env::var("MANAGET_CONFIG_PATH") {
+            if !p.is_empty() {
+                return Self::load_from(Path::new(&p));
+            }
+        }
         let path = crate::installer::paths::config_file();
         Self::load_from(&path)
     }

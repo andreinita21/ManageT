@@ -109,6 +109,25 @@ impl ServiceManager for SystemdManager {
         Ok(())
     }
 
+    fn restart(&self) -> Result<()> {
+        // Use systemctl's native restart so the unit goes through its
+        // proper ExecStop → ExecStart cycle. The default impl would
+        // also work but leaves a tiny window where the service is
+        // marked inactive that monitoring tools might flag.
+        self.systemctl(&["restart", UNIT_NAME])
+    }
+
+    fn print_status(&self) -> Result<()> {
+        // `--no-pager --full` shows the whole status block without
+        // paging or truncation. We deliberately don't `bail!` on a
+        // non-zero exit because systemctl exits 3 when the unit is
+        // inactive — that's useful output, not an error.
+        let _ = Command::new("systemctl")
+            .args(["--no-pager", "--full", "status", UNIT_NAME])
+            .status();
+        Ok(())
+    }
+
     fn status_command_hint(&self) -> &'static str {
         "systemctl status managet-agent"
     }
