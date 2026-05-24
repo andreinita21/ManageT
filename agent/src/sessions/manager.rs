@@ -691,19 +691,25 @@ impl SessionManager {
                                 cursor = abs + DETACH_MARKER.len();
                             }
 
-                            // Forward the remainder, except for a tail
-                            // that *could* be the start of a marker
-                            // spilling into the next chunk. The tail
-                            // can be at most MARKER.len()-1 bytes long.
+                            // Forward the remainder, holding back ONLY
+                            // bytes that could actually be the start of
+                            // a marker continuing into the next chunk
+                            // (i.e. the longest suffix of `remaining`
+                            // that's also a prefix of DETACH_MARKER).
+                            //
+                            // The earlier "hold the trailing 23 bytes
+                            // unconditionally" version caused a nasty
+                            // input-lag bug: each character the user
+                            // typed echoed back as a single byte, which
+                            // landed in `carry` and never reached the
+                            // attached client until 24 bytes had
+                            // accumulated. The user had to type a full
+                            // sentence before *anything* showed up.
                             let remaining = &combined[cursor..];
-                            let keep_tail = DETACH_MARKER.len().saturating_sub(1);
-                            if remaining.len() > keep_tail {
-                                let emit_end = remaining.len() - keep_tail;
-                                emit_bytes(&session, &remaining[..emit_end]);
-                                carry.extend_from_slice(&remaining[emit_end..]);
-                            } else {
-                                carry.extend_from_slice(remaining);
-                            }
+                            let keep = longest_marker_prefix_at_end(remaining);
+                            let emit_end = remaining.len() - keep;
+                            emit_bytes(&session, &remaining[..emit_end]);
+                            carry.extend_from_slice(&remaining[emit_end..]);
                         }
                     }
                 }
@@ -771,6 +777,30 @@ fn emit_bytes(session: &Arc<Session>, data: &[u8]) {
     // Broadcast send returns Err when no receivers are subscribed
     // (e.g. detached session). That's fine — scrollback still has it.
     let _ = session.output_tx.send(bytes);
+}
+
+/// Return `k` = the length of the longest suffix of `data` that is
+/// also a prefix of `DETACH_MARKER`. The PTY reader uses this to
+/// decide which trailing bytes MUST be held back across a read
+/// boundary because they could be the start of a marker.
+///
+/// For the common case (no ESC byte anywhere in the tail) this
+/// returns 0 immediately and the reader can flush the full chunk —
+/// which is what fixes the "I have to type a sentence before
+/// anything appears" bug the unconditional-hold version caused.
+///
+/// Worst case is O(MARKER.len()) per call. With marker length 24
+/// and a 4 KiB chunk, that's still cheaper than the I/O itself.
+fn longest_marker_prefix_at_end(data: &[u8]) -> usize {
+    let max_check = data.len().min(DETACH_MARKER.len() - 1);
+    // Walk from longest possible match downwards so we stop at the
+    // first (= longest) hit.
+    for k in (1..=max_check).rev() {
+        if data[data.len() - k..] == DETACH_MARKER[..k] {
+            return k;
+        }
+    }
+    0
 }
 
 /// Locate the first occurrence of `needle` inside `haystack` and
