@@ -58,17 +58,45 @@ User=root
 # the previous unit-template iteration in git history.
 #
 # These flags are surgical: they harden the daemon's own runtime
-# (block setuid escalation, kernel module loading, raw IPC families)
-# without restricting what the PTY children can read or write. None
-# of them affect the user's shell experience.
+# (block kernel module loading, raw IPC families) without restricting
+# what the PTY children can read or write.
+#
+# **Important** — every `Protect*` / `Restrict*` directive below has a
+# side effect that surprised us during dogfooding: systemd strips
+# CAP_SETUID from the service's effective capability set (CapEff)
+# whenever ANY of these is present, even though CapBnd keeps it. That
+# made `su -l <user>` start failing with
+# "su: cannot set user id: Operation not permitted" — i.e. every
+# `managet new` produced an instant detach loop.
+#
+# `AmbientCapabilities=CAP_SETUID CAP_SETGID` puts both back into
+# Permitted + Effective. Ambient caps are also inherited across the
+# wrapper-sh + su exec chain, so the running su can drop privileges
+# from root to the configured per-server user (which is the whole
+# point of the daemon).
+#
+# NOT included here, even though they appear in most service-hardening
+# checklists, because they break our core feature:
+#
+#   * RestrictSUIDSGID=true — strips CAP_SETUID/CAP_SETGID from CapBnd
+#     too, defeating even the AmbientCapabilities recovery above.
+#
+#   * PrivateUsers=true — same problem in a different shape (the user
+#     namespace makes setuid syscalls EPERM for everyone outside the
+#     mapped range).
+#
+#   * ProtectHome / ProtectSystem=strict — would block PTY shells
+#     from reading/writing anywhere under /home or /opt, which is
+#     the whole point of opening a shell. See the git history note
+#     in the previous unit template for the original incident.
 NoNewPrivileges=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectClock=true
-RestrictSUIDSGID=true
 RestrictRealtime=true
 RestrictNamespaces=true
 LockPersonality=true
+AmbientCapabilities=CAP_SETUID CAP_SETGID
 # Allow only the address families we actually use: UNIX for the
 # control socket, INET/INET6 for heartbeats. NETLINK is needed by
 # sysinfo's load-average collection on some kernels — leaving it on
