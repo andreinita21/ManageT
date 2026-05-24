@@ -520,17 +520,30 @@ async function extractUserId(req: IncomingMessage): Promise<string | null> {
     return null;
   }
   try {
-    // `getToken` accepts a Node IncomingMessage; it parses the
-    // cookie header itself and tries every known authjs cookie
-    // name. Casts because @auth/core's overload set was written
-    // around the Web Request type.
-    const jwt = await getToken({
-      req: req as unknown as Request,
-      secret,
-    });
-    if (!jwt) return null;
-    const userId = (jwt.id as string | undefined) ?? (jwt.sub as string | undefined);
-    return userId ?? null;
+    // `getToken` only checks ONE cookie-name variant per call — which
+    // one depends on `secureCookie`. Behind a TLS-terminating proxy
+    // (Cloudflare tunnel in our deployment) the browser holds a
+    // `__Secure-authjs.session-token` cookie set during an HTTPS
+    // response, but the upgrade request reaches us as HTTP and
+    // `getToken`'s auto-detect picks the un-prefixed name. The cookie
+    // name is also the JWE salt, so the wrong variant doesn't just
+    // miss the read — it fails decryption.
+    //
+    // Try both modes and accept the first one that decodes. Cheap (a
+    // single sha256 on miss) and robust to either deployment topology.
+    for (const secureCookie of [true, false]) {
+      const jwt = await getToken({
+        req: req as unknown as Request,
+        secret,
+        secureCookie,
+      });
+      if (jwt) {
+        const userId =
+          (jwt.id as string | undefined) ?? (jwt.sub as string | undefined);
+        if (userId) return userId;
+      }
+    }
+    return null;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.warn(`[WS] auth validation failed: ${msg}`);
