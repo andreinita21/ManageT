@@ -11,12 +11,12 @@ import { hashPassword } from "../src/lib/auth/index.js";
 import { db } from "../src/lib/db/index.js";
 import { users } from "../src/lib/db/schema.js";
 
-const NEW_EMAIL = "andrei@test.com";
+const NEW_USERNAME = "andrei";
 const NEW_PASSWORD = "2006";
 
 async function main() {
   // Find the existing admin row (by role first, falling back to the seed
-  // email so this script keeps working even after a fresh seed).
+  // username so this script keeps working even after a fresh seed).
   const adminRows = await db
     .select()
     .from(users)
@@ -27,7 +27,7 @@ async function main() {
       ? await db
           .select()
           .from(users)
-          .where(eq(users.email, "admin@managet.local"))
+          .where(eq(users.username, NEW_USERNAME))
           .limit(1)
       : [];
   const target = adminRows[0] ?? seedRows[0];
@@ -40,14 +40,14 @@ async function main() {
   await db
     .update(users)
     .set({
-      email: NEW_EMAIL,
+      username: NEW_USERNAME,
       passwordHash: hashPassword(NEW_PASSWORD),
       updatedAt: Date.now(),
     })
     .where(eq(users.id, target.id));
 
   console.log(
-    `Updated admin user ${target.id.slice(0, 8)}: email=${NEW_EMAIL}, password=${NEW_PASSWORD}`
+    `Updated admin user ${target.id.slice(0, 8)}: username=${NEW_USERNAME}, password=${NEW_PASSWORD}`
   );
 }
 

@@ -99,6 +99,13 @@
       "when": 1779800000000,
       "tag": "0013_group_view_server_label",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "6",
+      "when": 1780300000000,
+      "tag": "0014_rename_email_to_username",
+      "breakpoints": true
     }
   ]
 }

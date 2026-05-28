@@ -10,8 +10,8 @@ import { execSync } from "node:child_process";
 import { v4 as uuidv4 } from "uuid";
 import { eq } from "drizzle-orm";
 
-const EMAIL = "admin@managet.local";
-const PASSWORD = "admin";
+const USERNAME = "andrei";
+const PASSWORD = "2006";
 const ROLE = "admin" as const;
 
 async function seed() {
@@ -37,11 +37,11 @@ async function seed() {
   const existing = await db
     .select()
     .from(users)
-    .where(eq(users.email, EMAIL))
+    .where(eq(users.username, USERNAME))
     .limit(1);
 
   if (existing.length > 0) {
-    console.log(`[seed] Admin user already exists (${EMAIL}). Skipping.`);
+    console.log(`[seed] Admin user already exists (${USERNAME}). Skipping.`);
     return;
   }
 
@@ -51,7 +51,7 @@ async function seed() {
 
   await db.insert(users).values({
     id,
-    email: EMAIL,
+    username: USERNAME,
     passwordHash,
     role: ROLE,
     createdAt: now,
@@ -60,7 +60,7 @@ async function seed() {
 
   console.log("");
   console.log("=== Default Admin User Created ===");
-  console.log(`  Email:    ${EMAIL}`);
+  console.log(`  Username: ${USERNAME}`);
   console.log(`  Password: ${PASSWORD}`);
   console.log(`  Role:     ${ROLE}`);
   console.log("==================================");

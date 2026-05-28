@@ -399,7 +399,7 @@ function SettingsPage() {
         <div className="space-y-6">
           <div className="bg-mg-bg-secondary border border-mg-border rounded-lg p-6 space-y-4">
             <h3 className="text-sm font-medium text-mg-text">User Profile</h3>
-            <Input label="Email" type="email" placeholder="admin@example.com" />
+            <Input label="Username" type="text" placeholder="andrei" />
             <div className="grid grid-cols-2 gap-3">
               <Input label="Current Password" type="password" placeholder="Current password" />
               <Input label="New Password" type="password" placeholder="New password" />

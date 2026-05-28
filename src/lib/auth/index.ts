@@ -38,21 +38,21 @@ export const { auth, signIn, signOut, handlers } = NextAuth({
     Credentials({
       name: "credentials",
       credentials: {
-        email: { label: "Email", type: "email" },
+        username: { label: "Username", type: "text" },
         password: { label: "Password", type: "password" },
       },
       async authorize(credentials) {
-        const email = credentials?.email;
+        const username = credentials?.username;
         const password = credentials?.password;
 
-        if (typeof email !== "string" || typeof password !== "string") {
+        if (typeof username !== "string" || typeof password !== "string") {
           return null;
         }
 
         const rows = await db
           .select()
           .from(users)
-          .where(eq(users.email, email))
+          .where(eq(users.username, username))
           .limit(1);
 
         const user = rows[0];
@@ -64,7 +64,7 @@ export const { auth, signIn, signOut, handlers } = NextAuth({
 
         return {
           id: user.id,
-          email: user.email,
+          name: user.username,
           role: user.role,
         };
       },
