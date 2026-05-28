@@ -709,11 +709,16 @@ export const TERMINAL_FONT_SIZES: number[] = [
 // Public types
 // ---------------------------------------------------------------------------
 
+/** What to show as the server identifier in the group-mosaic cell title
+ *  bar — the SSH host or the user-assigned friendly name. */
+export type GroupViewServerLabel = "host" | "name";
+
 export interface AppearancePreferences {
   themeKey: string;
   terminalFontFamily: string;
   terminalFontSize: number;
   customTheme: ThemeColors | null;
+  groupViewServerLabel: GroupViewServerLabel;
 }
 
 export const DEFAULT_PREFERENCES: AppearancePreferences = {
@@ -721,6 +726,7 @@ export const DEFAULT_PREFERENCES: AppearancePreferences = {
   terminalFontFamily: "JetBrains Mono",
   terminalFontSize: 14,
   customTheme: null,
+  groupViewServerLabel: "host",
 };
 
 /**

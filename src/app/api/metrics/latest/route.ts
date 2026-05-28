@@ -12,6 +12,11 @@ import { db } from "@/lib/db";
 import { metricSnapshots } from "@/lib/db/schema";
 import { gte } from "drizzle-orm";
 
+interface FanReadingDto {
+  name: string;
+  rpm: number;
+}
+
 interface PerServerMetrics {
   cpuPercent?: number;
   cpuHistory: number[];
@@ -19,6 +24,14 @@ interface PerServerMetrics {
   memoryTotalMb?: number;
   diskUsedPercent?: number;
   load1m?: number;
+  // Latest sample's thermal + fan readings. Plus a short history of
+  // the CPU temp so the ServerCard sparkline has something to plot
+  // without a second round-trip.
+  cpuTempC?: number;
+  cpuTempHistory: number[];
+  gpuTempC?: number;
+  fans?: FanReadingDto[];
+  fanMaxRpm?: number;
   capturedAt: number;
 }
 
@@ -48,6 +61,7 @@ export async function GET() {
       data[row.serverId] ??
       (data[row.serverId] = {
         cpuHistory: [],
+        cpuTempHistory: [],
         capturedAt: 0,
       });
 
@@ -58,10 +72,32 @@ export async function GET() {
       }
       entry.cpuPercent = row.cpuPercent;
     }
+    if (row.cpuTempC != null) {
+      entry.cpuTempHistory.push(row.cpuTempC);
+      if (entry.cpuTempHistory.length > MAX_HISTORY) {
+        entry.cpuTempHistory.splice(0, entry.cpuTempHistory.length - MAX_HISTORY);
+      }
+      entry.cpuTempC = row.cpuTempC;
+    }
     if (row.memoryUsedMb != null) entry.memoryUsedMb = row.memoryUsedMb;
     if (row.memoryTotalMb != null) entry.memoryTotalMb = row.memoryTotalMb;
     if (row.diskUsedPercent != null) entry.diskUsedPercent = row.diskUsedPercent;
     if (row.load1m != null) entry.load1m = row.load1m;
+    if (row.gpuTempC != null) entry.gpuTempC = row.gpuTempC;
+    if (row.fanMaxRpm != null) entry.fanMaxRpm = row.fanMaxRpm;
+    // fans_json holds raw [{name, rpm}] from the most recent heartbeat.
+    // We only need to surface the latest sample's array; bucket
+    // aggregation drives the historical fan-RPM chart via fan_max_rpm.
+    if (row.fansJson != null) {
+      try {
+        const parsed = JSON.parse(row.fansJson) as FanReadingDto[];
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          entry.fans = parsed;
+        }
+      } catch {
+        // Corrupt row — leave fans undefined and move on.
+      }
+    }
     if (row.capturedAt > entry.capturedAt) entry.capturedAt = row.capturedAt;
   }
 

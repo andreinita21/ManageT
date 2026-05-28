@@ -12,6 +12,7 @@ import {
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { AgentStatusBadge } from "@/components/server/AgentStatusBadge";
+import { FanControlWidget } from "@/components/server/FanControlWidget";
 import { InstallProgressPanel } from "@/components/server/InstallProgressPanel";
 import { Tabs } from "@/components/ui/Tabs";
 import { Table } from "@/components/ui/Table";
@@ -82,8 +83,31 @@ export function ServerDetailClient({
       memory: m.memoryTotalMb && m.memoryTotalMb > 0 ? ((m.memoryUsedMb ?? 0) / m.memoryTotalMb) * 100 : 0,
       disk: m.diskUsedPercent ?? 0,
       load1m: m.load1m ?? 0,
+      // Recharts plots `null` as a gap, which is exactly what we want
+      // for sensors that occasionally drop out of a bucket. The Temp
+      // chart hides the GPU line entirely if every bucket is null.
+      cpuTemp: m.cpuTempC ?? null,
+      gpuTemp: m.gpuTempC ?? null,
+      fanRpm: m.fanMaxRpm ?? null,
     }));
   }, [currentMetrics]);
+
+  // Decide whether each optional chart should render at all. A series
+  // is "present" if at least one bucket carries a real number — that
+  // way Pi-class hosts (no GPU, no fans) just don't see those panels
+  // instead of staring at an empty graph.
+  const hasGpuTemp = useMemo(
+    () => chartData.some((d) => d.gpuTemp !== null),
+    [chartData]
+  );
+  const hasCpuTemp = useMemo(
+    () => chartData.some((d) => d.cpuTemp !== null),
+    [chartData]
+  );
+  const hasFans = useMemo(
+    () => chartData.some((d) => d.fanRpm !== null),
+    [chartData]
+  );
 
   const sessionColumns = useMemo(
     () => [
@@ -141,6 +165,9 @@ export function ServerDetailClient({
         memoryTotalMb: liveLatest.memoryTotalMb,
         diskUsedPercent: liveLatest.diskUsedPercent,
         load1m: liveLatest.load1m,
+        cpuTempC: liveLatest.cpuTempC,
+        gpuTempC: liveLatest.gpuTempC,
+        fans: liveLatest.fans,
         capturedAt: liveLatest.capturedAt,
       }
     : latestBucket;
@@ -185,10 +212,20 @@ export function ServerDetailClient({
         </div>
       </div>
 
-      {/* Quick stats */}
+      {/* Quick stats. Order:
+       *    CPU usage → CPU temp (next to CPU) → Memory → Disk
+       *  GPU temp + Fans tiles tack on at the end only when the host
+       *  actually reports them. Load average is plotted in the
+       *  detailed System Load chart below — it's redundant in the
+       *  top-of-page tile strip. */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         {[
           { label: "CPU", value: latestMetric?.cpuPercent != null ? `${latestMetric.cpuPercent.toFixed(1)}%` : "--" },
+          // CPU temp sits adjacent to CPU%. Renders "--" when the
+          // agent hasn't reported a sensor yet so the grid alignment
+          // stays stable across servers — the rest of the tiles slot
+          // in deterministically rather than reshuffling per host.
+          { label: "CPU temp", value: latestMetric?.cpuTempC != null ? `${latestMetric.cpuTempC.toFixed(1)}°C` : "--" },
           {
             label: "Memory",
             value:
@@ -197,7 +234,12 @@ export function ServerDetailClient({
                 : "--",
           },
           { label: "Disk", value: latestMetric?.diskUsedPercent != null ? `${latestMetric.diskUsedPercent.toFixed(1)}%` : "--" },
-          { label: "Load (1m)", value: latestMetric?.load1m != null ? latestMetric.load1m.toFixed(2) : "--" },
+          ...(latestMetric?.gpuTempC != null
+            ? [{ label: "GPU temp", value: `${latestMetric.gpuTempC.toFixed(1)}°C` }]
+            : []),
+          // Fans intentionally absent — they're surfaced via the
+          // FanControlWidget at the top of the Metrics tab, which
+          // also exposes the Auto/Manual/Max controls.
         ].map((stat) => (
           <div key={stat.label} className="bg-mg-bg-secondary border border-mg-border rounded-lg p-3">
             <p className="text-xs text-mg-text-tertiary">{stat.label}</p>
@@ -298,6 +340,14 @@ export function ServerDetailClient({
       {/* Tab content */}
       {activeTab === "metrics" && (
         <div className="space-y-6">
+          {/* Fan control sits above the charts because it's a control
+           *  surface, not a read-only graph. Hides itself when the host
+           *  reports no fans. */}
+          <FanControlWidget
+            server={currentServer}
+            fans={liveLatest?.fans}
+            onChanged={refetchServer}
+          />
           {chartData.length === 0 ? (
             <div className="bg-mg-bg-secondary border border-mg-border rounded-lg p-12 text-center">
               <p className="text-mg-text-tertiary text-sm">No metric data available yet</p>
@@ -369,6 +419,105 @@ export function ServerDetailClient({
                   </LineChart>
                 </ResponsiveContainer>
               </div>
+
+              {/* Temperatures — only renders when at least one sensor
+               *  reported in the window. CPU + (optional) GPU sit on
+               *  the same axis since they share °C as a unit. */}
+              {hasCpuTemp && (
+                <div className="bg-mg-bg-secondary border border-mg-border rounded-lg p-4">
+                  <h3 className="text-sm font-medium text-mg-text-secondary mb-4">
+                    Temperature {hasGpuTemp ? "(CPU + GPU, °C)" : "(CPU, °C)"}
+                  </h3>
+                  <ResponsiveContainer width="100%" height={200}>
+                    <LineChart data={chartData}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--color-mg-border)" />
+                      <XAxis dataKey="time" stroke="var(--color-mg-text-tertiary)" fontSize={11} />
+                      <YAxis stroke="var(--color-mg-text-tertiary)" fontSize={11} />
+                      <Tooltip
+                        contentStyle={{
+                          backgroundColor: "var(--color-mg-bg-secondary)",
+                          border: "1px solid var(--color-mg-border)",
+                          borderRadius: "8px",
+                        }}
+                        labelStyle={{ color: "var(--color-mg-text-secondary)" }}
+                        itemStyle={{ color: "var(--color-mg-text)" }}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="cpuTemp"
+                        name="CPU"
+                        stroke="var(--color-mg-accent)"
+                        strokeWidth={2}
+                        dot={false}
+                        connectNulls
+                        isAnimationActive={false}
+                      />
+                      {hasGpuTemp && (
+                        <Line
+                          type="monotone"
+                          dataKey="gpuTemp"
+                          name="GPU"
+                          stroke="var(--color-mg-accent-bright)"
+                          strokeWidth={2}
+                          dot={false}
+                          connectNulls
+                          isAnimationActive={false}
+                        />
+                      )}
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              )}
+
+              {/* Fan RPM — only shown when the host has at least one
+               *  fan. The series is the max RPM across all fans for
+               *  the bucket, which collapses cleanly for single-fan
+               *  hosts and tracks the loudest fan on multi-fan ones. */}
+              {hasFans && (
+                <div className="bg-mg-bg-secondary border border-mg-border rounded-lg p-4">
+                  <h3 className="text-sm font-medium text-mg-text-secondary mb-4">
+                    Fan RPM
+                  </h3>
+                  <ResponsiveContainer width="100%" height={180}>
+                    <LineChart data={chartData}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--color-mg-border)" />
+                      <XAxis dataKey="time" stroke="var(--color-mg-text-tertiary)" fontSize={11} />
+                      <YAxis stroke="var(--color-mg-text-tertiary)" fontSize={11} />
+                      <Tooltip
+                        contentStyle={{
+                          backgroundColor: "var(--color-mg-bg-secondary)",
+                          border: "1px solid var(--color-mg-border)",
+                          borderRadius: "8px",
+                        }}
+                        labelStyle={{ color: "var(--color-mg-text-secondary)" }}
+                        itemStyle={{ color: "var(--color-mg-text)" }}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="fanRpm"
+                        name="Max RPM"
+                        stroke="var(--color-mg-accent-dim)"
+                        strokeWidth={2}
+                        dot={false}
+                        connectNulls
+                        isAnimationActive={false}
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                  {/* When multiple fans are reporting right now,
+                   *  surface the per-fan breakdown below the graph so
+                   *  the user can match a label to its current RPM. */}
+                  {liveLatest?.fans && liveLatest.fans.length > 1 && (
+                    <div className="mt-3 flex flex-wrap gap-3 text-xs text-mg-text-tertiary">
+                      {liveLatest.fans.map((f) => (
+                        <span key={f.name} className="font-mono">
+                          {f.name}: <span className="text-mg-text">{f.rpm} rpm</span>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </>
           )}
         </div>

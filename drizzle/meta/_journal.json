@@ -78,6 +78,27 @@
       "when": 1779348538761,
       "tag": "0010_server_bar_settings",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1779600000000,
+      "tag": "0011_metric_temps_fans",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1779700000000,
+      "tag": "0012_server_fan_control",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "6",
+      "when": 1779800000000,
+      "tag": "0013_group_view_server_label",
+      "breakpoints": true
     }
   ]
 }

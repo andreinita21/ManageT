@@ -12,6 +12,7 @@
 pub mod cli;
 pub mod collector;
 pub mod config;
+pub mod hwmon;
 pub mod installer;
 pub mod reporter;
 pub mod service;

@@ -17,6 +17,7 @@ import {
   DEFAULT_PREFERENCES,
   PRESETS_BY_KEY,
   type AppearancePreferences,
+  type GroupViewServerLabel,
   type ThemeColors,
 } from "@/lib/themes/presets";
 
@@ -31,11 +32,14 @@ function rowToPrefs(
       custom = null;
     }
   }
+  const groupViewServerLabel: GroupViewServerLabel =
+    row.groupViewServerLabel === "name" ? "name" : "host";
   return {
     themeKey: row.themeKey,
     terminalFontFamily: row.terminalFontFamily,
     terminalFontSize: row.terminalFontSize,
     customTheme: custom,
+    groupViewServerLabel,
   };
 }
 
@@ -61,6 +65,7 @@ interface IncomingBody {
   terminalFontFamily?: unknown;
   terminalFontSize?: unknown;
   customTheme?: unknown;
+  groupViewServerLabel?: unknown;
 }
 
 export async function PUT(request: Request) {
@@ -99,6 +104,9 @@ export async function PUT(request: Request) {
       ? Math.round(fontSizeNum)
       : DEFAULT_PREFERENCES.terminalFontSize;
 
+  const groupViewServerLabel: GroupViewServerLabel =
+    body.groupViewServerLabel === "name" ? "name" : "host";
+
   // Custom theme only stored when actually using "custom"; for preset
   // themeKeys we clear it to avoid stale colors hanging around.
   let customThemeJson: string | null = null;
@@ -127,6 +135,7 @@ export async function PUT(request: Request) {
       terminalFontFamily,
       terminalFontSize,
       customTheme: customThemeJson,
+      groupViewServerLabel,
       updatedAt: now,
     })
     .onConflictDoUpdate({
@@ -136,6 +145,7 @@ export async function PUT(request: Request) {
         terminalFontFamily,
         terminalFontSize,
         customTheme: customThemeJson,
+        groupViewServerLabel,
         updatedAt: now,
       },
     });
@@ -148,6 +158,7 @@ export async function PUT(request: Request) {
       themeKey === "custom" && customThemeJson
         ? (JSON.parse(customThemeJson) as ThemeColors)
         : null,
+    groupViewServerLabel,
   };
   return NextResponse.json({ data: saved });
 }

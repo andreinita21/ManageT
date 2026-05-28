@@ -179,7 +179,86 @@ fn non_interactive_config(args: &InstallArgs) -> Result<AgentConfig> {
         server_id,
         token,
         heartbeat_interval_secs: args.interval_secs,
+        // Probed by `do_install` after this struct is built. Default
+        // false so the early-validate call doesn't choke on a partial
+        // config.
+        gpu_present: false,
     })
+}
+
+/// Best-effort detection of a usable GPU on the host. Persisted into the
+/// config at install time so the runtime collector can skip GPU-temp work
+/// entirely on systems without one (e.g. headless Pi, VMs).
+///
+/// Order:
+///   1. `nvidia-smi -L` exits 0 → NVIDIA card present (covers both Linux
+///      and macOS-with-eGPU edge cases).
+///   2. On Linux: any `/sys/class/drm/card*/device/uevent` mentioning a
+///      DRM-capable device, *excluding* the Pi's bcm2708-fb framebuffer
+///      which counts as a "card" but isn't a real GPU for our purposes.
+///   3. On macOS: every Apple Silicon Mac has an integrated GPU. Detect
+///      via uname; we report true and let the SMC reader surface the temp.
+fn probe_gpu_present() -> bool {
+    // Try nvidia-smi first — fast exit on systems with NVIDIA drivers.
+    if let Ok(out) = std::process::Command::new("nvidia-smi")
+        .arg("-L")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        if out.status.success() && !out.stdout.is_empty() {
+            info!("GPU probe: detected NVIDIA card via nvidia-smi");
+            return true;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Iterate /sys/class/drm/card* and look at the uevent. A real GPU
+        // (AMD radeon/amdgpu, Intel i915, Nouveau, etc.) carries a
+        // DRIVER= line with a non-framebuffer driver name. The Pi 4/5
+        // expose `card0` for the kms driver `vc4` — that's a real GPU.
+        // The bcm2708-fb older framebuffer is NOT useful for thermals so
+        // we filter it out by name.
+        if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.starts_with("card") || name.contains('-') {
+                    // Skip "card0-HDMI-A-1" connector entries.
+                    continue;
+                }
+                let uevent = entry.path().join("device").join("uevent");
+                if let Ok(text) = std::fs::read_to_string(&uevent) {
+                    for line in text.lines() {
+                        if let Some(driver) = line.strip_prefix("DRIVER=") {
+                            // Skip framebuffer-only entries; everything
+                            // else (amdgpu, radeon, i915, nouveau, vc4,
+                            // v3d, nvidia, etc.) means a real GPU.
+                            if driver == "simple-framebuffer" || driver == "bcm2708-fb" {
+                                continue;
+                            }
+                            info!(driver, card = %name, "GPU probe: detected via /sys/class/drm");
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // Every Mac has a GPU. The SMC reader will figure out whether
+        // there's a usable thermal sensor for it.
+        true
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
 }
 
 /// Perform the install steps shared between interactive and non-interactive.
@@ -213,7 +292,11 @@ pub(crate) async fn do_install(cfg: &AgentConfig) -> Result<()> {
     //     subcommand interface still works.
     install_managet_cli(&current_exe)?;
 
-    // 3. Write config.
+    // 3. Probe for a GPU, then write config. The probe runs once, here,
+    //    so the runtime collector doesn't pay for it on every heartbeat.
+    let mut cfg = cfg.clone();
+    cfg.gpu_present = probe_gpu_present();
+    info!(gpu_present = cfg.gpu_present, "host GPU probe result");
     cfg.save().context("writing agent config")?;
     info!("wrote config to {}", paths::config_file().display());
 

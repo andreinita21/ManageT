@@ -71,6 +71,22 @@ export interface Server {
    * user_host, duration, detach. `undefined` = agent default.
    */
   barFields?: string;
+  // ---- Fan control ----
+  /** Current target mode: auto (OS-managed), manual (pin to fanTargetRpm),
+   *  or max (peg to hardware max). Defaults to auto on new servers. */
+  fanMode: "auto" | "manual" | "max";
+  /** Pinned RPM when `fanMode === "manual"`. Clamped by the agent
+   *  against the hardware's reported safe range. */
+  fanTargetRpm?: number;
+  /** True when the dashboard has set a new fan command that the agent
+   *  hasn't yet acknowledged (cleared on the heartbeat that ships it). */
+  fanPending: boolean;
+  /** Last error reported by the agent when it tried to apply a fan
+   *  command. Apple Silicon Mac mini M4 returns "SMC reported
+   *  zero-length key" for the `FS! ` write — fan control via legacy
+   *  SMC keys isn't available there. Linux hosts may return permission
+   *  errors when PWM channels are firmware-locked. */
+  fanError?: string;
   createdBy: string;
   createdAt: number;
   updatedAt: number;
@@ -120,6 +136,14 @@ export interface CommandHistoryEntry {
   executedAt: number;
 }
 
+export interface FanReading {
+  /** Driver-supplied label: "cpu_fan", "Fan 0", or a synthetic
+   *  "<chip>/fanN" when the driver doesn't expose a label. Never empty. */
+  name: string;
+  /** Raw RPM from `fan*_input` / SMC `F<n>Ac`. */
+  rpm: number;
+}
+
 export interface MetricSnapshot {
   id: string;
   serverId: string;
@@ -131,6 +155,19 @@ export interface MetricSnapshot {
   load5m?: number;
   load15m?: number;
   activeConnections?: number;
+  /** CPU package/proximity temperature in °C, or undefined when the
+   *  agent didn't find a sensor (or the agent predates this field). */
+  cpuTempC?: number;
+  /** GPU temperature in °C. Always undefined on hosts the installer
+   *  flagged as GPU-less. */
+  gpuTempC?: number;
+  /** Per-fan RPM readings from the most recent heartbeat. Empty/undefined
+   *  on fanless systems (RPi) or unsupported platforms. */
+  fans?: FanReading[];
+  /** Pre-derived max RPM across `fans` at insert time. Populated on
+   *  bucket-aggregated rows so charts can plot a fan-activity line
+   *  without parsing the JSON blob in every row. */
+  fanMaxRpm?: number;
   capturedAt: number;
 }
 
@@ -249,6 +286,12 @@ export interface Group {
  *  the current member arrangement, the UI falls back to the default
  *  equal-split layout (and overwrites on the next drag).
  *
+ *  `rowPartition` is the column count per row that the user picked from
+ *  the arrangement menu (e.g. `[2, 2]` for a four-member group, `[1, 2]`
+ *  for a three-member group). When present, it must sum to the current
+ *  member count and have the same length as `rowHeights`. When absent,
+ *  the UI falls back to the default 3-per-row layout.
+ *
  *  `fontSizeBySession` carries optional per-pane font-size overrides
  *  (the user's +/- bumps from the cell bar). Keys that don't appear
  *  fall back to the global appearance default.
@@ -256,7 +299,31 @@ export interface Group {
 export interface GroupLayout {
   rowHeights: number[];
   colWidthsByRow: number[][];
+  rowPartition?: number[];
   fontSizeBySession?: Record<string, number>;
+}
+
+/** Allowed row arrangements for a group with `n` members. First entry is
+ *  the default (matching the legacy 3-per-row rule). Each arrangement is
+ *  the column count per row; the array sums to `n` and never exceeds two
+ *  rows. */
+export function allowedRowPartitions(n: number): number[][] {
+  switch (n) {
+    case 1:
+      return [[1]];
+    case 2:
+      return [[2], [1, 1]];
+    case 3:
+      return [[3], [1, 2], [2, 1]];
+    case 4:
+      return [[3, 1], [4], [2, 2], [1, 3]];
+    case 5:
+      return [[3, 2], [5], [2, 3]];
+    case 6:
+      return [[3, 3], [6]];
+    default:
+      return [];
+  }
 }
 
 export interface CreateGroupRequest {

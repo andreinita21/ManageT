@@ -111,6 +111,27 @@ export const servers = sqliteTable("servers", {
   // Recognised keys: session, user_host, duration, detach. Same shape
   // we pass to `managet-agent reconfigure --bar-fields`.
   barFields: text("bar_fields"),
+  // ---- Fan control (Phase 2) ----
+  // Desired fan mode the dashboard wants on this host. "auto" lets the OS
+  // / firmware manage fans (the safe default and the value the agent
+  // restores on graceful shutdown). "manual" pins to `fan_target_rpm`.
+  // "max" pins to the hardware's maximum, useful for "cool down after a
+  // hard run" scenarios.
+  fanMode: text("fan_mode", { enum: ["auto", "manual", "max"] })
+    .notNull()
+    .default("auto"),
+  // Target RPM when fan_mode = "manual". NULL otherwise. Clamped against
+  // the hardware's safe min/max by the agent on apply.
+  fanTargetRpm: integer("fan_target_rpm"),
+  // 0/1 — when 1, the next heartbeat response carries the fan command
+  // so the agent applies it. Cleared by the heartbeat handler after
+  // embedding the directive.
+  fanPending: integer("fan_pending").notNull().default(0),
+  // Free-form text — populated when the agent's most recent apply
+  // failed (Apple Silicon may reject `FS! ` writes, Linux PWM may be
+  // firmware-locked). Surfaced in the UI so operators understand why
+  // a setting didn't stick. Cleared on a subsequent successful apply.
+  fanError: text("fan_error"),
   createdBy: text("created_by")
     .notNull()
     .references(() => users.id),
@@ -206,6 +227,20 @@ export const metricSnapshots = sqliteTable(
     load5m: real("load_5m"),
     load15m: real("load_15m"),
     activeConnections: integer("active_connections"),
+    // CPU package/proximity temperature in °C. Null when the agent
+    // couldn't find a usable sensor (most hosts produce a value).
+    cpuTempC: real("cpu_temp_c"),
+    // GPU temperature in °C. Null on hosts the installer flagged as
+    // GPU-less so the agent never even tries.
+    gpuTempC: real("gpu_temp_c"),
+    // JSON-serialised [{name, rpm}] for the raw snapshot. Used to
+    // populate the "latest fan readings" widget; for time-series we
+    // store a scalar summary alongside (see fan_max_rpm).
+    fansJson: text("fans_json"),
+    // Pre-derived max RPM across the sample's fans so bucket-aggregation
+    // (AVG/MIN/MAX over a time window) can run as a normal SQL aggregate
+    // without parsing JSON for every row.
+    fanMaxRpm: integer("fan_max_rpm"),
     capturedAt: integer("captured_at").notNull(),
   },
   (t) => [
@@ -302,6 +337,10 @@ export const userPreferences = sqliteTable("user_preferences", {
     .default("JetBrains Mono"),
   terminalFontSize: integer("terminal_font_size").notNull().default(14),
   customTheme: text("custom_theme"),
+  /** Controls what the group-mosaic cell title bar shows for each
+   *  terminal's server: "host" (default — the SSH host) or "name" (the
+   *  user-assigned friendly name). */
+  groupViewServerLabel: text("group_view_server_label").notNull().default("host"),
   updatedAt: integer("updated_at").notNull(),
 });
 

@@ -13,6 +13,12 @@ interface ServerCardProps {
   cpuHistory?: number[];
   memoryUsedMb?: number;
   memoryTotalMb?: number;
+  /** Rolling history of CPU temperature in °C — same length as
+   *  cpuHistory in steady state. Empty when the host doesn't report
+   *  thermals (older agent, unsupported platform). */
+  cpuTempHistory?: number[];
+  /** Latest CPU temperature in °C. */
+  cpuTempC?: number;
   alertCount?: number;
 }
 
@@ -59,9 +65,18 @@ const dotByAgentStatus: Record<Server["agentStatus"], { color: string; glow: str
   },
 };
 
-export function ServerCard({ server, cpuHistory = [], memoryUsedMb, memoryTotalMb, alertCount = 0 }: ServerCardProps) {
+export function ServerCard({
+  server,
+  cpuHistory = [],
+  memoryUsedMb,
+  memoryTotalMb,
+  cpuTempHistory = [],
+  cpuTempC,
+  alertCount = 0,
+}: ServerCardProps) {
   const dot = dotByAgentStatus[server.agentStatus];
   const memoryPercent = memoryTotalMb && memoryTotalMb > 0 ? (memoryUsedMb ?? 0) / memoryTotalMb * 100 : 0;
+  const showTemp = cpuTempHistory.length > 0 || cpuTempC != null;
 
   return (
     <Link href={`/servers/${server.id}`}>
@@ -104,6 +119,25 @@ export function ServerCard({ server, cpuHistory = [], memoryUsedMb, memoryTotalM
           </div>
           <MetricSparkline data={cpuHistory} />
         </div>
+
+        {/* CPU temperature sparkline — only when the host actually
+         *  reports thermals (older agents and unsupported platforms
+         *  simply don't render this strip). */}
+        {showTemp && (
+          <div className="mb-3">
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-xs text-mg-text-tertiary">CPU temp</span>
+              <span className="text-xs text-mg-text-secondary font-mono">
+                {cpuTempC != null
+                  ? `${cpuTempC.toFixed(1)}°C`
+                  : cpuTempHistory.length > 0
+                    ? `${cpuTempHistory[cpuTempHistory.length - 1]?.toFixed(1)}°C`
+                    : "--"}
+              </span>
+            </div>
+            <MetricSparkline data={cpuTempHistory} />
+          </div>
+        )}
 
         {/* RAM Bar */}
         <div className="mb-3">

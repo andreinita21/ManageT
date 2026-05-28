@@ -8,6 +8,8 @@ use serde::Serialize;
 use std::collections::HashMap;
 use sysinfo::{Disks, LoadAvg, Pid, ProcessesToUpdate, System};
 
+use crate::hwmon::{FanApplyOutcome, FanReading};
+
 /// A single point-in-time measurement. Field names intentionally match the
 /// JSON the dashboard expects (camelCase) — serde_json handles the mapping.
 #[derive(Debug, Clone, Serialize)]
@@ -23,6 +25,22 @@ pub struct MetricSnapshot {
     pub uptime_secs: u64,
     pub agent_version: &'static str,
     pub hostname: String,
+    /// CPU package/proximity temperature, °C. `None` when no usable
+    /// sensor was found.
+    pub cpu_temp_c: Option<f32>,
+    /// GPU temperature, °C. Always `None` on hosts where the installer
+    /// determined no GPU is present, so the collector never even tries.
+    pub gpu_temp_c: Option<f32>,
+    /// Per-fan RPM readings. Empty on systems without fans (e.g. RPi),
+    /// and on platforms where we couldn't open the SMC/hwmon source.
+    #[serde(default)]
+    pub fans: Vec<FanReading>,
+    /// Set when this heartbeat carries the outcome of a fan command
+    /// that the agent just applied. None on regular heartbeats — the
+    /// agent reports applied state only once, then clears it so the
+    /// dashboard doesn't churn on duplicates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fan_state: Option<FanApplyOutcome>,
     /// Per-session CPU/RAM. Empty when the agent has no live sessions.
     /// Older dashboards ignore the field; newer ones upsert into the
     /// `sessions` table to drive the stack-detail view.
@@ -54,7 +72,11 @@ pub struct SessionStats {
 /// For CPU percentages — both global and per-process — `sysinfo` requires
 /// two refreshes with a short gap because the first reading has no
 /// baseline. We refresh twice here with a 200ms sleep in between.
-pub fn collect(session_pids: &[(String, u32)]) -> MetricSnapshot {
+///
+/// `gpu_present` is plumbed in from the agent config (set once at
+/// install time by probing the host). Passed as a parameter rather than
+/// re-read from disk each tick so the hot path stays cheap.
+pub fn collect(session_pids: &[(String, u32)], gpu_present: bool) -> MetricSnapshot {
     let mut sys = System::new();
     sys.refresh_memory();
     sys.refresh_cpu_all();
@@ -129,6 +151,12 @@ pub fn collect(session_pids: &[(String, u32)]) -> MetricSnapshot {
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "unknown".to_string());
 
+    // Temperatures + fans live in their own module so the platform-
+    // specific code stays out of this file. Errors / missing sensors are
+    // handled as `None` / empty arrays — the dashboard renders nothing
+    // when the corresponding column is null.
+    let hw = crate::hwmon::collect(gpu_present);
+
     MetricSnapshot {
         cpu_percent,
         memory_used_mb,
@@ -140,6 +168,12 @@ pub fn collect(session_pids: &[(String, u32)]) -> MetricSnapshot {
         uptime_secs: System::uptime(),
         agent_version: env!("CARGO_PKG_VERSION"),
         hostname,
+        cpu_temp_c: hw.cpu_temp_c,
+        gpu_temp_c: hw.gpu_temp_c,
+        fans: hw.fans,
+        // Default to None — the reporter mutates this in-place when it
+        // has a fresh apply outcome to ship.
+        fan_state: None,
         sessions,
     }
 }
@@ -189,8 +223,13 @@ fn pick_root_disk(disks: &Disks) -> Option<(u64, u64)> {
 pub fn print_status_snapshot() -> Result<()> {
     // No live SessionManager when the user runs `managet-agent status` from
     // the command line — pass an empty list so the per-session block is
-    // omitted from the JSON.
-    let snapshot = collect(&[]);
+    // omitted from the JSON. Read the config's gpu_present flag if a
+    // config exists; otherwise probe (we're explicitly diagnostic here).
+    let gpu_present = match crate::config::AgentConfig::load() {
+        Ok(cfg) => cfg.gpu_present,
+        Err(_) => false,
+    };
+    let snapshot = collect(&[], gpu_present);
     let json = serde_json::to_string_pretty(&snapshot)?;
     println!("{json}");
 

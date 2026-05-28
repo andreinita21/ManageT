@@ -22,6 +22,13 @@ pub struct AgentConfig {
     /// How often to send heartbeats (seconds).
     #[serde(default = "default_interval")]
     pub heartbeat_interval_secs: u64,
+    /// Set at install time by probing the host. When false, the runtime
+    /// collector skips all GPU-temperature work — no `nvidia-smi`
+    /// subprocess, no per-component scan for "amdgpu"/"nouveau". On a
+    /// system that genuinely has no GPU (e.g. a headless Pi or VM) this
+    /// avoids wasted syscalls on every heartbeat.
+    #[serde(default)]
+    pub gpu_present: bool,
 }
 
 fn default_interval() -> u64 {
@@ -174,6 +181,7 @@ mod tests {
             server_id: "11111111-2222-3333-4444-555555555555".into(),
             token: "deadbeef".into(),
             heartbeat_interval_secs: 5,
+            gpu_present: false,
         };
         cfg.save_to(&tmp).unwrap();
         let loaded = AgentConfig::load_from(&tmp).unwrap();
@@ -191,6 +199,7 @@ mod tests {
             server_id: "x".into(),
             token: "y".into(),
             heartbeat_interval_secs: 1,
+            gpu_present: false,
         };
         assert!(cfg.validate().is_err());
     }

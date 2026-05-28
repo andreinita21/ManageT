@@ -173,6 +173,8 @@ export default function DashboardPage() {
                 cpuHistory={m?.cpuHistory ?? []}
                 memoryUsedMb={m?.memoryUsedMb}
                 memoryTotalMb={m?.memoryTotalMb}
+                cpuTempHistory={m?.cpuTempHistory ?? []}
+                cpuTempC={m?.cpuTempC}
               />
             );
           })}

@@ -107,6 +107,14 @@ export interface LatestMetricsEntry {
   memoryTotalMb?: number;
   diskUsedPercent?: number;
   load1m?: number;
+  // Latest sample's thermal + fan readings. cpuTempHistory carries a
+  // rolling window (last ~5 minutes) so ServerCard can draw a
+  // sparkline for temp the same way it does for CPU%.
+  cpuTempC?: number;
+  cpuTempHistory: number[];
+  gpuTempC?: number;
+  fans?: Array<{ name: string; rpm: number }>;
+  fanMaxRpm?: number;
   capturedAt: number;
 }
 
@@ -230,6 +238,28 @@ export async function deleteServer(
       /* non-JSON body — ignore */
     }
     throw new Error(detail ?? `HTTP ${res.status}`);
+  }
+}
+
+/**
+ * Push a fan-control command to a server. The dashboard sets the
+ * desired mode/RPM; the agent picks it up on its next heartbeat (so
+ * expect up to ~10s of latency before the change applies) and reports
+ * back via subsequent heartbeats.
+ */
+export async function setServerFan(
+  id: string,
+  cmd: { mode: "auto" | "max" } | { mode: "manual"; rpm: number }
+): Promise<void> {
+  const res = await fetch(`${API_BASE}/servers/${id}/fan`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(cmd),
+  });
+  handleUnauthorized(res);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body?.error ?? `HTTP ${res.status}`);
   }
 }
 

@@ -213,6 +213,7 @@ function shallowSamePrefs(
   if (a.themeKey !== b.themeKey) return false;
   if (a.terminalFontFamily !== b.terminalFontFamily) return false;
   if (a.terminalFontSize !== b.terminalFontSize) return false;
+  if (a.groupViewServerLabel !== b.groupViewServerLabel) return false;
   return JSON.stringify(a.customTheme) === JSON.stringify(b.customTheme);
 }
 

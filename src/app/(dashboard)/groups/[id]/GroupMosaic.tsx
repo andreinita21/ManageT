@@ -45,6 +45,12 @@ import {
 import { useAppearance } from "@/lib/themes/provider";
 import type { Group, GroupLayout, Server, Session } from "@/types";
 
+/** Visual highlight: when the user hovers a server's resource tile in
+ *  the page header, every MosaicCell whose member belongs to that
+ *  server paints a translucent accent overlay so it's immediately clear
+ *  which terminals are running on the highlighted host. */
+type HighlightServerId = string | null;
+
 interface GroupMosaicProps {
   group: Group;
   serversById: Map<string, Server>;
@@ -54,13 +60,29 @@ interface GroupMosaicProps {
    *  PATCH the session and trigger a refetch so the new name flows
    *  back through `group.members`. */
   onRenameMember: (sessionId: string, name: string) => void | Promise<void>;
+  /** Server-id whose cells should paint a translucent accent overlay.
+   *  Driven by the resource-tile hover in the group header. */
+  highlightServerId?: HighlightServerId;
+  /** Fired whenever the active row arrangement changes (layout load,
+   *  picker pick, member add/remove that falls back to a fresh default).
+   *  The page header's LayoutPicker subscribes to this so its "active"
+   *  highlight stays in sync without needing to peek into a ref. */
+  onPartitionChange?: (partition: number[]) => void;
 }
 
 /** Imperative handle exposed to the page so its group-level +/- buttons
- *  can drive the layout state that this component owns. */
+ *  and layout picker can drive the layout state that this component owns. */
 export interface GroupMosaicHandle {
   /** Bump every member's font size by `delta`, clamped to the limits. */
   bumpAll: (delta: number) => void;
+  /** Currently active row partition (e.g. [3, 1]). Returns null until
+   *  the saved layout has loaded. Used by the page header to drive the
+   *  arrangement picker's "active" indicator. */
+  getRowPartition: () => number[] | null;
+  /** Switch to a new row arrangement. The total of `partition` must
+   *  equal the current member count; the call is ignored otherwise.
+   *  Persists immediately. */
+  setRowPartition: (partition: number[]) => void;
 }
 
 const LAYOUT_DEBOUNCE_MS = 350;
@@ -68,42 +90,64 @@ const FONT_MIN = 8;
 const FONT_MAX = 28;
 const FONT_STEP = 1;
 
-/** Mirror of `defaultLayoutForCount` in src/lib/groups. Inlined here so
- *  the client bundle doesn't pull in the drizzle/db side of that module. */
-function defaultLayoutForCount(n: number): GroupLayout {
-  if (n <= 0) return { rowHeights: [1], colWidthsByRow: [[]] };
-  const rows = n <= 3 ? 1 : 2;
-  const firstRow = Math.min(n, 3);
-  const secondRow = Math.max(0, n - firstRow);
-  if (rows === 1) {
-    return {
-      rowHeights: [1],
-      colWidthsByRow: [Array.from({ length: firstRow }, () => 1 / firstRow)],
-    };
-  }
-  return {
-    rowHeights: [0.5, 0.5],
-    colWidthsByRow: [
-      Array.from({ length: firstRow }, () => 1 / firstRow),
-      Array.from({ length: secondRow }, () => 1 / secondRow),
-    ],
-  };
+/** Mirror of `defaultPartitionForCount` in src/lib/groups. Inlined here
+ *  so the client bundle doesn't pull in the drizzle/db side of that
+ *  module. Matches the legacy 3-per-row rule so layouts written before
+ *  the arrangement picker existed don't visually shift. */
+function defaultPartitionForCount(n: number): number[] {
+  if (n <= 0) return [];
+  if (n <= 3) return [n];
+  return [3, n - 3];
 }
 
-/** Slice the ordered member array into two visual rows (max 3-per-row). */
-function partitionRows<T>(items: T[]): T[][] {
+function layoutForPartition(partition: number[]): GroupLayout {
+  if (partition.length === 0) {
+    return { rowHeights: [1], colWidthsByRow: [[]], rowPartition: [] };
+  }
+  const rowHeights = Array.from(
+    { length: partition.length },
+    () => 1 / partition.length
+  );
+  const colWidthsByRow = partition.map((cols) =>
+    Array.from({ length: cols }, () => 1 / cols)
+  );
+  return { rowHeights, colWidthsByRow, rowPartition: [...partition] };
+}
+
+function defaultLayoutForCount(n: number): GroupLayout {
+  return layoutForPartition(defaultPartitionForCount(n));
+}
+
+/** Slice the ordered member array into visual rows according to
+ *  `partition` (e.g. [3, 1] = first row of 3 then a row of 1). When the
+ *  partition is missing or inconsistent we fall back to the legacy
+ *  3-per-row rule so older saved layouts keep rendering. */
+function partitionRows<T>(items: T[], partition?: number[]): T[][] {
+  if (
+    partition &&
+    partition.length > 0 &&
+    partition.reduce((a, b) => a + b, 0) === items.length
+  ) {
+    const rows: T[][] = [];
+    let i = 0;
+    for (const n of partition) {
+      rows.push(items.slice(i, i + n));
+      i += n;
+    }
+    return rows;
+  }
   if (items.length <= 3) return [items];
   return [items.slice(0, 3), items.slice(3)];
 }
 
 /** Membership-shape signature used to gate the panel remount when the
- *  member count changes (e.g. someone added or removed a terminal).
- *  Different signature ⇒ different `key` ⇒ the PanelGroup remounts and
- *  picks up the appropriate defaults. Without this, going from 3→4
- *  members would keep the old single-row layout. */
-function shapeKey(members: Session[]): string {
+ *  member count or arrangement changes. Different signature ⇒ different
+ *  `key` ⇒ the PanelGroup remounts and picks up the appropriate
+ *  defaults. The partition is part of the signature so swapping
+ *  arrangements (e.g. [3,1] → [2,2]) repaints cleanly. */
+function shapeKey(members: Session[], partition: number[]): string {
   const ids = members.map((m) => m.id).join("|");
-  return `${members.length}::${ids}`;
+  return `${partition.join(",")}::${members.length}::${ids}`;
 }
 
 export const GroupMosaic = forwardRef<GroupMosaicHandle, GroupMosaicProps>(
@@ -114,14 +158,16 @@ export const GroupMosaic = forwardRef<GroupMosaicHandle, GroupMosaicProps>(
       onReorderPersisted,
       onRemoveMember,
       onRenameMember,
+      highlightServerId = null,
+      onPartitionChange,
     },
     ref
   ) {
   const members = group.members;
   const memberCount = members.length;
-  const rows = useMemo(() => partitionRows(members), [members]);
   const appearance = useAppearance();
   const baseFontSize = appearance.active.terminalFontSize;
+  const serverLabelMode = appearance.active.groupViewServerLabel;
 
   // Single state cell holds (groupId, layout) so the placeholder
   // condition `layoutState.groupId !== group.id` works without us
@@ -149,13 +195,37 @@ export const GroupMosaic = forwardRef<GroupMosaicHandle, GroupMosaicProps>(
       }
       if (cancelled) return;
       const fresh = defaultLayoutForCount(memberCount);
-      const shapeOk =
-        saved &&
-        saved.rowHeights.length === fresh.rowHeights.length &&
-        saved.colWidthsByRow.length === fresh.colWidthsByRow.length &&
-        saved.colWidthsByRow.every(
-          (r, i) => r.length === fresh.colWidthsByRow[i].length
-        );
+      // `rowPartition` is the source of truth for shape when present.
+      // Accept the saved layout only when its partition sums to the
+      // current member count AND its rowHeights/colWidthsByRow shape
+      // agrees with that partition. Layouts written before the
+      // arrangement picker existed have no `rowPartition`; we treat
+      // them as legacy and only accept them if they also match the
+      // default partition shape.
+      const savedPartition = saved?.rowPartition;
+      let shapeOk = false;
+      if (saved) {
+        if (
+          savedPartition &&
+          savedPartition.length > 0 &&
+          savedPartition.length <= 2 &&
+          savedPartition.reduce((a, b) => a + b, 0) === memberCount &&
+          saved.rowHeights.length === savedPartition.length &&
+          saved.colWidthsByRow.length === savedPartition.length &&
+          saved.colWidthsByRow.every((r, i) => r.length === savedPartition[i])
+        ) {
+          shapeOk = true;
+        } else if (
+          !savedPartition &&
+          saved.rowHeights.length === fresh.rowHeights.length &&
+          saved.colWidthsByRow.length === fresh.colWidthsByRow.length &&
+          saved.colWidthsByRow.every(
+            (r, i) => r.length === fresh.colWidthsByRow[i].length
+          )
+        ) {
+          shapeOk = true;
+        }
+      }
       // Preserve font-size overrides even when the row/col shape no
       // longer matches — a font choice for session X is still valid
       // regardless of how the panels are split.
@@ -274,7 +344,61 @@ export const GroupMosaic = forwardRef<GroupMosaicHandle, GroupMosaicProps>(
     [members, baseFontSize, persistLayout, setLayout]
   );
 
-  useImperativeHandle(ref, () => ({ bumpAll: bumpAllFont }), [bumpAllFont]);
+  // Active partition (after layout has loaded). Used by the picker to
+  // light up the current arrangement.
+  const activePartition = useMemo<number[] | null>(() => {
+    if (!layout) return null;
+    if (layout.rowPartition && layout.rowPartition.length > 0) {
+      return layout.rowPartition;
+    }
+    return defaultPartitionForCount(memberCount);
+  }, [layout, memberCount]);
+
+  // Notify the parent whenever the partition changes. Stringify for the
+  // deps so a reference change without a value change (a new array
+  // with the same numbers) doesn't fire the callback.
+  const partitionKey = activePartition ? activePartition.join(",") : null;
+  useEffect(() => {
+    if (activePartition && onPartitionChange) {
+      onPartitionChange(activePartition);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [partitionKey]);
+
+  const setRowPartitionExternal = useCallback(
+    (partition: number[]) => {
+      if (
+        partition.length === 0 ||
+        partition.length > 2 ||
+        partition.reduce((a, b) => a + b, 0) !== memberCount
+      ) {
+        return;
+      }
+      setLayout((prev) => {
+        // Preserve per-pane font overrides — they're attached to
+        // sessionIds, not panel positions, so a new arrangement
+        // doesn't invalidate them.
+        const fresh = layoutForPartition(partition);
+        const next: GroupLayout = {
+          ...fresh,
+          fontSizeBySession: prev?.fontSizeBySession,
+        };
+        persistLayout(next);
+        return next;
+      });
+    },
+    [memberCount, persistLayout, setLayout]
+  );
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      bumpAll: bumpAllFont,
+      getRowPartition: () => activePartition,
+      setRowPartition: setRowPartitionExternal,
+    }),
+    [bumpAllFont, activePartition, setRowPartitionExternal]
+  );
 
   // --- Drag-and-drop reorder ---
   const [dragId, setDragId] = useState<string | null>(null);
@@ -340,10 +464,18 @@ export const GroupMosaic = forwardRef<GroupMosaicHandle, GroupMosaicProps>(
     );
   }
 
+  // Resolved partition for the current render. Falls back to the
+  // default when the saved layout pre-dates the picker.
+  const partition: number[] =
+    layout.rowPartition && layout.rowPartition.length > 0
+      ? layout.rowPartition
+      : defaultPartitionForCount(memberCount);
+  const rows = partitionRows(members, partition);
+
   // PanelGroup needs to remount when the member arrangement changes
   // (so panels pick up new defaults) — see `shapeKey`. Within a single
   // arrangement, panel sizes are controlled live by drag.
-  const mosaicKey = shapeKey(members);
+  const mosaicKey = shapeKey(members, partition);
 
   const renderRow = (rowItems: Session[], rowIdx: number) => {
     const startSlot = rowIdx === 0 ? 0 : rows[0].length;
@@ -376,12 +508,20 @@ export const GroupMosaic = forwardRef<GroupMosaicHandle, GroupMosaicProps>(
               <Panel defaultSize={colSize} minSize={10}>
                 <MosaicCell
                   member={m}
-                  serverHost={server?.host}
+                  serverLabel={
+                    serverLabelMode === "name"
+                      ? server?.name ?? server?.host
+                      : server?.host
+                  }
                   slotNumber={slotNumber}
                   totalSlots={memberCount}
                   isDragging={isDragging}
                   isSource={isSource}
                   isHoverTarget={isHoverTarget}
+                  isServerHighlighted={
+                    highlightServerId !== null &&
+                    highlightServerId === m.serverId
+                  }
                   fontSize={fontSize}
                   canBumpUp={fontSize < FONT_MAX}
                   canBumpDown={fontSize > FONT_MIN}
@@ -439,12 +579,18 @@ export const GroupMosaic = forwardRef<GroupMosaicHandle, GroupMosaicProps>(
 
 interface MosaicCellProps {
   member: Session;
-  serverHost: string | undefined;
+  /** Already resolved per the user's `groupViewServerLabel` preference
+   *  (host vs. friendly name). */
+  serverLabel: string | undefined;
   slotNumber: number;
   totalSlots: number;
   isDragging: boolean;
   isSource: boolean;
   isHoverTarget: boolean;
+  /** True when the user is hovering this cell's server tile in the page
+   *  header — paints a thin translucent accent overlay so it's obvious
+   *  which terminal windows belong to which host. */
+  isServerHighlighted: boolean;
   fontSize: number;
   canBumpUp: boolean;
   canBumpDown: boolean;
@@ -461,12 +607,13 @@ interface MosaicCellProps {
 
 function MosaicCell({
   member,
-  serverHost,
+  serverLabel,
   slotNumber,
   totalSlots,
   isDragging,
   isSource,
   isHoverTarget,
+  isServerHighlighted,
   fontSize,
   canBumpUp,
   canBumpDown,
@@ -542,8 +689,8 @@ function MosaicCell({
             #{slotNumber}
           </span>
           <span className="text-mg-text-tertiary shrink-0">|</span>
-          <span className="font-mono text-mg-text truncate" title={serverHost ?? ""}>
-            {serverHost ?? "?"}
+          <span className="font-mono text-mg-text truncate" title={serverLabel ?? ""}>
+            {serverLabel ?? "?"}
           </span>
           <span className="text-mg-text-tertiary shrink-0">|</span>
           {editing ? (
@@ -668,6 +815,20 @@ function MosaicCell({
           fontSize={fontSize}
         />
       </div>
+
+      {/* Server-highlight overlay — a thin translucent wash in the
+          theme accent colour painted over the whole cell whenever the
+          user hovers this cell's server tile in the page header. No
+          text; just the colour, so it's purely a "these cells belong to
+          that server" visual cue. Pointer-events disabled so it doesn't
+          eat terminal interactions. Sits above the terminal (z-10) but
+          below the drag overlay (z-20). */}
+      {isServerHighlighted && (
+        <div
+          className="absolute inset-0 z-10 pointer-events-none bg-mg-accent/15 ring-1 ring-inset ring-mg-accent/50 transition-opacity duration-100"
+          aria-hidden
+        />
+      )}
 
       {/* Big centered slot number — only visible while a drag is active. */}
       {isDragging && (

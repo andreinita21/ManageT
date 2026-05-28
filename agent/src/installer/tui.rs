@@ -69,6 +69,9 @@ pub fn interactive_config(args: &InstallArgs) -> Result<AgentConfig> {
         server_id,
         token,
         heartbeat_interval_secs: interval_secs,
+        // Filled in by `do_install` after probing the host. Default to
+        // false here so a partial config (no probe yet) still validates.
+        gpu_present: false,
     })
 }
 

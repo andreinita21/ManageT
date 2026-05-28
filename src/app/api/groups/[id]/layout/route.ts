@@ -16,7 +16,16 @@ import { getUserLayout, saveUserLayout } from "@/lib/groups";
 
 const layoutSchema = z.object({
   rowHeights: z.array(z.number()).min(1).max(2),
-  colWidthsByRow: z.array(z.array(z.number()).min(1).max(3)).min(1).max(2),
+  // Up to 6 columns per row to accommodate single-row layouts for groups
+  // with all 6 members in one row (the new arrangement options).
+  colWidthsByRow: z.array(z.array(z.number()).min(1).max(6)).min(1).max(2),
+  // Column counts per row picked from the arrangement menu. Optional for
+  // backward compatibility with layouts written before the picker existed.
+  rowPartition: z
+    .array(z.number().int().min(1).max(6))
+    .min(1)
+    .max(2)
+    .optional(),
   // Map sessionId → font-size override. Bounded to keep an editor from
   // landing on a 200pt monstrosity that breaks layout entirely.
   fontSizeBySession: z

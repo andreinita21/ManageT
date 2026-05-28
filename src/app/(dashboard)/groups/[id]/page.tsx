@@ -30,6 +30,10 @@ import {
 import { GROUP_MAX_MEMBERS, type Server, type Session } from "@/types";
 
 import { GroupMosaic, type GroupMosaicHandle } from "./GroupMosaic";
+import {
+  LayoutPicker,
+  ServerResourceStrip,
+} from "./GroupHeaderWidgets";
 
 export default function GroupPage() {
   const params = useParams<{ id: string }>();
@@ -170,6 +174,33 @@ export default function GroupPage() {
     mosaicRef.current?.bumpAll(delta);
   };
 
+  // Which server's resource tile is currently being hovered in the
+  // header. Drives the translucent accent overlay over the matching
+  // cells in the mosaic.
+  const [highlightServerId, setHighlightServerId] = useState<string | null>(null);
+
+  // Unique servers backing this group's members, in first-appearance
+  // order so the strip's tile order stays stable across renders.
+  const uniqueServers = useMemo(() => {
+    if (!group) return [] as Server[];
+    const seen = new Set<string>();
+    const out: Server[] = [];
+    for (const m of group.members) {
+      if (seen.has(m.serverId)) continue;
+      const s = serversById.get(m.serverId);
+      if (!s) continue;
+      seen.add(m.serverId);
+      out.push(s);
+    }
+    return out;
+  }, [group, serversById]);
+
+  // Active row arrangement, sourced from GroupMosaic via callback. The
+  // mosaic owns the layout state (so its persistence debounce works);
+  // we just mirror the partition here so the LayoutPicker's "active"
+  // highlight stays in sync.
+  const [currentPartition, setCurrentPartition] = useState<number[] | null>(null);
+
   if (loading || !group) {
     return (
       <div className="flex items-center justify-center h-screen text-mg-text-tertiary text-sm">
@@ -193,8 +224,8 @@ export default function GroupPage() {
       className="flex flex-col"
       style={{ height: "100vh" }}
     >
-      <div className="flex items-center justify-between border-b border-mg-border bg-mg-bg-secondary px-4 py-2 flex-shrink-0">
-        <div className="flex items-center gap-3 min-w-0">
+      <div className="flex items-center gap-3 border-b border-mg-border bg-mg-bg-secondary px-4 py-2 flex-shrink-0">
+        <div className="flex items-center gap-3 min-w-0 shrink-0">
           <button
             type="button"
             onClick={() => router.push("/sessions")}
@@ -212,7 +243,24 @@ export default function GroupPage() {
             </p>
           </div>
         </div>
-        <div className="flex items-center gap-2">
+
+        {/* Per-server resource tiles. Sits between the title and the
+            action buttons, filling the previously-empty header space.
+            Hovering a tile highlights the matching terminals via the
+            translucent accent overlay rendered by GroupMosaic. */}
+        <div className="flex-1 min-w-0 px-2">
+          <ServerResourceStrip
+            servers={uniqueServers}
+            onHover={setHighlightServerId}
+          />
+        </div>
+
+        <div className="flex items-center gap-2 shrink-0">
+          <LayoutPicker
+            memberCount={group.members.length}
+            current={currentPartition}
+            onPick={(p) => mosaicRef.current?.setRowPartition(p)}
+          />
           {/* Group-wide font bump — only shown once the layout opens a
               second row (≥4 members), where individual panes start
               feeling cramped and a single sweep is easier than nudging
@@ -281,6 +329,8 @@ export default function GroupPage() {
           onReorderPersisted={refetchGroup}
           onRemoveMember={handleRemoveMember}
           onRenameMember={handleRenameMember}
+          highlightServerId={highlightServerId}
+          onPartitionChange={setCurrentPartition}
         />
       </div>
 

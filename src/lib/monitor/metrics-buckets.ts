@@ -40,6 +40,12 @@ export interface BucketedMetric {
   load5m: number | null;
   load15m: number | null;
   activeConnections: number | null;
+  // Bucketed thermal + fan readings. AVG of the per-sample max RPM gives
+  // a representative "fan activity" line for the bucket without
+  // collapsing per-fan detail (which the latest-sample widget covers).
+  cpuTempC: number | null;
+  gpuTempC: number | null;
+  fanMaxRpm: number | null;
 }
 
 export function fetchMetricBuckets(
@@ -72,6 +78,11 @@ export function fetchMetricBuckets(
           activeConnections: sql<number | null>`CAST(AVG(${metricSnapshots.activeConnections}) AS INTEGER)`.as(
             "active_connections"
           ),
+          cpuTempC: sql<number | null>`AVG(${metricSnapshots.cpuTempC})`.as("cpu_temp_c"),
+          gpuTempC: sql<number | null>`AVG(${metricSnapshots.gpuTempC})`.as("gpu_temp_c"),
+          fanMaxRpm: sql<number | null>`CAST(AVG(${metricSnapshots.fanMaxRpm}) AS INTEGER)`.as(
+            "fan_max_rpm"
+          ),
         })
         .from(metricSnapshots)
         .where(
@@ -97,6 +108,9 @@ export function fetchMetricBuckets(
         load5m: r.load5m,
         load15m: r.load15m,
         activeConnections: r.activeConnections,
+        cpuTempC: r.cpuTempC,
+        gpuTempC: r.gpuTempC,
+        fanMaxRpm: r.fanMaxRpm,
       }));
     },
     ["server-metrics", serverId, range, String(from), String(to)],

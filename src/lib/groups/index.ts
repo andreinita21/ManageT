@@ -22,30 +22,73 @@ import {
 
 const DEFAULT_RATIO_PRECISION = 1e-4;
 
-/** Build the default equal-split layout for a member count of `n` (1..6). */
-export function defaultLayoutForCount(n: number): GroupLayout {
-  if (n <= 0) return { rowHeights: [1], colWidthsByRow: [[]] };
-  const rows = n <= 3 ? 1 : 2;
-  const firstRow = Math.min(n, 3);
-  const secondRow = Math.max(0, n - firstRow);
-  const rowHeights = rows === 1 ? [1] : [0.5, 0.5];
-  const colWidthsByRow: number[][] =
-    rows === 1
-      ? [Array.from({ length: firstRow }, () => 1 / firstRow)]
-      : [
-          Array.from({ length: firstRow }, () => 1 / firstRow),
-          Array.from({ length: secondRow }, () => 1 / secondRow),
-        ];
-  return { rowHeights, colWidthsByRow };
+/** Default partition for a given member count — matches the legacy
+ *  3-per-row rule so existing groups don't visually shift when this
+ *  field becomes the source of truth. */
+export function defaultPartitionForCount(n: number): number[] {
+  if (n <= 0) return [];
+  if (n <= 3) return [n];
+  return [3, n - 3];
 }
 
-/** Light sanity-check on a layout payload. Returns true if `l` matches the
- *  expected shape for `memberCount` members under the 3-per-row rule. */
+/** Build the equal-split layout for a given row partition. The partition
+ *  drives both rowHeights (one per row) and colWidthsByRow (one inner
+ *  array per row, equal-weighted columns). */
+export function layoutForPartition(partition: number[]): GroupLayout {
+  if (partition.length === 0) {
+    return { rowHeights: [1], colWidthsByRow: [[]], rowPartition: [] };
+  }
+  const rowHeights = Array.from({ length: partition.length }, () => 1 / partition.length);
+  const colWidthsByRow = partition.map((cols) =>
+    Array.from({ length: cols }, () => 1 / cols)
+  );
+  return { rowHeights, colWidthsByRow, rowPartition: [...partition] };
+}
+
+/** Build the default equal-split layout for a member count of `n` (1..6). */
+export function defaultLayoutForCount(n: number): GroupLayout {
+  return layoutForPartition(defaultPartitionForCount(n));
+}
+
+/** Light sanity-check on a layout payload. The persisted `rowPartition`,
+ *  when present, takes precedence — we accept any partition that sums
+ *  to `memberCount`, has at most 2 rows, and matches the row/column
+ *  shape of `rowHeights` / `colWidthsByRow`. Layouts written before this
+ *  field existed (`rowPartition === undefined`) fall back to the legacy
+ *  3-per-row check. */
 export function isLayoutShapeValidForCount(
   l: GroupLayout,
   memberCount: number
 ): boolean {
   if (memberCount <= 0) return true;
+  const sumNear1 = (arr: number[]) =>
+    Math.abs(arr.reduce((a, b) => a + b, 0) - 1) < DEFAULT_RATIO_PRECISION;
+
+  const partition: number[] | undefined = l.rowPartition;
+  if (partition !== undefined) {
+    if (!Array.isArray(partition) || partition.length === 0 || partition.length > 2) {
+      return false;
+    }
+    if (partition.some((c) => !Number.isInteger(c) || c < 1)) return false;
+    if (partition.reduce((a, b) => a + b, 0) !== memberCount) return false;
+    if (!Array.isArray(l.rowHeights) || l.rowHeights.length !== partition.length) {
+      return false;
+    }
+    if (
+      !Array.isArray(l.colWidthsByRow) ||
+      l.colWidthsByRow.length !== partition.length
+    ) {
+      return false;
+    }
+    for (let i = 0; i < partition.length; i++) {
+      if (l.colWidthsByRow[i]?.length !== partition[i]) return false;
+    }
+    if (!sumNear1(l.rowHeights)) return false;
+    if (!l.colWidthsByRow.every(sumNear1)) return false;
+    return true;
+  }
+
+  // Legacy shape — 3-per-row.
   const rows = memberCount <= 3 ? 1 : 2;
   const firstRow = Math.min(memberCount, 3);
   const secondRow = Math.max(0, memberCount - firstRow);
@@ -54,8 +97,6 @@ export function isLayoutShapeValidForCount(
     return false;
   if (l.colWidthsByRow[0]?.length !== firstRow) return false;
   if (rows === 2 && l.colWidthsByRow[1]?.length !== secondRow) return false;
-  const sumNear1 = (arr: number[]) =>
-    Math.abs(arr.reduce((a, b) => a + b, 0) - 1) < DEFAULT_RATIO_PRECISION;
   if (!sumNear1(l.rowHeights)) return false;
   if (!l.colWidthsByRow.every(sumNear1)) return false;
   return true;

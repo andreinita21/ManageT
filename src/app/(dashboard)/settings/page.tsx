@@ -14,12 +14,13 @@ import { Table } from "@/components/ui/Table";
 import { Badge } from "@/components/ui/Badge";
 import { useToast } from "@/components/ui/Toast";
 import { AppearanceTab } from "@/components/settings/AppearanceTab";
+import { DashboardTab } from "@/components/settings/DashboardTab";
 import { ServersTab } from "@/components/settings/ServersTab";
 import type { RestartRule, CreateRestartRuleRequest, TestRestartRuleResponse } from "@/types";
 
 // Whitelist of accepted tab ids — anything else in ?tab= falls back to
 // the default. Keeps the URL→state mapping a closed set.
-const TAB_IDS = ["appearance", "servers", "rules", "test", "profile"] as const;
+const TAB_IDS = ["appearance", "dashboard", "servers", "rules", "test", "profile"] as const;
 type TabId = (typeof TAB_IDS)[number];
 const isTabId = (s: string | null): s is TabId =>
   s !== null && (TAB_IDS as readonly string[]).includes(s);
@@ -194,6 +195,7 @@ function SettingsPage() {
       <Tabs
         tabs={[
           { id: "appearance", label: "Appearance" },
+          { id: "dashboard", label: "Dashboard" },
           { id: "servers", label: "Servers", count: servers?.length ?? 0 },
           { id: "rules", label: "Restart Rules", count: rules?.length ?? 0 },
           { id: "test", label: "Test Command" },
@@ -204,6 +206,8 @@ function SettingsPage() {
       />
 
       {activeTab === "appearance" && <AppearanceTab />}
+
+      {activeTab === "dashboard" && <DashboardTab />}
 
       {activeTab === "servers" && <ServersTab />}
 

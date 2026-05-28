@@ -32,6 +32,9 @@ interface DraftState {
   terminalFontFamily: string;
   terminalFontSize: number;
   customTheme: ThemeColors;
+  /** Held in draft only so save() round-trips the value — the Dashboard
+   *  tab owns editing this field. */
+  groupViewServerLabel: AppearancePreferences["groupViewServerLabel"];
 }
 
 function prefsToDraft(prefs: AppearancePreferences): DraftState {
@@ -44,6 +47,7 @@ function prefsToDraft(prefs: AppearancePreferences): DraftState {
     terminalFontFamily: prefs.terminalFontFamily,
     terminalFontSize: prefs.terminalFontSize,
     customTheme: seed,
+    groupViewServerLabel: prefs.groupViewServerLabel,
   };
 }
 
@@ -53,6 +57,7 @@ function draftToPrefs(d: DraftState): AppearancePreferences {
     terminalFontFamily: d.terminalFontFamily,
     terminalFontSize: d.terminalFontSize,
     customTheme: d.themeKey === "custom" ? d.customTheme : null,
+    groupViewServerLabel: d.groupViewServerLabel,
   };
 }
 
