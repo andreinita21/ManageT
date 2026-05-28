@@ -670,7 +670,7 @@ function MosaicCell({
         className={`absolute inset-0 border transition-all pointer-events-none ${
           isDragging
             ? isHoverTarget
-              ? "border-mg-accent-bright shadow-[inset_0_0_18px_rgba(168,85,247,0.45)]"
+              ? "border-mg-accent-bright shadow-[inset_0_0_18px_color-mix(in_srgb,var(--color-mg-accent)_45%,transparent)]"
               : "border-mg-accent/70"
             : "border-transparent"
         }`}

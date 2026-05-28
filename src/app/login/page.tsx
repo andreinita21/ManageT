@@ -42,7 +42,7 @@ export default function LoginPage() {
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        backgroundColor: "#0a0a0f",
+        backgroundColor: "var(--color-mg-bg)",
         padding: "1rem",
       }}
     >
@@ -50,8 +50,8 @@ export default function LoginPage() {
         style={{
           width: "100%",
           maxWidth: "400px",
-          backgroundColor: "#12121a",
-          border: "1px solid #27272a",
+          backgroundColor: "var(--color-mg-bg-secondary)",
+          border: "1px solid var(--color-mg-border)",
           borderRadius: "12px",
           padding: "2.5rem 2rem",
         }}
@@ -71,7 +71,8 @@ export default function LoginPage() {
               width: "40px",
               height: "40px",
               borderRadius: "10px",
-              backgroundColor: "rgba(168, 85, 247, 0.2)",
+              backgroundColor:
+                "color-mix(in srgb, var(--color-mg-accent) 20%, transparent)",
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
@@ -82,7 +83,7 @@ export default function LoginPage() {
               height="24"
               fill="none"
               viewBox="0 0 24 24"
-              stroke="#a855f7"
+              stroke="var(--color-mg-accent)"
               strokeWidth={2}
             >
               <path
@@ -96,7 +97,7 @@ export default function LoginPage() {
             style={{
               fontSize: "1.5rem",
               fontWeight: 700,
-              color: "#e4e4e7",
+              color: "var(--color-mg-text)",
               letterSpacing: "-0.025em",
             }}
           >
@@ -107,7 +108,7 @@ export default function LoginPage() {
         <p
           style={{
             textAlign: "center",
-            color: "#a1a1aa",
+            color: "var(--color-mg-text-secondary)",
             fontSize: "0.875rem",
             marginBottom: "1.5rem",
           }}
@@ -118,12 +119,12 @@ export default function LoginPage() {
         {error && (
           <div
             style={{
-              backgroundColor: "rgba(239, 68, 68, 0.1)",
-              border: "1px solid rgba(239, 68, 68, 0.3)",
+              backgroundColor: "color-mix(in srgb, var(--color-mg-danger) 12%, transparent)",
+              border: "1px solid color-mix(in srgb, var(--color-mg-danger) 35%, transparent)",
               borderRadius: "8px",
               padding: "0.75rem 1rem",
               marginBottom: "1rem",
-              color: "#f87171",
+              color: "var(--color-mg-danger)",
               fontSize: "0.875rem",
             }}
           >
@@ -138,7 +139,7 @@ export default function LoginPage() {
                 display: "block",
                 fontSize: "0.875rem",
                 fontWeight: 500,
-                color: "#a1a1aa",
+                color: "var(--color-mg-text-secondary)",
                 marginBottom: "0.375rem",
               }}
             >
@@ -153,19 +154,19 @@ export default function LoginPage() {
               style={{
                 width: "100%",
                 padding: "0.625rem 0.75rem",
-                backgroundColor: "#1a1a2e",
-                border: "1px solid #27272a",
+                backgroundColor: "var(--color-mg-bg-tertiary)",
+                border: "1px solid var(--color-mg-border)",
                 borderRadius: "8px",
-                color: "#e4e4e7",
+                color: "var(--color-mg-text)",
                 fontSize: "0.875rem",
                 outline: "none",
                 boxSizing: "border-box",
               }}
               onFocus={(e) =>
-                (e.currentTarget.style.borderColor = "#a855f7")
+                (e.currentTarget.style.borderColor = "var(--color-mg-accent)")
               }
               onBlur={(e) =>
-                (e.currentTarget.style.borderColor = "#27272a")
+                (e.currentTarget.style.borderColor = "var(--color-mg-border)")
               }
             />
           </div>
@@ -176,7 +177,7 @@ export default function LoginPage() {
                 display: "block",
                 fontSize: "0.875rem",
                 fontWeight: 500,
-                color: "#a1a1aa",
+                color: "var(--color-mg-text-secondary)",
                 marginBottom: "0.375rem",
               }}
             >
@@ -191,19 +192,19 @@ export default function LoginPage() {
               style={{
                 width: "100%",
                 padding: "0.625rem 0.75rem",
-                backgroundColor: "#1a1a2e",
-                border: "1px solid #27272a",
+                backgroundColor: "var(--color-mg-bg-tertiary)",
+                border: "1px solid var(--color-mg-border)",
                 borderRadius: "8px",
-                color: "#e4e4e7",
+                color: "var(--color-mg-text)",
                 fontSize: "0.875rem",
                 outline: "none",
                 boxSizing: "border-box",
               }}
               onFocus={(e) =>
-                (e.currentTarget.style.borderColor = "#a855f7")
+                (e.currentTarget.style.borderColor = "var(--color-mg-accent)")
               }
               onBlur={(e) =>
-                (e.currentTarget.style.borderColor = "#27272a")
+                (e.currentTarget.style.borderColor = "var(--color-mg-border)")
               }
             />
           </div>
@@ -214,7 +215,7 @@ export default function LoginPage() {
             style={{
               width: "100%",
               padding: "0.625rem",
-              backgroundColor: loading ? "#7c3aed" : "#a855f7",
+              backgroundColor: loading ? "var(--color-mg-accent-dim)" : "var(--color-mg-accent)",
               color: "#fff",
               fontWeight: 600,
               fontSize: "0.875rem",
@@ -225,10 +226,10 @@ export default function LoginPage() {
               transition: "background-color 0.2s, opacity 0.2s",
             }}
             onMouseEnter={(e) => {
-              if (!loading) e.currentTarget.style.backgroundColor = "#c084fc";
+              if (!loading) e.currentTarget.style.backgroundColor = "var(--color-mg-accent-bright)";
             }}
             onMouseLeave={(e) => {
-              if (!loading) e.currentTarget.style.backgroundColor = "#a855f7";
+              if (!loading) e.currentTarget.style.backgroundColor = "var(--color-mg-accent)";
             }}
           >
             {loading ? "Signing in..." : "Sign In"}

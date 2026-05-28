@@ -32,6 +32,7 @@ import {
 import {
   DEFAULT_PREFERENCES,
   resolveColors,
+  UI_CSS_VAR_MAP,
   type AppearancePreferences,
   type ThemeColors,
   type UiPalette,
@@ -68,31 +69,11 @@ interface AppearanceContextValue {
 
 const AppearanceContext = createContext<AppearanceContextValue | null>(null);
 
-const UI_VAR_MAP: Record<keyof UiPalette, string> = {
-  bg: "--color-mg-bg",
-  bgSecondary: "--color-mg-bg-secondary",
-  bgTertiary: "--color-mg-bg-tertiary",
-  bgHover: "--color-mg-bg-hover",
-  bgActive: "--color-mg-bg-active",
-  accent: "--color-mg-accent",
-  accentBright: "--color-mg-accent-bright",
-  accentDim: "--color-mg-accent-dim",
-  text: "--color-mg-text",
-  textSecondary: "--color-mg-text-secondary",
-  textTertiary: "--color-mg-text-tertiary",
-  border: "--color-mg-border",
-  borderHover: "--color-mg-border-hover",
-  success: "--color-mg-success",
-  warning: "--color-mg-warning",
-  danger: "--color-mg-danger",
-  info: "--color-mg-info",
-};
-
 function applyUiPalette(palette: UiPalette): void {
   if (typeof document === "undefined") return;
   const root = document.documentElement;
-  for (const k of Object.keys(UI_VAR_MAP) as (keyof UiPalette)[]) {
-    root.style.setProperty(UI_VAR_MAP[k], palette[k]);
+  for (const k of Object.keys(UI_CSS_VAR_MAP) as (keyof UiPalette)[]) {
+    root.style.setProperty(UI_CSS_VAR_MAP[k], palette[k]);
   }
   // Also update the hard-coded fallbacks on `html`/`body` from
   // globals.css so the first frame after a preset change repaints
@@ -101,16 +82,31 @@ function applyUiPalette(palette: UiPalette): void {
   root.style.color = palette.text;
 }
 
-export function ThemeProvider({ children }: { children: ReactNode }) {
+export function ThemeProvider({
+  children,
+  initialPrefs,
+}: {
+  children: ReactNode;
+  /** Preferences resolved server-side and seeded into the first render
+   *  so the client never paints the default purple palette before the
+   *  user's theme loads. When present we skip the loading state and the
+   *  mount effect applies *these* vars (matching the SSR-injected
+   *  <style>) instead of the defaults. */
+  initialPrefs?: AppearancePreferences;
+}) {
   // Persisted prefs (server source of truth) and an optional preview
   // override applied locally while the user is mid-edit. Keeping them
   // separate is what prevents the AppearanceTab's "live preview" from
   // looking like an external prefs update and triggering its own
   // sync-effect — that's the loop that produced the
   // "Maximum update depth exceeded" error.
-  const [prefs, setPrefs] = useState<AppearancePreferences>(DEFAULT_PREFERENCES);
+  const [prefs, setPrefs] = useState<AppearancePreferences>(
+    initialPrefs ?? DEFAULT_PREFERENCES
+  );
   const [previewOverride, setPreviewOverride] = useState<AppearancePreferences | null>(null);
-  const [loading, setLoading] = useState<boolean>(true);
+  // When the layout already handed us the user's prefs there's nothing
+  // to wait for — start un-loading so consumers don't flash a spinner.
+  const [loading, setLoading] = useState<boolean>(!initialPrefs);
 
   const active = previewOverride ?? prefs;
   const colors = useMemo(() => resolveColors(active), [active]);
