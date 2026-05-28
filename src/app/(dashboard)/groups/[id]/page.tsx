@@ -203,7 +203,7 @@ export default function GroupPage() {
 
   if (loading || !group) {
     return (
-      <div className="flex items-center justify-center h-screen text-mg-text-tertiary text-sm">
+      <div className="flex items-center justify-center h-full text-mg-text-tertiary text-sm">
         Loading group…
       </div>
     );
@@ -220,10 +220,8 @@ export default function GroupPage() {
   const atCap = group.members.length >= GROUP_MAX_MEMBERS;
 
   return (
-    <div
-      className="flex flex-col"
-      style={{ height: "100vh" }}
-    >
+    <div className="flex flex-col h-full">
+
       <div className="flex items-center gap-3 border-b border-mg-border bg-mg-bg-secondary px-4 py-2 flex-shrink-0">
         <div className="flex items-center gap-3 min-w-0 shrink-0">
           <button

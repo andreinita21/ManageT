@@ -126,10 +126,11 @@ export function SidebarLayout({ children }: { children: React.ReactNode }) {
   }, [activeIndex, sidebarCollapsed]);
 
   return (
-    <div className="flex h-screen overflow-hidden">
-      {/* Sidebar */}
+    <div className="flex flex-col md:flex-row h-[100dvh] overflow-hidden">
+      {/* Desktop sidebar — hidden on phones, where the bottom nav takes
+          over (see the <nav> at the end of this component). */}
       <aside
-        className={`flex flex-col bg-mg-bg-secondary border-r border-mg-border transition-all duration-200 ${
+        className={`hidden md:flex flex-col bg-mg-bg-secondary border-r border-mg-border transition-all duration-200 ${
           sidebarCollapsed ? "w-16" : "w-60"
         }`}
       >
@@ -240,8 +241,31 @@ export function SidebarLayout({ children }: { children: React.ReactNode }) {
         </div>
       </aside>
 
+      {/* Mobile top bar — branding + Sign Out. The sidebar (which owns
+          both on desktop) is hidden on phones, so without this there'd
+          be no way to sign out on mobile. */}
+      <header className="md:hidden flex items-center justify-between h-14 px-4 border-b border-mg-border bg-mg-bg-secondary flex-shrink-0">
+        <Link href="/dashboard" className="flex items-center gap-2" title="Go to dashboard">
+          <div className="w-8 h-8 rounded-lg bg-mg-accent/20 flex items-center justify-center flex-shrink-0">
+            <svg className="w-5 h-5 text-mg-accent" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+            </svg>
+          </div>
+          <span className="text-lg font-bold text-mg-text tracking-tight">ManageT</span>
+        </Link>
+        <button
+          onClick={() => signOut({ callbackUrl: "/login" })}
+          className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-mg-text-tertiary hover:text-mg-danger hover:bg-mg-bg-hover transition-all duration-200"
+        >
+          <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+          </svg>
+          <span className="text-xs">Sign Out</span>
+        </button>
+      </header>
+
       {/* Main content */}
-      <div className="flex-1 flex flex-col overflow-hidden">
+      <div className="flex-1 flex flex-col overflow-hidden min-w-0">
         {/* Page content */}
         {/* /stacks and /groups own their own padding because they can split
             into a table + terminal mosaic layout that needs to fill the
@@ -252,12 +276,42 @@ export function SidebarLayout({ children }: { children: React.ReactNode }) {
             pathname.startsWith("/stacks") ||
             pathname.startsWith("/groups")
               ? ""
-              : "p-6"
+              : "p-4 md:p-6"
           }`}
         >
           {children}
         </main>
       </div>
+
+      {/* Mobile bottom nav — the phone equivalent of the desktop
+          sidebar. Each item is an icon + label; the active route is
+          tinted with the accent and gets a short top bar. The
+          safe-area inset keeps the tappable row clear of the iOS home
+          indicator. */}
+      <nav className="md:hidden flex items-stretch border-t border-mg-border bg-mg-bg-secondary pb-[env(safe-area-inset-bottom)] flex-shrink-0">
+        {navItems.map((item) => {
+          const active = isActive(item);
+          return (
+            <Link
+              key={item.href}
+              href={item.href}
+              aria-current={active ? "page" : undefined}
+              className={`relative flex-1 flex flex-col items-center justify-center gap-1 py-2 text-[10px] font-medium transition-colors duration-200 ${
+                active ? "text-mg-accent" : "text-mg-text-tertiary hover:text-mg-text"
+              }`}
+            >
+              {active && (
+                <span
+                  aria-hidden
+                  className="absolute top-0 left-1/2 -translate-x-1/2 h-0.5 w-8 rounded-full bg-mg-accent"
+                />
+              )}
+              {item.icon}
+              <span>{item.label}</span>
+            </Link>
+          );
+        })}
+      </nav>
     </div>
   );
 }

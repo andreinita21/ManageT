@@ -8,6 +8,7 @@ import { z } from "zod";
 
 import { auth } from "@/lib/auth";
 import {
+  cleanupAllEmptyGroups,
   createGroupWithFirstMember,
   GroupConstraintError,
   listGroups,
@@ -23,6 +24,9 @@ export async function GET() {
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
+  // Opportunistically sweep groups whose last live member has gone
+  // (all-closed or truly empty) so orphans don't linger in the list.
+  await cleanupAllEmptyGroups();
   const data = await listGroups();
   return NextResponse.json({ data });
 }

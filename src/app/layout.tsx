@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Inter, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 import { SidebarLayout } from "@/components/SidebarLayout";
@@ -21,6 +21,15 @@ const jetbrains = JetBrains_Mono({
 export const metadata: Metadata = {
   title: "ManageT — Server Management Terminal",
   description: "SSH terminal manager with session recovery and monitoring",
+};
+
+// viewportFit: "cover" lets the layout extend under the iOS notch/home
+// indicator so `env(safe-area-inset-*)` returns real values — the
+// mobile bottom nav uses that inset for its bottom padding.
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
 };
 
 export default async function RootLayout({

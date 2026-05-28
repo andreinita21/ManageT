@@ -8,7 +8,7 @@
  * the moment their last member leaves.
  */
 import { v4 as uuidv4 } from "uuid";
-import { and, asc, eq, isNull } from "drizzle-orm";
+import { and, asc, eq, isNull, ne } from "drizzle-orm";
 
 import { db } from "@/lib/db";
 import { groupLayouts, groups, sessions } from "@/lib/db/schema";
@@ -103,10 +103,14 @@ export function isLayoutShapeValidForCount(
 }
 
 async function membersOf(groupId: string): Promise<Session[]> {
+  // Closed sessions are excluded: a dead PTY is no longer a terminal in
+  // the group. They lose their groupId on close (see
+  // detachFromGroupOnClose), but we also filter here so any legacy
+  // zombie row never shows in the mosaic or inflates the count.
   const rows = await db
     .select()
     .from(sessions)
-    .where(eq(sessions.groupId, groupId))
+    .where(and(eq(sessions.groupId, groupId), ne(sessions.status, "closed")))
     .orderBy(asc(sessions.groupOrderIndex));
   return rows.map(rowToSession);
 }
@@ -159,7 +163,8 @@ export async function listGroups(): Promise<Group[]> {
     .orderBy(asc(sessions.groupOrderIndex));
   const byGroup = new Map<string, Session[]>();
   for (const r of memberRows) {
-    if (!r.groupId) continue;
+    // Skip ungrouped and closed (dead) sessions — see membersOf.
+    if (!r.groupId || r.status === "closed") continue;
     const list = byGroup.get(r.groupId) ?? [];
     list.push(rowToSession(r));
     byGroup.set(r.groupId, list);
@@ -233,7 +238,7 @@ async function assertGroupHasRoom(groupId: string): Promise<void> {
   const memberRows = await db
     .select({ id: sessions.id })
     .from(sessions)
-    .where(eq(sessions.groupId, groupId));
+    .where(and(eq(sessions.groupId, groupId), ne(sessions.status, "closed")));
   if (memberRows.length >= GROUP_MAX_MEMBERS) {
     throw new GroupConstraintError(
       `Group is at the ${GROUP_MAX_MEMBERS}-terminal cap`,
@@ -290,8 +295,23 @@ export async function renameGroup(
 }
 
 export async function deleteGroup(groupId: string): Promise<void> {
-  // FK on sessions.groupId is ON DELETE SET NULL — members become
-  // free-standing rather than getting killed. Layout rows cascade.
+  // Detach every session still pointing at this group (including closed
+  // ones) BEFORE removing the group row. The live DB's
+  // `sessions.group_id` FK was added via `ALTER TABLE ... ADD` without
+  // an ON DELETE action, so with foreign_keys enforcement on, deleting
+  // a group that still has referencing rows raises
+  // SQLITE_CONSTRAINT_FOREIGNKEY. Nulling first makes the delete always
+  // succeed and leaves the members free-standing (their shells keep
+  // running) — the intended behaviour the schema's `onDelete: "set
+  // null"` was meant to provide.
+  const now = Date.now();
+  await db
+    .update(sessions)
+    .set({ groupId: null, groupOrderIndex: 0, updatedAt: now })
+    .where(eq(sessions.groupId, groupId));
+  // group_layouts is declared ON DELETE CASCADE, but delete explicitly
+  // so cleanup doesn't depend on the FK pragma being enabled.
+  await db.delete(groupLayouts).where(eq(groupLayouts.groupId, groupId));
   await db.delete(groups).where(eq(groups.id, groupId));
 }
 
@@ -427,10 +447,14 @@ export async function cleanupEmptyGroupIfNeeded(
     .where(eq(groups.id, groupId))
     .limit(1);
   if (exists.length === 0) return false;
+  // "Empty" means no *live* members. A group whose only remaining
+  // members are closed PTYs should auto-delete just like one with zero
+  // rows — matching the rule that a group disappears once it has no
+  // terminal left in it.
   const members = await db
     .select({ id: sessions.id })
     .from(sessions)
-    .where(eq(sessions.groupId, groupId))
+    .where(and(eq(sessions.groupId, groupId), ne(sessions.status, "closed")))
     .limit(1);
   if (members.length > 0) return false;
   await deleteGroup(groupId);

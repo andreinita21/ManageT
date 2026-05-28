@@ -18,12 +18,12 @@ interface TabsProps {
 
 export function Tabs({ tabs, activeTab, onChange, className = "" }: TabsProps) {
   return (
-    <div className={`flex items-center gap-1 border-b border-mg-border ${className}`}>
+    <div className={`flex items-center gap-1 border-b border-mg-border overflow-x-auto ${className}`}>
       {tabs.map((tab) => (
         <button
           key={tab.id}
           onClick={() => onChange(tab.id)}
-          className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium transition-all duration-200 border-b-2 -mb-px ${
+          className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium whitespace-nowrap shrink-0 transition-all duration-200 border-b-2 -mb-px ${
             activeTab === tab.id
               ? "text-mg-accent border-mg-accent"
               : "text-mg-text-secondary border-transparent hover:text-mg-text hover:border-mg-border-hover"

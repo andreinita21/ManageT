@@ -45,6 +45,29 @@ import {
   type AttachedHandle,
 } from "./agent-socket";
 
+/** Detach a session from any group it belongs to and auto-delete that
+ *  group if it's left empty. Called whenever a session transitions to
+ *  `closed`: a dead PTY is no longer a terminal the group should count,
+ *  render in the mosaic, or be kept alive by. Without this, closed
+ *  sessions keep their `groupId` — so the group reports a stale member
+ *  count (e.g. "2/6"), the rows are hidden from the sessions list
+ *  (which excludes closed), and the mosaic tries to attach to PTYs the
+ *  agent no longer has. No-op when the session isn't grouped. */
+async function detachFromGroupOnClose(sessionId: string): Promise<void> {
+  const rows = await db
+    .select({ groupId: sessions.groupId })
+    .from(sessions)
+    .where(eq(sessions.id, sessionId))
+    .limit(1);
+  const groupId = rows[0]?.groupId ?? null;
+  if (!groupId) return;
+  await db
+    .update(sessions)
+    .set({ groupId: null, groupOrderIndex: 0, updatedAt: Date.now() })
+    .where(eq(sessions.id, sessionId));
+  await cleanupEmptyGroupIfNeeded(groupId);
+}
+
 /** Options accepted when creating a session through the dashboard. */
 export interface CreateOptions {
   command?: string;
@@ -143,6 +166,7 @@ export async function attachSession(
         .update(sessions)
         .set({ status: "closed", updatedAt: Date.now() })
         .where(eq(sessions.id, sessionId));
+      await detachFromGroupOnClose(sessionId);
       return null;
     }
     throw err;
@@ -307,6 +331,7 @@ export async function reconcileServer(serverId: string): Promise<Session[]> {
           .update(sessions)
           .set({ status: desiredStatus, updatedAt: now })
           .where(eq(sessions.id, s.id));
+        if (desiredStatus === "closed") await detachFromGroupOnClose(s.id);
       }
     }
   }
@@ -318,6 +343,7 @@ export async function reconcileServer(serverId: string): Promise<Session[]> {
         .update(sessions)
         .set({ status: "closed", updatedAt: now })
         .where(eq(sessions.id, row.id));
+      await detachFromGroupOnClose(row.id);
     }
   }
 
