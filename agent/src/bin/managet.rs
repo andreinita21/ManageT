@@ -17,7 +17,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use managet_agent::cli::ServiceAction;
-use managet_agent::{service, sessions};
+use managet_agent::{cli_dashboard, service, sessions};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -35,6 +35,30 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Authenticate this local CLI with the ManageT dashboard.
+    Login {
+        /// Dashboard base URL, e.g. https://managet.example.com.
+        #[arg(long, env = "MANAGET_API_URL")]
+        api_url: Option<String>,
+
+        /// Dashboard username. Prompted when omitted.
+        #[arg(short, long)]
+        username: Option<String>,
+
+        /// Dashboard password. Prefer the prompt; this exists for automation.
+        #[arg(long, env = "MANAGET_PASSWORD", hide = true, hide_env_values = true)]
+        password: Option<String>,
+    },
+
+    /// List terminal groups from the dashboard.
+    Groups,
+
+    /// Open or modify a dashboard terminal group from this CLI.
+    Group {
+        #[command(subcommand)]
+        action: GroupAction,
+    },
+
     /// List active terminal sessions managed by this host's agent.
     Ls,
 
@@ -91,6 +115,52 @@ enum Command {
     Restart,
 }
 
+#[derive(Debug, Subcommand)]
+enum GroupAction {
+    /// Attach to a group as a multi-pane terminal view (alias: open).
+    /// Detach with Ctrl-A d, just like a single-session attach.
+    #[command(alias = "open")]
+    Attach {
+        /// Group id, unique prefix, or exact group name.
+        id: String,
+    },
+
+    /// Save a browser-compatible row arrangement such as 2+2 or 1+3.
+    Layout {
+        /// Group id, unique prefix, or exact group name.
+        id: String,
+        /// Row arrangement. Examples: 2+2, 1+3, 3+1, 4.
+        arrangement: String,
+    },
+
+    /// Swap two pane slots and persist the new order for the browser too.
+    Swap {
+        /// Group id, unique prefix, or exact group name.
+        id: String,
+        /// First 1-based slot number.
+        from: usize,
+        /// Second 1-based slot number.
+        to: usize,
+    },
+
+    /// Add a new terminal to a group. With no `--server`, opens an
+    /// interactive picker listing every server on your dashboard
+    /// account (friendly name + host).
+    Add {
+        /// Group id, unique prefix, or exact group name.
+        id: String,
+        /// Server name, host, or id. Skips the picker when given.
+        #[arg(short, long)]
+        server: Option<String>,
+        /// Friendly name for the new session.
+        #[arg(short, long)]
+        name: Option<String>,
+        /// Command to run in the session (default: server's $SHELL).
+        #[arg(short, long)]
+        command: Option<String>,
+    },
+}
+
 fn init_tracing() {
     // Quieter than the agent's default — `managet` is interactive, the
     // user doesn't want INFO logs by default. Only honour RUST_LOG if
@@ -110,8 +180,35 @@ async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     match cli.command {
-        Command::Ls => sessions::client::run_ls().await,
-        Command::New { name, name_flag, command, no_attach } => {
+        Command::Login {
+            api_url,
+            username,
+            password,
+        } => cli_dashboard::run_login(api_url, username, password).await,
+        Command::Groups => cli_dashboard::run_group_list().await,
+        Command::Group { action } => match action {
+            GroupAction::Attach { id } => cli_dashboard::run_group_open(id).await,
+            GroupAction::Layout { id, arrangement } => {
+                cli_dashboard::run_group_layout(id, arrangement).await
+            }
+            GroupAction::Swap { id, from, to } => cli_dashboard::run_group_swap(id, from, to).await,
+            GroupAction::Add {
+                id,
+                server,
+                name,
+                command,
+            } => cli_dashboard::run_group_add(id, server, name, command).await,
+        },
+        Command::Ls => {
+            sessions::client::run_ls().await?;
+            cli_dashboard::print_groups_section().await
+        }
+        Command::New {
+            name,
+            name_flag,
+            command,
+            no_attach,
+        } => {
             let resolved = name.or(name_flag);
             sessions::client::run_new(resolved, command, no_attach).await
         }

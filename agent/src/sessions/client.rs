@@ -15,6 +15,7 @@ use std::io::{IsTerminal, Write};
 use std::os::fd::AsRawFd;
 
 use anyhow::{anyhow, Context, Result};
+use crossterm::style::Stylize;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::signal::unix::{signal, SignalKind};
@@ -23,7 +24,11 @@ use super::bar::StatusBar;
 use super::protocol::{Request, Response};
 use super::server::socket_path;
 
-/// `managet ls` — print the active sessions in a small table.
+/// `managet ls` — print the active local sessions as a colored,
+/// section-headed block. The "Group sessions" section is printed by the
+/// dashboard CLI module after this returns; keeping the two halves
+/// separate means hosts that have never logged into the dashboard still
+/// get a useful local listing.
 pub async fn run_ls() -> Result<()> {
     let resp = round_trip(&Request::List).await?;
     let sessions = match resp {
@@ -31,27 +36,47 @@ pub async fn run_ls() -> Result<()> {
         Response::Error { message } => return Err(anyhow!(message)),
         other => return Err(anyhow!("unexpected response: {other:?}")),
     };
+
+    println!("{}", "Individual sessions".cyan().bold());
     if sessions.is_empty() {
-        println!("(no sessions — start one with `managet new`)");
+        println!(
+            "  {}",
+            "(none — start one with `managet new`)".dark_grey()
+        );
         return Ok(());
     }
-    println!("{:<10}  {:<20}  {:<24}  {}", "ID", "NAME", "AGE", "STATUS");
+
     let now = chrono_now_ms();
+    let name_width = sessions
+        .iter()
+        .map(|s| s.name.chars().count().min(28))
+        .max()
+        .unwrap_or(20)
+        .max(20);
+
     for s in &sessions {
         let age = format_age(now.saturating_sub(s.created_at_ms));
-        let status = if !s.running {
-            "exited".to_string()
+        let (bullet, status_styled) = if !s.running {
+            ("✗", "exited".to_string().red())
         } else if s.attached_clients > 0 {
-            format!("attached×{}", s.attached_clients)
+            (
+                "●",
+                format!("attached×{}", s.attached_clients).green(),
+            )
         } else {
-            "detached".to_string()
+            ("○", "detached".to_string().yellow())
         };
+        // Pad before styling — ANSI sequences would otherwise throw the
+        // column widths off.
+        let name_col = pad_visible(&truncate(&s.name, name_width), name_width);
+        let age_col = pad_visible(&age, 10);
         println!(
-            "{:<10}  {:<20}  {:<24}  {}",
-            short_id(&s.id),
-            truncate(&s.name, 20),
-            age,
-            status
+            "  {bullet} {name}  {age}  {status}  {hint}",
+            bullet = bullet.green(),
+            name = name_col.white().bold(),
+            age = age_col.dark_grey(),
+            status = status_styled,
+            hint = format!("[{}]", short_id(&s.id)).dark_grey(),
         );
     }
     Ok(())
@@ -443,10 +468,26 @@ fn short_id(id: &str) -> String {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max - 1])
+        let head = s.chars().take(max.saturating_sub(1)).collect::<String>();
+        format!("{head}…")
+    }
+}
+
+/// Right-pad a string with spaces so its visible (character) width is
+/// at least `width`. Used to keep colored columns aligned — coloring
+/// happens *after* padding so the ANSI escape codes don't get counted.
+fn pad_visible(s: &str, width: usize) -> String {
+    let len = s.chars().count();
+    if len >= width {
+        s.to_string()
+    } else {
+        let mut out = String::with_capacity(s.len() + (width - len));
+        out.push_str(s);
+        out.push_str(&" ".repeat(width - len));
+        out
     }
 }
 

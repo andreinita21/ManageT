@@ -39,6 +39,7 @@ import { StringDecoder } from "node:string_decoder";
 import { eq } from "drizzle-orm";
 import { getToken } from "next-auth/jwt";
 
+import { extractBearerToken, getUserIdForCliToken } from "@/lib/cli-auth/token";
 import { db } from "@/lib/db";
 import { servers, sessions } from "@/lib/db/schema";
 import {
@@ -510,6 +511,11 @@ function handleDisconnect(ws: WebSocket): void {
  * function returns `null` and the upgrade is refused. Fail-closed.
  */
 async function extractUserId(req: IncomingMessage): Promise<string | null> {
+  const bearer = extractBearerToken(req.headers.authorization);
+  if (bearer) {
+    return getUserIdForCliToken(bearer);
+  }
+
   const secret = process.env.AUTH_SECRET ?? process.env.NEXTAUTH_SECRET;
   if (!secret) {
     // Server is misconfigured; refusing the upgrade is the safest
@@ -597,6 +603,7 @@ export type _SessionForAttach = Session;
 function isOriginAllowed(req: IncomingMessage): boolean {
   const origin = req.headers.origin;
   if (!origin) {
+    if (extractBearerToken(req.headers.authorization)) return true;
     return process.env.WS_ALLOW_NO_ORIGIN === "1";
   }
   let originHost: string;

@@ -15,6 +15,18 @@ export const users = sqliteTable("users", {
   updatedAt: integer("updated_at").notNull(),
 });
 
+export const userCliTokens = sqliteTable("user_cli_tokens", {
+  id: text("id").primaryKey(),
+  userId: text("user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  tokenHash: text("token_hash").notNull().unique(),
+  createdAt: integer("created_at").notNull(),
+  lastUsedAt: integer("last_used_at"),
+  revokedAt: integer("revoked_at"),
+});
+
 export const servers = sqliteTable("servers", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
