@@ -194,7 +194,7 @@ managet new build -c "cargo watch -x test" --no-attach   # spawn, stay put
 | **`-c "<cmd>"`** | Runs `<cmd>` inside the new session, then drops into your login shell so the session stays alive after `<cmd>` exits. |
 | **No name argument** | Auto-generated `session-<short-id>`. |
 | **Working directory** | The new session starts in **the directory you ran `managet new` from**, not in `$HOME`. |
-| **User identity** | The session runs as **you** (the invoking user), not as root — even though the agent itself runs as root. The drop is via `su -l <you> --session-command …` so PAM env + a real login shell + full job control all come along for the ride. |
+| **User identity** | The session runs as **you** (the invoking user), not as root — even though the agent itself runs as root. The drop is via `su -l <you> ...` using the platform's supported command form, so PAM env + a real login shell + full job control all come along for the ride. |
 
 The legacy `-n / --name` long flag is still accepted (e.g. `managet new -n foo`) so older scripts keep working, but new invocations don't need it.
 

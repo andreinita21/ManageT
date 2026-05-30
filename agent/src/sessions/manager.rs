@@ -394,7 +394,7 @@ impl SessionManager {
         //
         // User switching: portable-pty's `CommandBuilder` doesn't expose
         // any `pre_exec`/uid hook, so we can't `setuid()` ourselves
-        // between fork and exec. Instead we exec `su -l <user> [-c ...]`,
+        // between fork and exec. Instead we exec `su -l <user> ...`,
         // which (when invoked as root) does the UID/GID drop + login
         // environment setup for us. `-l` makes it a login shell that
         // sources .bash_profile/.profile, sets HOME/USER/LOGNAME/SHELL,
@@ -440,45 +440,37 @@ impl SessionManager {
                 // drop into their login shell so the session stays alive
                 // after the command exits.
                 //
-                // `--session-command` (util-linux) keeps the existing
-                // session — same as `-c` but does NOT call setsid().
-                // Without this the inner bash loses its controlling
-                // terminal across the su call ("cannot set terminal
-                // process group: Inappropriate ioctl for device" /
-                // "no job control in this shell"). Job control is
-                // essential — without it Ctrl+C, suspend, fg/bg, etc.
-                // all break.
                 let user_shell = if u.shell.as_os_str().is_empty() {
                     "/bin/sh".to_string()
                 } else {
                     u.shell.to_string_lossy().into_owned()
                 };
-                let chained = format!("{cd_prefix}{cmd_str}; exec {user_shell} -l");
-                format!(
-                    "su -l {user} --session-command {payload}",
-                    user = shell_single_quote(&u.name),
-                    payload = shell_single_quote(&chained),
-                )
+                let chained = format!(
+                    "{cd_prefix}{cmd_str}; exec {user_shell} -l",
+                    user_shell = shell_single_quote(&user_shell),
+                );
+                su_login_command(&u.name, &chained)
             }
             (Some(u), None) => {
-                // Interactive shell as the target user. Same `su -l …
-                // --session-command` plumbing as above so the cwd takes
-                // effect and the controlling terminal is preserved.
+                // Interactive shell as the target user. Same `su -l ...`
+                // plumbing as above so the cwd takes effect.
                 let user_shell = if u.shell.as_os_str().is_empty() {
                     "/bin/sh".to_string()
                 } else {
                     u.shell.to_string_lossy().into_owned()
                 };
                 let chained = if cd_prefix.is_empty() {
-                    format!("exec {user_shell} -l")
+                    format!(
+                        "exec {user_shell} -l",
+                        user_shell = shell_single_quote(&user_shell),
+                    )
                 } else {
-                    format!("{cd_prefix}exec {user_shell} -l")
+                    format!(
+                        "{cd_prefix}exec {user_shell} -l",
+                        user_shell = shell_single_quote(&user_shell),
+                    )
                 };
-                format!(
-                    "su -l {user} --session-command {payload}",
-                    user = shell_single_quote(&u.name),
-                    payload = shell_single_quote(&chained),
-                )
+                su_login_command(&u.name, &chained)
             }
             (None, Some(cmd_str)) => {
                 // `<shell> -c "<cmd_str>; exec <shell>"` — run the command,
@@ -833,6 +825,26 @@ fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
 }
 
+fn su_login_command(user: &str, payload: &str) -> String {
+    build_su_login_command(user, payload, cfg!(target_os = "linux"))
+}
+
+fn build_su_login_command(user: &str, payload: &str, use_session_command: bool) -> String {
+    let user = shell_single_quote(user);
+    let payload = shell_single_quote(payload);
+    if use_session_command {
+        // util-linux `su -c` calls setsid(), which can leave the inner shell
+        // without job control on a PTY. `--session-command` keeps the current
+        // session, but it is a GNU extension and must not be sent to BSD su.
+        format!("su -l {user} --session-command {payload}")
+    } else {
+        // BSD/macOS `su` accepts arguments after the login name as arguments
+        // for the user's shell. Passing GNU's long option there makes zsh try
+        // to parse `--session-command` and fail with "no such option".
+        format!("su -l {user} -c {payload}")
+    }
+}
+
 /// Single-quote a value for safe interpolation into a `sh -c` snippet.
 /// Wraps in `'…'`; any embedded single quotes are escaped via `'\''`.
 fn shell_single_quote(s: &str) -> String {
@@ -847,4 +859,33 @@ fn shell_single_quote(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_su_login_command;
+
+    #[test]
+    fn builds_linux_su_command_with_session_command() {
+        assert_eq!(
+            build_su_login_command("andrei", "exec /bin/zsh -l", true),
+            "su -l 'andrei' --session-command 'exec /bin/zsh -l'"
+        );
+    }
+
+    #[test]
+    fn builds_bsd_su_command_with_shell_c_argument() {
+        assert_eq!(
+            build_su_login_command("andrei", "exec /bin/zsh -l", false),
+            "su -l 'andrei' -c 'exec /bin/zsh -l'"
+        );
+    }
+
+    #[test]
+    fn quotes_su_user_and_payload() {
+        assert_eq!(
+            build_su_login_command("o'brien", "echo 'hi'", false),
+            "su -l 'o'\\''brien' -c 'echo '\\''hi'\\'''"
+        );
+    }
 }
