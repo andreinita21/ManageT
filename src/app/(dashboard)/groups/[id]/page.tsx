@@ -66,6 +66,62 @@ export default function GroupPage() {
     }
   }, [loading, group, router, toast]);
 
+  // Subscribe to the dashboard WS for `group:changed` pushes. The CLI
+  // and other browser tabs mutate the group via REST; the server then
+  // broadcasts so this view refetches without a manual reload. Plain
+  // `new WebSocket` here (not the xterm hook) — we only need one-way
+  // notifications, no PTY plumbing.
+  useEffect(() => {
+    if (!groupId) return;
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const url = `${proto}//${window.location.host}/api/ws`;
+    let ws: WebSocket | null = null;
+    let closed = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const connect = () => {
+      try {
+        ws = new WebSocket(url);
+      } catch {
+        return;
+      }
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data as string) as {
+            type?: string;
+            groupId?: string;
+          };
+          if (msg.type === "group:changed" && msg.groupId === groupId) {
+            void refetchGroup();
+            void refetchSessions();
+          }
+        } catch {
+          /* unrelated frame */
+        }
+      };
+      ws.onclose = () => {
+        if (!closed) retryTimer = setTimeout(connect, 2000);
+      };
+      ws.onerror = () => {
+        try {
+          ws?.close();
+        } catch {
+          /* fall through to onclose */
+        }
+      };
+    };
+    connect();
+    return () => {
+      closed = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      try {
+        ws?.close();
+      } catch {
+        /* socket already torn down */
+      }
+    };
+  }, [groupId, refetchGroup, refetchSessions]);
+
   // Open the rename modal pre-populated with the current name.
   useEffect(() => {
     if (renaming && group) setRenameValue(group.name);

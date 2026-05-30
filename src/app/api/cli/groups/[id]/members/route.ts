@@ -20,6 +20,7 @@ import { sessions, servers } from "@/lib/db/schema";
 import { rowToSession } from "@/lib/db/transform";
 import { addMember, GroupConstraintError } from "@/lib/groups";
 import { createSession } from "@/lib/ssh/session-manager";
+import { broadcastToAll } from "@/lib/ws";
 
 const bodySchema = z.object({
   serverId: z.string().min(1),
@@ -126,6 +127,10 @@ export async function POST(
       .from(sessions)
       .where(eq(sessions.id, created.sessionId))
       .limit(1);
+    // Push to every connected WebSocket so any open browser tab
+    // viewing this group (or its sessions list) refetches without the
+    // user having to reload.
+    broadcastToAll({ type: "group:changed", groupId });
     return NextResponse.json(
       { data: { session: rowToSession(sessionRows[0]), group } },
       { status: 201 }

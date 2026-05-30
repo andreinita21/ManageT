@@ -9,6 +9,7 @@ import { z } from "zod";
 
 import { requireCliUserId } from "@/lib/cli-auth";
 import { GroupConstraintError, reorderMembers } from "@/lib/groups";
+import { broadcastToAll } from "@/lib/ws";
 
 const orderSchema = z.object({
   sessionIds: z.array(z.string().min(1)).min(1).max(6),
@@ -42,6 +43,7 @@ export async function PUT(
   const { id } = await params;
   try {
     const group = await reorderMembers(id, parsed.data.sessionIds);
+    broadcastToAll({ type: "group:changed", groupId: id });
     return NextResponse.json({ data: group });
   } catch (err) {
     if (err instanceof GroupConstraintError) {

@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
         Command::Run => reporter::run_loop().await,
         Command::Uninstall => installer::run_uninstall().await,
         Command::Status => collector::print_status_snapshot(),
-        Command::Ls => sessions::client::run_ls().await,
+        Command::Ls => sessions::client::run_ls(None).await,
         Command::New { name, name_flag, command, no_attach } => {
             // Positional name wins if both are given (defensible default
             // when an old script with `-n foo` is invoked alongside a

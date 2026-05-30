@@ -200,7 +200,14 @@ async fn main() -> Result<()> {
             } => cli_dashboard::run_group_add(id, server, name, command).await,
         },
         Command::Ls => {
-            sessions::client::run_ls().await?;
+            // Pull the dashboard's group → member map up front (when
+            // logged in) so individual session rows can be tagged with
+            // `[groupName]`. Silent fall-through when offline keeps
+            // `managet ls` useful on hosts that haven't logged into
+            // the dashboard.
+            let group_map = cli_dashboard::fetch_session_group_map().await;
+            let group_ref = if group_map.is_empty() { None } else { Some(&group_map) };
+            sessions::client::run_ls(group_ref).await?;
             cli_dashboard::print_groups_section().await
         }
         Command::New {

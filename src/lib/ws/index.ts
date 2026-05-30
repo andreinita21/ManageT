@@ -100,7 +100,47 @@ interface AttachState {
 const wsAttachments = new Map<WebSocket, Map<string, AttachState>>();
 const wsToUser = new Map<WebSocket, string>();
 
-const wss = new WebSocketServer({ noServer: true });
+// `tsx` loads server.ts (and this file) as its own ESM copy of the
+// module, while Next.js bundles every API route as a self-contained
+// chunk that imports `@/lib/ws` *separately*. Without intervention each
+// copy ends up with its own `wss` (and its own `wss.clients` set), so a
+// route that calls `broadcastToAll` writes to an empty Set while the
+// real clients live on server.ts's instance. Pinning the WSS to
+// `globalThis` so every copy shares one instance is the standard
+// Next.js custom-server fix for this class of bug.
+type GlobalWsState = {
+  wss?: WebSocketServer;
+  listenersRegistered?: boolean;
+};
+const __globalWs = globalThis as unknown as { __managetWs?: GlobalWsState };
+__globalWs.__managetWs ??= {};
+const wss: WebSocketServer =
+  __globalWs.__managetWs.wss ??
+  (__globalWs.__managetWs.wss = new WebSocketServer({ noServer: true }));
+
+/**
+ * Push a payload to every currently-connected WebSocket. Used for
+ * out-of-band notifications that aren't tied to a specific session —
+ * e.g. group membership changed via the REST API, so the dashboard's
+ * group view needs to refetch. Stays in-process: API routes import this
+ * directly since the WS server and the Next.js handlers share the
+ * Node process.
+ */
+export function broadcastToAll(payload: object): void {
+  const text = JSON.stringify(payload);
+  let sent = 0;
+  for (const client of wss.clients) {
+    if (client.readyState === WS_OPEN) {
+      try {
+        client.send(text);
+        sent++;
+      } catch {
+        /* a dead client shouldn't break the broadcast loop */
+      }
+    }
+  }
+  console.log(`[WS] broadcast ${JSON.stringify(payload)} → ${sent} client(s)`);
+}
 
 // ---------------------------------------------------------------------------
 // Browser-bound protocol types (kept in lockstep with src/types/index.ts)
@@ -561,26 +601,33 @@ async function extractUserId(req: IncomingMessage): Promise<string | null> {
 // Connection handler
 // ---------------------------------------------------------------------------
 
-wss.on("connection", (ws: WebSocket) => {
-  console.log("[WS] client connected");
+// Only the *first* copy of this module to load gets to wire up the
+// per-connection handlers. A second copy (the bundled API route) would
+// otherwise double-attach them and we'd process every byte twice.
+if (!__globalWs.__managetWs.listenersRegistered) {
+  __globalWs.__managetWs.listenersRegistered = true;
 
-  ws.on("message", (raw: Buffer | string) => {
-    const data = typeof raw === "string" ? raw : raw.toString("utf-8");
-    handleMessage(ws, data).catch((err: Error) => {
-      console.error(`[WS] unhandled error: ${err.message}`);
+  wss.on("connection", (ws: WebSocket) => {
+    console.log("[WS] client connected");
+
+    ws.on("message", (raw: Buffer | string) => {
+      const data = typeof raw === "string" ? raw : raw.toString("utf-8");
+      handleMessage(ws, data).catch((err: Error) => {
+        console.error(`[WS] unhandled error: ${err.message}`);
+      });
+    });
+
+    ws.on("close", () => {
+      console.log("[WS] client disconnected");
+      handleDisconnect(ws);
+    });
+
+    ws.on("error", (err: Error) => {
+      console.error(`[WS] client error: ${err.message}`);
+      handleDisconnect(ws);
     });
   });
-
-  ws.on("close", () => {
-    console.log("[WS] client disconnected");
-    handleDisconnect(ws);
-  });
-
-  ws.on("error", (err: Error) => {
-    console.error(`[WS] client error: ${err.message}`);
-    handleDisconnect(ws);
-  });
-});
+}
 
 // Unused export kept for compatibility with any old import sites.
 export type _SessionForAttach = Session;

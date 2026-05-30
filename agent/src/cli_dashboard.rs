@@ -17,7 +17,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::style::{
-    Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor, Stylize,
+    Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
+    Stylize,
 };
 use crossterm::terminal::{
     self, disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
@@ -134,7 +135,7 @@ struct CliServer {
     username: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct GroupLayout {
     #[serde(rename = "rowHeights")]
     row_heights: Vec<f64>,
@@ -160,6 +161,28 @@ struct Pane {
     rect: Rect,
     parser: vt100::Parser,
     lost: Option<String>,
+}
+
+/// Inline server-picker state when the user hits Ctrl-A N. The view
+/// previews a layout one slot larger (existing panes shrink), and the
+/// new slot is occupied by a list of available servers. Confirm
+/// creates+links the session; cancel restores the prior layout.
+struct PickerState {
+    /// Rect of the empty new slot — picker is drawn here.
+    target_rect: Rect,
+    /// Highlighted server index in `current_servers`.
+    selected: usize,
+    /// Layout/partition to restore if the user cancels or the API call
+    /// fails. Saved at entry so a poll that fires mid-pick can't
+    /// clobber the user's prior view.
+    saved_layout: GroupLayout,
+    saved_partition: Vec<usize>,
+}
+
+enum PickerKeyResult {
+    Idle,
+    Confirm,
+    Cancel,
 }
 
 pub async fn run_login(
@@ -211,6 +234,23 @@ pub async fn run_login(
         cfg.api_url, envelope.data.user.username
     );
     Ok(())
+}
+
+/// Best-effort lookup of sessionId → groupName for every member of every
+/// group on the dashboard. Returns an empty map (silently) when the
+/// CLI isn't logged in or the dashboard is unreachable — `managet ls`
+/// should still print the local section in that case, just without the
+/// `[groupName]` annotations.
+pub async fn fetch_session_group_map() -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let Ok(cfg) = load_config() else { return map; };
+    let Ok(payload) = fetch_group_list_payload(&cfg).await else { return map; };
+    for g in &payload.groups {
+        for m in &g.members {
+            map.insert(m.id.clone(), g.name.clone());
+        }
+    }
+    map
 }
 
 pub async fn run_group_list() -> Result<()> {
@@ -305,6 +345,15 @@ fn print_group_rows(payload: &GroupListPayload) {
     // word and the divider after it line up across rows.
     let windows_col_width = max_members_digits + " windows".len();
 
+    let member_name_width = payload
+        .groups
+        .iter()
+        .flat_map(|g| g.members.iter())
+        .map(|m| m.session_name.chars().count().min(28))
+        .max()
+        .unwrap_or(20)
+        .max(20);
+
     for g in &payload.groups {
         let mut ordered = g.members.clone();
         ordered.sort_by_key(|m| m.group_order_index.unwrap_or(usize::MAX));
@@ -331,6 +380,25 @@ fn print_group_rows(payload: &GroupListPayload) {
             windows = windows_col.cyan(),
             servers = server_labels.blue(),
         );
+        // Tree sub-list: one indented row per terminal in slot order so
+        // `managet ls` matches the visual order of the panes you'd see
+        // in `managet group attach` or in the browser mosaic.
+        let last_idx = ordered.len().saturating_sub(1);
+        for (i, m) in ordered.iter().enumerate() {
+            let branch = if i == last_idx { "└" } else { "├" };
+            let name_cell = pad_visible(
+                &truncate(&m.session_name, member_name_width),
+                member_name_width,
+            );
+            let server = server_label_for(&m.server_id);
+            println!(
+                "      {branch} {name} {sep} {server}",
+                branch = branch.dark_grey(),
+                name = name_cell.white(),
+                sep = "·".dark_grey(),
+                server = server.blue(),
+            );
+        }
     }
 }
 
@@ -534,7 +602,14 @@ pub async fn run_group_open(selector: String) -> Result<()> {
         rows,
     );
     let mut focused = 0usize;
-    draw_group(&mut stdout, &current_group, &panes, focused)?;
+    draw_group(
+        &mut stdout,
+        &current_group,
+        &panes,
+        focused,
+        None,
+        &current_servers,
+    )?;
 
     let ws_url = ws_url_for(&cfg.api_url)?;
     let mut request = ws_url
@@ -599,13 +674,147 @@ pub async fn run_group_open(selector: String) -> Result<()> {
     membership_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut escape = false;
+    let mut picker: Option<PickerState> = None;
     loop {
         tokio::select! {
             maybe_event = event_rx.recv() => {
                 let Some(ev) = maybe_event else { break; };
                 match ev {
                     Event::Key(key) => {
-                        let focused_session = panes[focused].session.clone();
+                        // Picker mode short-circuits ordinary key
+                        // handling: Up/Down navigate, Enter confirms,
+                        // Esc cancels. Any other key is dropped so it
+                        // doesn't leak into the focused session (which
+                        // is still attached and could otherwise eat the
+                        // input we typed into the picker).
+                        if picker.is_some() {
+                            match handle_picker_key(key, picker.as_mut().unwrap(), current_servers.len()) {
+                                PickerKeyResult::Idle => {}
+                                PickerKeyResult::Cancel => {
+                                    let p = picker.take().unwrap();
+                                    restore_after_picker(
+                                        p,
+                                        &mut panes,
+                                        &mut current_layout,
+                                        &mut current_partition,
+                                        &send_tx,
+                                    ).await?;
+                                    focused = focused.min(panes.len().saturating_sub(1));
+                                }
+                                PickerKeyResult::Confirm => {
+                                    let p = picker.take().unwrap();
+                                    let server_id = current_servers
+                                        .get(p.selected)
+                                        .map(|s| s.id.clone());
+                                    if let Some(server_id) = server_id {
+                                        let body = serde_json::json!({ "serverId": server_id });
+                                        let res = post_json::<_, AddMemberResponse>(
+                                            &cfg,
+                                            &format!("/api/cli/groups/{group_id}/members"),
+                                            &body,
+                                        )
+                                        .await;
+                                        match res {
+                                            Ok(_) => {
+                                                if let Ok(latest) =
+                                                    fetch_group_detail(&cfg, &group_id).await
+                                                {
+                                                    reconcile_after_fetch(
+                                                        latest,
+                                                        &mut current_group,
+                                                        &mut current_servers,
+                                                        &mut current_layout,
+                                                        &mut current_partition,
+                                                        &mut server_labels,
+                                                        &mut panes,
+                                                        &mut focused,
+                                                        &send_tx,
+                                                    )
+                                                    .await?;
+                                                    focused =
+                                                        panes.len().saturating_sub(1);
+                                                } else {
+                                                    restore_after_picker(
+                                                        p,
+                                                        &mut panes,
+                                                        &mut current_layout,
+                                                        &mut current_partition,
+                                                        &send_tx,
+                                                    )
+                                                    .await?;
+                                                    focused =
+                                                        focused.min(panes.len().saturating_sub(1));
+                                                }
+                                            }
+                                            Err(_) => {
+                                                restore_after_picker(
+                                                    p,
+                                                    &mut panes,
+                                                    &mut current_layout,
+                                                    &mut current_partition,
+                                                    &send_tx,
+                                                )
+                                                .await?;
+                                                focused =
+                                                    focused.min(panes.len().saturating_sub(1));
+                                            }
+                                        }
+                                    } else {
+                                        restore_after_picker(
+                                            p,
+                                            &mut panes,
+                                            &mut current_layout,
+                                            &mut current_partition,
+                                            &send_tx,
+                                        )
+                                        .await?;
+                                    }
+                                }
+                            }
+                            draw_group(
+                                &mut stdout,
+                                &current_group,
+                                &panes,
+                                focused,
+                                picker.as_ref(),
+                                &current_servers,
+                            )?;
+                            continue;
+                        }
+
+                        // Ctrl-A N opens the inline picker — pre-allocate a
+                        // slot, drop the user's input mode, render the
+                        // server list inside the new pane.
+                        if escape
+                            && matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N'))
+                        {
+                            escape = false;
+                            if let Some(p) = enter_picker_mode(
+                                &mut panes,
+                                &mut current_layout,
+                                &mut current_partition,
+                                &send_tx,
+                            )
+                            .await?
+                            {
+                                focused = panes.len(); // points "past" panes;
+                                                       // picker draws there
+                                picker = Some(p);
+                            }
+                            draw_group(
+                                &mut stdout,
+                                &current_group,
+                                &panes,
+                                focused,
+                                picker.as_ref(),
+                                &current_servers,
+                            )?;
+                            continue;
+                        }
+
+                        let focused_session = panes[focused.min(panes.len().saturating_sub(1))]
+                            .session
+                            .clone();
                         if handle_key(
                             key,
                             &mut escape,
@@ -616,7 +825,14 @@ pub async fn run_group_open(selector: String) -> Result<()> {
                         ).await? {
                             break;
                         }
-                        draw_group(&mut stdout, &current_group, &panes, focused)?;
+                        draw_group(
+                            &mut stdout,
+                            &current_group,
+                            &panes,
+                            focused,
+                            picker.as_ref(),
+                            &current_servers,
+                        )?;
                     }
                     Event::Resize(cols, rows) => {
                         apply_resize(&mut panes, &current_layout, &current_partition, cols, rows);
@@ -627,7 +843,29 @@ pub async fn run_group_open(selector: String) -> Result<()> {
                                 client_resize_msg(&pane.session, inner_rows, inner_cols),
                             ).await?;
                         }
-                        draw_group(&mut stdout, &current_group, &panes, focused)?;
+                        // The picker lives in a rect computed off the
+                        // larger preview partition, so recompute it
+                        // against the new terminal size too.
+                        if let Some(p) = picker.as_mut() {
+                            let preview_count = panes.len() + 1;
+                            let rects = compute_rects(
+                                &current_layout,
+                                &current_partition,
+                                cols,
+                                rows,
+                            );
+                            if let Some(target) = rects.get(preview_count - 1) {
+                                p.target_rect = *target;
+                            }
+                        }
+                        draw_group(
+                            &mut stdout,
+                            &current_group,
+                            &panes,
+                            focused,
+                            picker.as_ref(),
+                            &current_servers,
+                        )?;
                     }
                     _ => {}
                 }
@@ -636,12 +874,26 @@ pub async fn run_group_open(selector: String) -> Result<()> {
                 match maybe_msg {
                     Some(Ok(Message::Text(text))) => {
                         handle_server_msg(&mut panes, text.as_str());
-                        draw_group(&mut stdout, &current_group, &panes, focused)?;
+                        draw_group(
+                            &mut stdout,
+                            &current_group,
+                            &panes,
+                            focused,
+                            picker.as_ref(),
+                            &current_servers,
+                        )?;
                     }
                     Some(Ok(Message::Binary(bytes))) => {
                         if let Ok(text) = std::str::from_utf8(&bytes) {
                             handle_server_msg(&mut panes, text);
-                            draw_group(&mut stdout, &current_group, &panes, focused)?;
+                            draw_group(
+                                &mut stdout,
+                                &current_group,
+                                &panes,
+                                focused,
+                                picker.as_ref(),
+                                &current_servers,
+                            )?;
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
@@ -650,81 +902,61 @@ pub async fn run_group_open(selector: String) -> Result<()> {
                 }
             }
             _ = membership_poll.tick() => {
+                // Don't fight the user mid-pick — once they've opened
+                // the inline picker we freeze the periodic refresh
+                // until they confirm or cancel.
+                if picker.is_some() {
+                    continue;
+                }
                 // Best-effort: a transient HTTP failure shouldn't drop
-                // the user out of the group view. We just skip this tick
-                // and try again on the next one.
+                // the user out of the group view.
                 let Ok(latest) = fetch_group_detail(&cfg, &group_id).await else {
                     continue;
                 };
-                let current_ids: Vec<String> = panes.iter().map(|p| p.session.id.clone()).collect();
-                let latest_ids: Vec<String> =
-                    latest.group.members.iter().map(|m| m.id.clone()).collect();
-                if latest_ids == current_ids {
-                    continue;
-                }
                 if latest.group.members.is_empty() {
                     // Last terminal removed → exit, otherwise we'd keep
                     // an empty mosaic on screen forever.
                     break;
                 }
-                let CliGroupDetail {
-                    group: new_group,
-                    layout: new_layout,
-                    servers: new_servers,
-                } = latest;
-                current_group = new_group;
-                current_servers = new_servers;
-                current_layout = valid_layout_or_default(new_layout, current_group.members.len());
-                current_partition = active_partition(&current_layout, current_group.members.len());
-                server_labels = build_server_labels(&current_servers);
-
-                let (cols, rows) = terminal::size().unwrap_or((120, 36));
-                let fresh_panes = build_panes(
+                // Detect membership/order changes (Vec<String> equality
+                // is order-sensitive) *and* layout edits made in the
+                // browser (column widths, row partition, etc.). Either
+                // alone is enough to rebuild — the dashboard doesn't
+                // push these so the poll is our only signal.
+                let current_ids: Vec<String> =
+                    panes.iter().map(|p| p.session.id.clone()).collect();
+                let latest_ids: Vec<String> =
+                    latest.group.members.iter().map(|m| m.id.clone()).collect();
+                let latest_layout_norm =
+                    valid_layout_or_default(latest.layout.clone(), latest.group.members.len());
+                let latest_partition =
+                    active_partition(&latest_layout_norm, latest.group.members.len());
+                let unchanged = latest_ids == current_ids
+                    && latest_partition == current_partition
+                    && latest_layout_norm == current_layout;
+                if unchanged {
+                    continue;
+                }
+                reconcile_after_fetch(
+                    latest,
+                    &mut current_group,
+                    &mut current_servers,
+                    &mut current_layout,
+                    &mut current_partition,
+                    &mut server_labels,
+                    &mut panes,
+                    &mut focused,
+                    &send_tx,
+                )
+                .await?;
+                draw_group(
+                    &mut stdout,
                     &current_group,
-                    &server_labels,
-                    &current_layout,
-                    &current_partition,
-                    cols,
-                    rows,
-                );
-                // Preserve vt100 scroll/state for sessions that survived
-                // the membership change — otherwise a new pane appearing
-                // would blank everyone's scrollback.
-                let mut preserved: std::collections::HashMap<String, vt100::Parser> =
-                    std::collections::HashMap::new();
-                for old in panes.drain(..) {
-                    preserved.insert(old.session.id.clone(), old.parser);
-                }
-                let kept: std::collections::HashSet<String> =
-                    current_ids.into_iter().collect();
-                let mut rebuilt = Vec::with_capacity(fresh_panes.len());
-                for mut p in fresh_panes {
-                    if let Some(parser) = preserved.remove(&p.session.id) {
-                        let (h, w) = pane_inner_size(p.rect);
-                        let mut reused = parser;
-                        reused.set_size(h, w);
-                        p.parser = reused;
-                    }
-                    rebuilt.push(p);
-                }
-                panes = rebuilt;
-                focused = focused.min(panes.len().saturating_sub(1));
-
-                // Attach + size only the brand-new panes; the survivors
-                // are already attached on the WS server's side.
-                for pane in &panes {
-                    let is_new = !kept.contains(&pane.session.id);
-                    let (inner_rows, inner_cols) = pane_inner_size(pane.rect);
-                    if is_new {
-                        send_ws(&send_tx, client_attach_msg(&pane.session)).await?;
-                    }
-                    send_ws(
-                        &send_tx,
-                        client_resize_msg(&pane.session, inner_rows, inner_cols),
-                    )
-                    .await?;
-                }
-                draw_group(&mut stdout, &current_group, &panes, focused)?;
+                    &panes,
+                    focused,
+                    picker.as_ref(),
+                    &current_servers,
+                )?;
             }
         }
     }
@@ -744,6 +976,178 @@ fn build_server_labels(servers: &[CliServer]) -> HashMap<String, String> {
             )
         })
         .collect()
+}
+
+/// Replace the in-memory group state with the dashboard's view, then
+/// rebuild the pane vector preserving vt100 scrollback for any session
+/// that survived. Sends WS attach for brand-new panes and a resize for
+/// every pane whose rect changed. Shared between the periodic poll and
+/// the post-confirm path of the inline picker so the two stay in sync.
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_after_fetch(
+    latest: CliGroupDetail,
+    current_group: &mut Group,
+    current_servers: &mut Vec<CliServer>,
+    current_layout: &mut GroupLayout,
+    current_partition: &mut Vec<usize>,
+    server_labels: &mut HashMap<String, String>,
+    panes: &mut Vec<Pane>,
+    focused: &mut usize,
+    send_tx: &mpsc::Sender<String>,
+) -> Result<()> {
+    let prior_ids: std::collections::HashSet<String> =
+        panes.iter().map(|p| p.session.id.clone()).collect();
+
+    let CliGroupDetail {
+        group: new_group,
+        layout: new_layout,
+        servers: new_servers,
+    } = latest;
+    *current_group = new_group;
+    *current_servers = new_servers;
+    *current_layout = valid_layout_or_default(new_layout, current_group.members.len());
+    *current_partition = active_partition(current_layout, current_group.members.len());
+    *server_labels = build_server_labels(current_servers);
+
+    let (cols, rows) = terminal::size().unwrap_or((120, 36));
+    let fresh = build_panes(
+        current_group,
+        server_labels,
+        current_layout,
+        current_partition,
+        cols,
+        rows,
+    );
+
+    let mut preserved: HashMap<String, vt100::Parser> = HashMap::new();
+    for old in panes.drain(..) {
+        preserved.insert(old.session.id.clone(), old.parser);
+    }
+    let mut rebuilt = Vec::with_capacity(fresh.len());
+    for mut p in fresh {
+        if let Some(parser) = preserved.remove(&p.session.id) {
+            let (h, w) = pane_inner_size(p.rect);
+            let mut reused = parser;
+            reused.set_size(h, w);
+            p.parser = reused;
+        }
+        rebuilt.push(p);
+    }
+    *panes = rebuilt;
+    *focused = (*focused).min(panes.len().saturating_sub(1));
+
+    for pane in panes.iter() {
+        let is_new = !prior_ids.contains(&pane.session.id);
+        let (h, w) = pane_inner_size(pane.rect);
+        if is_new {
+            send_ws(send_tx, client_attach_msg(&pane.session)).await?;
+        }
+        send_ws(send_tx, client_resize_msg(&pane.session, h, w)).await?;
+    }
+    Ok(())
+}
+
+
+fn handle_picker_key(
+    key: KeyEvent,
+    picker: &mut PickerState,
+    server_count: usize,
+) -> PickerKeyResult {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            if picker.selected > 0 {
+                picker.selected -= 1;
+            }
+            PickerKeyResult::Idle
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if picker.selected + 1 < server_count {
+                picker.selected += 1;
+            }
+            PickerKeyResult::Idle
+        }
+        KeyCode::Home => {
+            picker.selected = 0;
+            PickerKeyResult::Idle
+        }
+        KeyCode::End => {
+            picker.selected = server_count.saturating_sub(1);
+            PickerKeyResult::Idle
+        }
+        KeyCode::Enter => PickerKeyResult::Confirm,
+        KeyCode::Esc => PickerKeyResult::Cancel,
+        _ => PickerKeyResult::Idle,
+    }
+}
+
+/// Enter inline-picker mode: shrink the existing panes to fit a preview
+/// layout one slot larger, send a WS resize so the remote PTYs reflow,
+/// and return a `PickerState` pointing at the freshly-opened slot.
+/// Returns `Ok(None)` (a no-op) when the group is already at the
+/// 6-member cap or the user has no servers registered yet, so the
+/// caller can leave the view as-is.
+async fn enter_picker_mode(
+    panes: &mut [Pane],
+    current_layout: &mut GroupLayout,
+    current_partition: &mut Vec<usize>,
+    send_tx: &mpsc::Sender<String>,
+) -> Result<Option<PickerState>> {
+    if panes.len() >= 6 {
+        return Ok(None);
+    }
+    let new_count = panes.len() + 1;
+    let new_partition = default_partition(new_count);
+    let new_layout = layout_for_partition(&new_partition);
+    let (cols, rows) = terminal::size().unwrap_or((120, 36));
+    let rects = compute_rects(&new_layout, &new_partition, cols, rows);
+    if rects.len() < new_count {
+        return Ok(None);
+    }
+
+    let saved_layout = current_layout.clone();
+    let saved_partition = current_partition.clone();
+
+    for (i, pane) in panes.iter_mut().enumerate() {
+        if let Some(rect) = rects.get(i) {
+            pane.rect = *rect;
+            let (h, w) = pane_inner_size(*rect);
+            pane.parser.set_size(h, w);
+        }
+    }
+    for pane in panes.iter() {
+        let (h, w) = pane_inner_size(pane.rect);
+        send_ws(send_tx, client_resize_msg(&pane.session, h, w)).await?;
+    }
+
+    *current_layout = new_layout;
+    *current_partition = new_partition;
+
+    Ok(Some(PickerState {
+        target_rect: rects[new_count - 1],
+        selected: 0,
+        saved_layout,
+        saved_partition,
+    }))
+}
+
+/// Undo what `enter_picker_mode` did: restore the prior layout/partition
+/// and reflow the remaining panes back to their original rects.
+async fn restore_after_picker(
+    picker: PickerState,
+    panes: &mut [Pane],
+    current_layout: &mut GroupLayout,
+    current_partition: &mut Vec<usize>,
+    send_tx: &mpsc::Sender<String>,
+) -> Result<()> {
+    *current_layout = picker.saved_layout;
+    *current_partition = picker.saved_partition;
+    let (cols, rows) = terminal::size().unwrap_or((120, 36));
+    apply_resize(panes, current_layout, current_partition, cols, rows);
+    for pane in panes.iter() {
+        let (h, w) = pane_inner_size(pane.rect);
+        send_ws(send_tx, client_resize_msg(&pane.session, h, w)).await?;
+    }
+    Ok(())
 }
 
 async fn handle_key(
@@ -875,12 +1279,27 @@ fn ctrl_char(c: char) -> Option<String> {
     }
 }
 
-fn draw_group(stdout: &mut Stdout, group: &Group, panes: &[Pane], focused: usize) -> Result<()> {
+fn draw_group(
+    stdout: &mut Stdout,
+    group: &Group,
+    panes: &[Pane],
+    focused: usize,
+    picker: Option<&PickerState>,
+    servers: &[CliServer],
+) -> Result<()> {
     queue!(stdout, Hide, MoveTo(0, 0), Clear(ClearType::All))?;
     let (cols, _) = terminal::size().unwrap_or((120, 36));
-    draw_status_bar(stdout, group, panes, focused, cols)?;
+    draw_status_bar(stdout, group, panes, focused, cols, picker.is_some())?;
+    // When the picker is active, the focused indicator belongs on the
+    // picker rect, not on any real pane — pass `false` to draw_pane so
+    // every existing pane renders in its dim "inactive" state.
+    let pane_focused = picker.is_none().then_some(focused);
     for (i, pane) in panes.iter().enumerate() {
-        draw_pane(stdout, pane, i == focused, i + 1)?;
+        let active = pane_focused.map(|f| f == i).unwrap_or(false);
+        draw_pane(stdout, pane, active, i + 1)?;
+    }
+    if let Some(p) = picker {
+        draw_picker(stdout, p, servers, panes.len() + 1)?;
     }
     stdout.flush()?;
     Ok(())
@@ -897,22 +1316,36 @@ fn draw_status_bar(
     panes: &[Pane],
     focused: usize,
     cols: u16,
+    picker_active: bool,
 ) -> Result<()> {
     let active_slot = focused + 1;
     let active_name = panes
         .get(focused)
         .map(|p| p.session.session_name.as_str())
         .unwrap_or("?");
-    let active_text = format!("active {}:{}", active_slot, active_name);
+    let active_text = if picker_active {
+        format!("adding terminal to slot {}", panes.len() + 1)
+    } else {
+        format!("active {}:{}", active_slot, active_name)
+    };
+    let hints = if picker_active {
+        "↑/↓ pick · Enter confirm · Esc cancel"
+    } else {
+        "Ctrl-A D detach · Ctrl-A 1-6 focus · Ctrl-A [/] cycle · Ctrl-A N add"
+    };
 
     let segments: [(&str, Color, bool); 7] = [
         ("managet group:", Color::Magenta, true),
         (" ", Color::White, false),
         (group.name.as_str(), Color::White, true),
         ("  │  ", Color::DarkGrey, false),
-        (active_text.as_str(), Color::Cyan, false),
+        (
+            active_text.as_str(),
+            if picker_active { Color::Yellow } else { Color::Cyan },
+            false,
+        ),
         ("  │  ", Color::DarkGrey, false),
-        ("Ctrl-A D detach · Ctrl-A 1-6 focus · Ctrl-A [/] cycle", Color::DarkGrey, false),
+        (hints, Color::DarkGrey, false),
     ];
 
     queue!(stdout, MoveTo(0, 0))?;
@@ -1058,6 +1491,117 @@ fn draw_pane(stdout: &mut Stdout, pane: &Pane, active: bool, slot: usize) -> Res
         )?;
         stdout.write_all(&formatted)?;
         queue!(stdout, ResetColor)?;
+    }
+    Ok(())
+}
+
+/// Render the inline server picker inside the pre-allocated empty
+/// slot. Uses the same Unicode border treatment as `draw_pane` so the
+/// new slot visually belongs to the mosaic, with a cyan-bold title
+/// announcing the picker mode.
+fn draw_picker(
+    stdout: &mut Stdout,
+    picker: &PickerState,
+    servers: &[CliServer],
+    slot: usize,
+) -> Result<()> {
+    let r = picker.target_rect;
+    if r.w < 4 || r.h < 3 {
+        return Ok(());
+    }
+    let horizontal = "─".repeat(r.w.saturating_sub(2) as usize);
+    queue!(
+        stdout,
+        SetForegroundColor(Color::Cyan),
+        MoveTo(r.x, r.y),
+        Print("┌"),
+        Print(&horizontal),
+        Print("┐"),
+    )?;
+    for y in r.y + 1..r.y + r.h.saturating_sub(1) {
+        queue!(stdout, MoveTo(r.x, y), Print("│"))?;
+        queue!(stdout, MoveTo(r.x + r.w.saturating_sub(1), y), Print("│"))?;
+    }
+    queue!(
+        stdout,
+        MoveTo(r.x, r.y + r.h.saturating_sub(1)),
+        Print("└"),
+        Print(&horizontal),
+        Print("┘"),
+        ResetColor,
+    )?;
+
+    let title = format!("● {slot} pick server");
+    let max_title = r.w.saturating_sub(4) as usize;
+    queue!(
+        stdout,
+        MoveTo(r.x + 2, r.y),
+        SetForegroundColor(Color::Cyan),
+        SetAttribute(Attribute::Bold),
+        Print(truncate(&title, max_title)),
+        SetAttribute(Attribute::Reset),
+        ResetColor,
+    )?;
+
+    let inner_w = r.w.saturating_sub(2) as usize;
+    let inner_h = r.h.saturating_sub(2) as usize;
+
+    if servers.is_empty() {
+        queue!(
+            stdout,
+            MoveTo(r.x + 1, r.y + 1),
+            SetForegroundColor(Color::Yellow),
+            Print(pad_visible("(no servers on this account)", inner_w)),
+            ResetColor,
+        )?;
+        return Ok(());
+    }
+
+    // Keep the highlighted row on screen even when the server list is
+    // longer than the slot height — same scroll-window trick the
+    // dashboard's picker uses.
+    let max_visible = inner_h.saturating_sub(1).max(1);
+    let scroll = picker
+        .selected
+        .saturating_sub(max_visible.saturating_sub(1));
+    let header = pad_visible("Press Enter to attach this slot to:", inner_w);
+    queue!(
+        stdout,
+        MoveTo(r.x + 1, r.y + 1),
+        SetForegroundColor(Color::DarkGrey),
+        Print(header),
+        ResetColor,
+    )?;
+
+    for (row_idx, (i, server)) in servers
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(max_visible)
+        .enumerate()
+    {
+        let label = if server.name.is_empty() {
+            format!("{}@{}", server.username, server.host)
+        } else {
+            format!("{}  ({}@{})", server.name, server.username, server.host)
+        };
+        let marker = if i == picker.selected { "▸ " } else { "  " };
+        let line = pad_visible(&truncate(&format!("{marker}{label}"), inner_w), inner_w);
+        let y = r.y + 2 + row_idx as u16;
+        queue!(stdout, MoveTo(r.x + 1, y))?;
+        if i == picker.selected {
+            queue!(
+                stdout,
+                SetForegroundColor(Color::Black),
+                SetBackgroundColor(Color::Cyan),
+                SetAttribute(Attribute::Bold),
+                Print(line),
+                SetAttribute(Attribute::Reset),
+                ResetColor,
+            )?;
+        } else {
+            queue!(stdout, SetForegroundColor(Color::White), Print(line), ResetColor)?;
+        }
     }
     Ok(())
 }

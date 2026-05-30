@@ -9,6 +9,7 @@ import { z } from "zod";
 
 import { requireCliUserId } from "@/lib/cli-auth";
 import { saveUserLayout } from "@/lib/groups";
+import { broadcastToAll } from "@/lib/ws";
 
 const layoutSchema = z.object({
   rowHeights: z.array(z.number()).min(1).max(2),
@@ -51,5 +52,6 @@ export async function PUT(
 
   const { id } = await params;
   await saveUserLayout(userId, id, parsed.data);
+  broadcastToAll({ type: "group:changed", groupId: id });
   return NextResponse.json({ ok: true });
 }

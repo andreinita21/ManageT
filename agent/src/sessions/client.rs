@@ -14,6 +14,8 @@
 use std::io::{IsTerminal, Write};
 use std::os::fd::AsRawFd;
 
+use std::collections::HashMap;
+
 use anyhow::{anyhow, Context, Result};
 use crossterm::style::Stylize;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -29,7 +31,12 @@ use super::server::socket_path;
 /// dashboard CLI module after this returns; keeping the two halves
 /// separate means hosts that have never logged into the dashboard still
 /// get a useful local listing.
-pub async fn run_ls() -> Result<()> {
+///
+/// `group_annotations`, when present, maps sessionId → group name. We
+/// append `[groupName]` to any local session that's part of a group so
+/// the listing makes it clear which sessions are also visible in the
+/// dashboard mosaic.
+pub async fn run_ls(group_annotations: Option<&HashMap<String, String>>) -> Result<()> {
     let resp = round_trip(&Request::List).await?;
     let sessions = match resp {
         Response::SessionList { sessions } => sessions,
@@ -70,13 +77,22 @@ pub async fn run_ls() -> Result<()> {
         // column widths off.
         let name_col = pad_visible(&truncate(&s.name, name_width), name_width);
         let age_col = pad_visible(&age, 10);
+        // Group tag (e.g. `[test]`) when the dashboard knows this
+        // session is a member of a group — keeps a session that's both
+        // in the local agent list AND in a group view visible in both
+        // places without making the user guess where it came from.
+        let group_tag = group_annotations
+            .and_then(|map| map.get(&s.id))
+            .map(|name| format!("  [{name}]").magenta())
+            .unwrap_or_else(|| String::new().stylize());
         println!(
-            "  {bullet} {name}  {age}  {status}  {hint}",
+            "  {bullet} {name}  {age}  {status}  {hint}{tag}",
             bullet = bullet.green(),
             name = name_col.white().bold(),
             age = age_col.dark_grey(),
             status = status_styled,
             hint = format!("[{}]", short_id(&s.id)).dark_grey(),
+            tag = group_tag,
         );
     }
     Ok(())
