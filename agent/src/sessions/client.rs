@@ -234,8 +234,8 @@ pub async fn run_attach(id: String) -> Result<()> {
     });
 
     // 5. Pipe stdin → socket and socket → stdout. The detach state
-    //    machine watches stdin for `Ctrl-A d`.
-    let pipe_result = pipe_attach(reader, wr).await;
+    //    machine watches stdin for `Ctrl-A d` and `Ctrl-A g` (group prompt).
+    let pipe_result = pipe_attach(reader, wr, &_raw, resolved_id.clone()).await;
 
     resize_task.abort();
     // Restore the terminal title before RawMode drops so the user's
@@ -263,13 +263,15 @@ pub async fn run_attach(id: String) -> Result<()> {
 async fn pipe_attach(
     mut socket_reader: BufReader<tokio::net::unix::OwnedReadHalf>,
     mut socket_writer: tokio::net::unix::OwnedWriteHalf,
+    raw: &RawMode,
+    session_id: String,
 ) -> Result<()> {
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
 
     // Detach escape state machine. NORMAL → ESCAPE on Ctrl-A. From
-    // ESCAPE: 'd' = detach, Ctrl-A = pass through (escape escape), any
-    // other byte = re-emit Ctrl-A then that byte.
+    // ESCAPE: 'd' = detach, 'g' = group prompt, Ctrl-A = pass through
+    // (escape escape), any other byte = re-emit Ctrl-A then that byte.
     #[derive(Copy, Clone, PartialEq)]
     enum EscState {
         Normal,
@@ -322,6 +324,31 @@ async fn pipe_attach(
                                         }
                                         eprintln!("\r\n[managet] detached.");
                                         return Ok(());
+                                    } else if b == b'g' || b == b'G' {
+                                        // Ctrl-A G: add this session to a
+                                        // group / create one. Flush pending
+                                        // input, drop to cooked mode, run the
+                                        // inquire prompt, then restore raw
+                                        // mode and nudge the shell to repaint.
+                                        state = EscState::Normal;
+                                        if !out.is_empty() {
+                                            socket_writer.write_all(&out).await?;
+                                            socket_writer.flush().await?;
+                                            out.clear();
+                                        }
+                                        raw.suspend();
+                                        let _ = stdout.write_all(b"\r\n").await;
+                                        let _ = stdout.flush().await;
+                                        let _ = crate::cli_dashboard::run_attach_group_prompt(
+                                            session_id.clone(),
+                                        )
+                                        .await;
+                                        raw.resume();
+                                        // Repaint: SIGWINCH-style resize so
+                                        // the shell redraws its prompt under
+                                        // the now-cleared prompt area.
+                                        let (r, c) = local_term_size().unwrap_or((24, 80));
+                                        let _ = send_resize(&session_id, r, c).await;
                                     } else if b == CTRL_A {
                                         // Literal Ctrl-A — emit one and
                                         // stay in Escape so user can do
@@ -461,6 +488,25 @@ impl RawMode {
             return Err(anyhow!("tcsetattr (raw) failed"));
         }
         Ok(Self { fd, original })
+    }
+
+    /// Temporarily restore cooked mode (e.g. to run an `inquire` prompt),
+    /// without consuming the guard. Pair with `resume`.
+    fn suspend(&self) {
+        // SAFETY: fd valid for the guard's lifetime; original is POD.
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+        }
+    }
+
+    /// Re-enter raw mode after a `suspend`.
+    fn resume(&self) {
+        let mut raw = self.original;
+        // SAFETY: same.
+        unsafe {
+            libc::cfmakeraw(&mut raw);
+            libc::tcsetattr(self.fd, libc::TCSANOW, &raw);
+        }
     }
 }
 

@@ -5,10 +5,12 @@
  * server labels for rendering a terminal-side group view.
  */
 import { NextResponse } from "next/server";
+import { and, eq, isNull, ne, or } from "drizzle-orm";
 
 import { requireCliUserId } from "@/lib/cli-auth";
 import { db } from "@/lib/db";
-import { servers } from "@/lib/db/schema";
+import { servers, sessions } from "@/lib/db/schema";
+import { rowToSession } from "@/lib/db/transform";
 import { getGroup, getUserLayout } from "@/lib/groups";
 
 export async function GET(
@@ -38,7 +40,26 @@ export async function GET(
     })
     .from(servers);
 
+  // Free standalone sessions eligible to be added to this group — not in a
+  // stack, not in another group, still alive. Mirrors the browser group
+  // page's freeSessions filter. Drives the Ctrl-A N "existing terminals"
+  // picker section.
+  const memberIds = new Set(group.members.map((m) => m.id));
+  const freeRows = await db
+    .select()
+    .from(sessions)
+    .where(
+      and(
+        isNull(sessions.stackId),
+        or(isNull(sessions.groupId), eq(sessions.groupId, id)),
+        ne(sessions.status, "closed")
+      )
+    );
+  const freeSessions = freeRows
+    .filter((s) => !memberIds.has(s.id))
+    .map(rowToSession);
+
   return NextResponse.json({
-    data: { group, layout, servers: serverRows },
+    data: { group, layout, servers: serverRows, freeSessions },
   });
 }

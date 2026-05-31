@@ -7,7 +7,11 @@
  * one-shot flow the `managet group add` picker needs (browser uses two
  * separate REST calls).
  *
- * Body: { serverId: string, name?: string, command?: string }
+ * Body (one of):
+ *   { sessionId: string }                       — attach an EXISTING free
+ *                                                  session into the group.
+ *   { serverId: string, name?, command? }        — create a NEW session on
+ *                                                  the server, then link it.
  * Returns: { session, group }
  */
 import { NextResponse } from "next/server";
@@ -23,7 +27,8 @@ import { createSession } from "@/lib/ssh/session-manager";
 import { broadcastToAll } from "@/lib/ws";
 
 const bodySchema = z.object({
-  serverId: z.string().min(1),
+  serverId: z.string().min(1).optional(),
+  sessionId: z.string().min(1).optional(),
   name: z.string().optional(),
   command: z.string().optional(),
 });
@@ -53,7 +58,43 @@ export async function POST(
       { status: 400 }
     );
   }
-  const { serverId, name, command } = parsed.data;
+  const { serverId, sessionId, name, command } = parsed.data;
+
+  // Attach-existing path: link a free standalone session without creating
+  // a new one. Used by the Ctrl-A N picker's "existing terminals" section
+  // and by the solo-attach Ctrl-A G flow.
+  if (sessionId) {
+    try {
+      const group = await addMember(groupId, sessionId);
+      const sessionRows = await db
+        .select()
+        .from(sessions)
+        .where(eq(sessions.id, sessionId))
+        .limit(1);
+      broadcastToAll({ type: "group:changed", groupId });
+      return NextResponse.json(
+        { data: { session: rowToSession(sessionRows[0]), group } },
+        { status: 201 }
+      );
+    } catch (err) {
+      if (err instanceof GroupConstraintError) {
+        const status = err.code === "session_not_found" ? 404 : 400;
+        return NextResponse.json(
+          { error: err.message, code: err.code },
+          { status }
+        );
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      return NextResponse.json({ error: msg }, { status: 500 });
+    }
+  }
+
+  if (!serverId) {
+    return NextResponse.json(
+      { error: "either sessionId or serverId is required" },
+      { status: 400 }
+    );
+  }
 
   // Mirror the gating logic of POST /api/servers/[id]/sessions: refuse
   // if the agent is stopped/installing, and honor the per-server

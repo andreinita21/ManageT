@@ -521,6 +521,11 @@ struct CliGroupDetail {
     group: Group,
     layout: Option<GroupLayout>,
     servers: Vec<CliServer>,
+    /// Free standalone sessions eligible to join this group (not in a
+    /// stack, not in another group, still alive). Drives the "existing
+    /// terminals" section of the Ctrl-A N picker. Older dashboards omit it.
+    #[serde(default)]
+    free_sessions: Vec<GroupSession>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -581,15 +586,66 @@ struct Pane {
     lost: Option<String>,
 }
 
-/// Inline server-picker state when the user hits Ctrl-A N. The view
-/// previews a layout one slot larger (existing panes shrink), and the
-/// new slot is occupied by a list of available servers. Confirm
-/// creates+links the session; cancel restores the prior layout.
+/// One selectable entry in the Ctrl-A N picker: attach an EXISTING free
+/// session, or launch a NEW session on a server.
+#[derive(Clone)]
+enum PickerChoice {
+    Existing { session_id: String, label: String },
+    NewOnServer { server_id: String, label: String },
+}
+
+impl PickerChoice {
+    fn label(&self) -> &str {
+        match self {
+            PickerChoice::Existing { label, .. } => label,
+            PickerChoice::NewOnServer { label, .. } => label,
+        }
+    }
+}
+
+/// Build the picker's combined choice list: existing free sessions first
+/// (so they're the quick default), then "launch new" per server.
+fn build_picker_choices(
+    free_sessions: &[GroupSession],
+    servers: &[CliServer],
+) -> Vec<PickerChoice> {
+    let mut out = Vec::new();
+    for s in free_sessions {
+        let server = servers
+            .iter()
+            .find(|sv| sv.id == s.server_id)
+            .map(|sv| if sv.name.is_empty() { sv.host.clone() } else { sv.name.clone() })
+            .unwrap_or_else(|| short_id(&s.server_id));
+        out.push(PickerChoice::Existing {
+            session_id: s.id.clone(),
+            label: format!("{}  ({})", s.session_name, server),
+        });
+    }
+    for sv in servers {
+        let label = if sv.name.is_empty() {
+            format!("{}@{}", sv.username, sv.host)
+        } else {
+            format!("{}  ({}@{})", sv.name, sv.username, sv.host)
+        };
+        out.push(PickerChoice::NewOnServer {
+            server_id: sv.id.clone(),
+            label,
+        });
+    }
+    out
+}
+
+/// Inline picker state when the user hits Ctrl-A N. The view previews a
+/// layout one slot larger (existing panes shrink), and the new slot lists
+/// the available choices (existing free sessions + launch-new servers).
+/// Confirm attaches/creates; cancel restores the prior layout.
 struct PickerState {
     /// Rect of the empty new slot — picker is drawn here.
     target_rect: Rect,
-    /// Highlighted server index in `current_servers`.
+    /// Highlighted index into `choices`.
     selected: usize,
+    /// The combined existing-sessions + launch-new-servers list.
+    choices: Vec<PickerChoice>,
     /// Layout/partition to restore if the user cancels or the API call
     /// fails. Saved at entry so a poll that fires mid-pick can't
     /// clobber the user's prior view.
@@ -815,6 +871,81 @@ pub async fn fetch_session_group_map() -> HashMap<String, String> {
         }
     }
     map
+}
+
+/// Interactive prompt fired from a solo `managet attach` via Ctrl-A G:
+/// add the attached session to an existing group or create a new one.
+/// Runs in cooked mode (the attach loop suspends raw mode around it) and
+/// uses `inquire`, like `pick_server_interactive`. Best-effort: missing
+/// login / unreachable dashboard / API errors print a line and return Ok.
+pub async fn run_attach_group_prompt(session_id: String) -> Result<()> {
+    let cfg = match load_config() {
+        Ok(c) => c,
+        Err(_) => {
+            println!("\r\nNot logged in — run `managet login` first.");
+            return Ok(());
+        }
+    };
+    let payload = match fetch_group_list_payload(&cfg).await {
+        Ok(p) => p,
+        Err(e) => {
+            println!("\r\nCould not reach the dashboard: {e}");
+            return Ok(());
+        }
+    };
+
+    const CREATE: &str = "➕  Create new group…";
+    let mut items: Vec<String> = payload.groups.iter().map(|g| g.name.clone()).collect();
+    items.push(CREATE.to_string());
+
+    let choice = match Select::new("Add this terminal to a group:", items)
+        .with_help_message("↑/↓ select · Enter confirm · Esc cancel")
+        .prompt()
+    {
+        Ok(c) => c,
+        Err(_) => return Ok(()), // cancelled
+    };
+
+    if choice == CREATE {
+        let name = match Text::new("New group name:").prompt() {
+            Ok(n) if !n.trim().is_empty() => n.trim().to_string(),
+            _ => return Ok(()),
+        };
+        let body = serde_json::json!({ "name": name, "sessionId": session_id });
+        match post_json::<_, serde_json::Value>(&cfg, "/api/cli/groups", &body).await {
+            Ok(_) => println!(
+                "{} created group {} with this terminal.",
+                "✓".green(),
+                name.white().bold()
+            ),
+            Err(e) => println!("{} {e}", "✗".red()),
+        }
+    } else {
+        let group_id = payload
+            .groups
+            .iter()
+            .find(|g| g.name == choice)
+            .map(|g| g.id.clone());
+        let Some(group_id) = group_id else {
+            return Ok(());
+        };
+        let body = serde_json::json!({ "sessionId": session_id });
+        match post_json::<_, serde_json::Value>(
+            &cfg,
+            &format!("/api/cli/groups/{group_id}/members"),
+            &body,
+        )
+        .await
+        {
+            Ok(_) => println!(
+                "{} added this terminal to {}.",
+                "✓".green(),
+                choice.white().bold()
+            ),
+            Err(e) => println!("{} {e}", "✗".red()),
+        }
+    }
+    Ok(())
 }
 
 pub async fn run_group_list() -> Result<()> {
@@ -1878,6 +2009,7 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
         group,
         layout,
         servers,
+        ..
     } = fetch_group_detail(&cfg, &group_id).await?;
     if group.members.is_empty() {
         bail!("group has no terminals");
@@ -1983,6 +2115,7 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
     let mut escape = false;
     let mut picker: Option<PickerState> = None;
     let mut confirm: Option<ConfirmState> = None;
+    let mut layout_picker: Option<LayoutPickerState> = None;
     loop {
         tokio::select! {
             maybe_event = event_rx.recv() => {
@@ -2052,7 +2185,7 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                         // is still attached and could otherwise eat the
                         // input we typed into the picker).
                         if picker.is_some() {
-                            match handle_picker_key(key, picker.as_mut().unwrap(), current_servers.len()) {
+                            match handle_picker_key(key, picker.as_mut().unwrap()) {
                                 PickerKeyResult::Idle => {}
                                 PickerKeyResult::Cancel => {
                                     let p = picker.take().unwrap();
@@ -2067,11 +2200,15 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                                 }
                                 PickerKeyResult::Confirm => {
                                     let p = picker.take().unwrap();
-                                    let server_id = current_servers
-                                        .get(p.selected)
-                                        .map(|s| s.id.clone());
-                                    if let Some(server_id) = server_id {
-                                        let body = serde_json::json!({ "serverId": server_id });
+                                    let body = p.choices.get(p.selected).map(|c| match c {
+                                        PickerChoice::Existing { session_id, .. } => {
+                                            serde_json::json!({ "sessionId": session_id })
+                                        }
+                                        PickerChoice::NewOnServer { server_id, .. } => {
+                                            serde_json::json!({ "serverId": server_id })
+                                        }
+                                    });
+                                    if let Some(body) = body {
                                         let res = post_json::<_, AddMemberResponse>(
                                             &cfg,
                                             &format!("/api/cli/groups/{group_id}/members"),
@@ -2147,6 +2284,81 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                             continue;
                         }
 
+                        // Layout overlay short-circuit: arrows move the
+                        // selection, Enter applies + persists, Esc cancels.
+                        if layout_picker.is_some() {
+                            let lp = layout_picker.as_mut().unwrap();
+                            match key.code {
+                                KeyCode::Left | KeyCode::Up | KeyCode::Char('h') | KeyCode::Char('k') => {
+                                    if lp.selected > 0 { lp.selected -= 1; }
+                                }
+                                KeyCode::Right | KeyCode::Down | KeyCode::Char('l') | KeyCode::Char('j') => {
+                                    if lp.selected + 1 < lp.options.len() { lp.selected += 1; }
+                                }
+                                KeyCode::Home => lp.selected = 0,
+                                KeyCode::End => lp.selected = lp.options.len().saturating_sub(1),
+                                KeyCode::Enter => {
+                                    let lp = layout_picker.take().unwrap();
+                                    if let Some(partition) = lp.options.get(lp.selected).cloned() {
+                                        let new_layout = layout_for_partition(&partition);
+                                        current_layout = new_layout.clone();
+                                        current_partition = partition;
+                                        let (c, r) = terminal::size().unwrap_or((120, 36));
+                                        apply_resize(&mut panes, &current_layout, &current_partition, c, r);
+                                        for pane in &panes {
+                                            if let Some(session) = &pane.session {
+                                                let (h, w) = pane_inner_size(pane.rect);
+                                                send_ws(&send_tx, client_resize_msg(session, h, w)).await?;
+                                            }
+                                        }
+                                        // Persist for the browser too (best-effort).
+                                        let _ = save_group_layout(&cfg, &group_id, &current_layout).await;
+                                    }
+                                }
+                                KeyCode::Esc => { layout_picker = None; }
+                                _ => {}
+                            }
+                            draw_group(
+                                &mut stdout,
+                                &current_group,
+                                &panes,
+                                focused,
+                                None,
+                                None,
+                                &current_servers,
+                            )?;
+                            if let Some(lp) = layout_picker.as_ref() {
+                                draw_layout_overlay(&mut stdout, lp)?;
+                            }
+                            continue;
+                        }
+
+                        // Ctrl-A V opens the layout-arrangement overlay.
+                        if escape && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')) {
+                            escape = false;
+                            let options = allowed_partitions(panes.len());
+                            if !options.is_empty() {
+                                let selected = options
+                                    .iter()
+                                    .position(|p| p == &current_partition)
+                                    .unwrap_or(0);
+                                layout_picker = Some(LayoutPickerState { options, selected });
+                                draw_group(
+                                    &mut stdout,
+                                    &current_group,
+                                    &panes,
+                                    focused,
+                                    None,
+                                    None,
+                                    &current_servers,
+                                )?;
+                                if let Some(lp) = layout_picker.as_ref() {
+                                    draw_layout_overlay(&mut stdout, lp)?;
+                                }
+                            }
+                            continue;
+                        }
+
                         // Ctrl-A N opens the inline picker — pre-allocate a
                         // slot, drop the user's input mode, render the
                         // server list inside the new pane.
@@ -2154,11 +2366,20 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                             && matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N'))
                         {
                             escape = false;
+                            // Pull a fresh detail so the picker lists the
+                            // currently-free standalone sessions plus the
+                            // servers; fall back to servers-only if the
+                            // fetch fails.
+                            let choices = match fetch_group_detail(&cfg, &group_id).await {
+                                Ok(d) => build_picker_choices(&d.free_sessions, &d.servers),
+                                Err(_) => build_picker_choices(&[], &current_servers),
+                            };
                             if let Some(p) = enter_picker_mode(
                                 &mut panes,
                                 &mut current_layout,
                                 &mut current_partition,
                                 &send_tx,
+                                choices,
                             )
                             .await?
                             {
@@ -2332,6 +2553,9 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                             confirm.as_ref(),
                             &current_servers,
                         )?;
+                        if let Some(lp) = layout_picker.as_ref() {
+                            draw_layout_overlay(&mut stdout, lp)?;
+                        }
                     }
                     _ => {}
                 }
@@ -2340,19 +2564,10 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                 match maybe_msg {
                     Some(Ok(Message::Text(text))) => {
                         handle_server_msg(&mut panes, text.as_str(), &send_tx).await;
-                        draw_group(
-                            &mut stdout,
-                            &current_group,
-                            &panes,
-                            focused,
-                            picker.as_ref(),
-                            confirm.as_ref(),
-                            &current_servers,
-                        )?;
-                    }
-                    Some(Ok(Message::Binary(bytes))) => {
-                        if let Ok(text) = std::str::from_utf8(&bytes) {
-                            handle_server_msg(&mut panes, text, &send_tx).await;
+                        // Skip the repaint while the layout overlay is up so
+                        // it isn't erased; output is still parsed above and
+                        // shows once the overlay closes.
+                        if layout_picker.is_none() {
                             draw_group(
                                 &mut stdout,
                                 &current_group,
@@ -2364,6 +2579,22 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                             )?;
                         }
                     }
+                    Some(Ok(Message::Binary(bytes))) => {
+                        if let Ok(text) = std::str::from_utf8(&bytes) {
+                            handle_server_msg(&mut panes, text, &send_tx).await;
+                            if layout_picker.is_none() {
+                                draw_group(
+                                    &mut stdout,
+                                    &current_group,
+                                    &panes,
+                                    focused,
+                                    picker.as_ref(),
+                                    confirm.as_ref(),
+                                    &current_servers,
+                                )?;
+                            }
+                        }
+                    }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(anyhow!("websocket error: {e}")),
@@ -2373,7 +2604,7 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                 // Don't fight the user mid-overlay — once they've opened
                 // the inline picker or a Y/n confirm modal we freeze
                 // the periodic refresh until they finish.
-                if picker.is_some() || confirm.is_some() {
+                if picker.is_some() || confirm.is_some() || layout_picker.is_some() {
                     continue;
                 }
                 // Best-effort: a transient HTTP failure shouldn't drop
@@ -2471,6 +2702,7 @@ async fn reconcile_after_fetch(
         group: new_group,
         layout: new_layout,
         servers: new_servers,
+        ..
     } = latest;
     *current_group = new_group;
     *current_servers = new_servers;
@@ -2518,11 +2750,54 @@ async fn reconcile_after_fetch(
 }
 
 
-fn handle_picker_key(
-    key: KeyEvent,
-    picker: &mut PickerState,
-    server_count: usize,
-) -> PickerKeyResult {
+/// Ctrl-A V layout overlay: pick a row arrangement (the same options the
+/// web dashboard offers) from a horizontal strip of mini-grid previews.
+struct LayoutPickerState {
+    options: Vec<Vec<usize>>,
+    selected: usize,
+}
+
+/// "2 + 2" style label for a partition.
+fn partition_label(p: &[usize]) -> String {
+    p.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(" + ")
+}
+
+/// A small 3-line × 9-col block-grid preview of a partition (rows of cells).
+fn partition_preview(p: &[usize]) -> [String; 3] {
+    const W: usize = 9;
+    const H: usize = 3;
+    let rows = p.len().max(1);
+    let mut lines: [String; 3] = [String::new(), String::new(), String::new()];
+    for (line_idx, line) in lines.iter_mut().enumerate() {
+        // Which partition band this preview line belongs to.
+        let band = (line_idx * rows / H).min(rows - 1);
+        let count = (*p.get(band).unwrap_or(&1)).max(1);
+        // Split W columns into `count` cells separated by single-space gaps.
+        let gap = count.saturating_sub(1);
+        let fill = W.saturating_sub(gap);
+        let base = fill / count;
+        let extra = fill % count;
+        let mut s = String::with_capacity(W);
+        for c in 0..count {
+            if c > 0 {
+                s.push(' ');
+            }
+            let cw = base + if c < extra { 1 } else { 0 };
+            for _ in 0..cw.max(1) {
+                s.push('█');
+            }
+        }
+        // Pad to width.
+        while s.chars().count() < W {
+            s.push(' ');
+        }
+        *line = s;
+    }
+    lines
+}
+
+fn handle_picker_key(key: KeyEvent, picker: &mut PickerState) -> PickerKeyResult {
+    let count = picker.choices.len();
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => {
             if picker.selected > 0 {
@@ -2531,7 +2806,7 @@ fn handle_picker_key(
             PickerKeyResult::Idle
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if picker.selected + 1 < server_count {
+            if picker.selected + 1 < count {
                 picker.selected += 1;
             }
             PickerKeyResult::Idle
@@ -2541,7 +2816,7 @@ fn handle_picker_key(
             PickerKeyResult::Idle
         }
         KeyCode::End => {
-            picker.selected = server_count.saturating_sub(1);
+            picker.selected = count.saturating_sub(1);
             PickerKeyResult::Idle
         }
         KeyCode::Enter => PickerKeyResult::Confirm,
@@ -2554,15 +2829,16 @@ fn handle_picker_key(
 /// layout one slot larger, send a WS resize so the remote PTYs reflow,
 /// and return a `PickerState` pointing at the freshly-opened slot.
 /// Returns `Ok(None)` (a no-op) when the group is already at the
-/// 6-member cap or the user has no servers registered yet, so the
-/// caller can leave the view as-is.
+/// 6-member cap or there's nothing to pick (no free sessions and no
+/// servers), so the caller can leave the view as-is.
 async fn enter_picker_mode(
     panes: &mut [Pane],
     current_layout: &mut GroupLayout,
     current_partition: &mut Vec<usize>,
     send_tx: &mpsc::Sender<String>,
+    choices: Vec<PickerChoice>,
 ) -> Result<Option<PickerState>> {
-    if panes.len() >= 6 {
+    if panes.len() >= 6 || choices.is_empty() {
         return Ok(None);
     }
     let new_count = panes.len() + 1;
@@ -2597,6 +2873,7 @@ async fn enter_picker_mode(
     Ok(Some(PickerState {
         target_rect: rects[new_count - 1],
         selected: 0,
+        choices,
         saved_layout,
         saved_partition,
     }))
@@ -2808,7 +3085,7 @@ fn draw_group(
     focused: usize,
     picker: Option<&PickerState>,
     confirm: Option<&ConfirmState>,
-    servers: &[CliServer],
+    _servers: &[CliServer],
 ) -> Result<()> {
     queue!(stdout, Hide, MoveTo(0, 0), Clear(ClearType::All))?;
     let (cols, _) = terminal::size().unwrap_or((120, 36));
@@ -2830,7 +3107,7 @@ fn draw_group(
         draw_pane(stdout, pane, active, i + 1)?;
     }
     if let Some(p) = picker {
-        draw_picker(stdout, p, servers, panes.len() + 1)?;
+        draw_picker(stdout, p, panes.len() + 1)?;
     }
     if let Some(c) = confirm {
         draw_confirm(stdout, c)?;
@@ -2873,7 +3150,7 @@ fn draw_status_bar(
     } else if picker_active {
         "↑/↓ pick · Enter confirm · Esc cancel"
     } else {
-        "Ctrl-A D detach · 1-6 focus · [/] cycle · N add · X detach pane · K kill"
+        "Ctrl-A D detach · 1-6 focus · [/] cycle · N add · V layout · X detach · K kill"
     };
 
     let t = theme();
@@ -3085,12 +3362,7 @@ fn draw_pane(stdout: &mut Stdout, pane: &Pane, active: bool, slot: usize) -> Res
 /// slot. Uses the same Unicode border treatment as `draw_pane` so the
 /// new slot visually belongs to the mosaic, with a cyan-bold title
 /// announcing the picker mode.
-fn draw_picker(
-    stdout: &mut Stdout,
-    picker: &PickerState,
-    servers: &[CliServer],
-    slot: usize,
-) -> Result<()> {
+fn draw_picker(stdout: &mut Stdout, picker: &PickerState, slot: usize) -> Result<()> {
     let r = picker.target_rect;
     if r.w < 4 || r.h < 3 {
         return Ok(());
@@ -3119,7 +3391,7 @@ fn draw_picker(
         ResetColor,
     )?;
 
-    let title = format!("● {slot} pick server");
+    let title = format!("● {slot} add terminal");
     let max_title = r.w.saturating_sub(4) as usize;
     queue!(
         stdout,
@@ -3134,63 +3406,181 @@ fn draw_picker(
     let inner_w = r.w.saturating_sub(2) as usize;
     let inner_h = r.h.saturating_sub(2) as usize;
 
-    if servers.is_empty() {
+    if picker.choices.is_empty() {
         queue!(
             stdout,
             MoveTo(r.x + 1, r.y + 1),
             SetForegroundColor(t.warning),
-            Print(pad_visible("(no servers on this account)", inner_w)),
+            Print(pad_visible("(nothing to add)", inner_w)),
             ResetColor,
         )?;
         return Ok(());
     }
 
-    // Keep the highlighted row on screen even when the server list is
-    // longer than the slot height — same scroll-window trick the
-    // dashboard's picker uses.
-    let max_visible = inner_h.saturating_sub(1).max(1);
-    let scroll = picker
-        .selected
-        .saturating_sub(max_visible.saturating_sub(1));
-    let header = pad_visible("Press Enter to attach this slot to:", inner_w);
+    // Render a "rows" list with section labels inserted before the first
+    // existing-session row and the first launch-new row. Each rendered
+    // row is either a header (dim, non-selectable) or a choice.
+    enum Disp<'a> {
+        Header(&'a str),
+        Choice(usize), // index into picker.choices
+    }
+    let mut rows: Vec<Disp> = Vec::new();
+    let has_existing = picker
+        .choices
+        .iter()
+        .any(|c| matches!(c, PickerChoice::Existing { .. }));
+    let mut emitted_existing_header = false;
+    let mut emitted_new_header = false;
+    for (i, c) in picker.choices.iter().enumerate() {
+        match c {
+            PickerChoice::Existing { .. } => {
+                if !emitted_existing_header {
+                    rows.push(Disp::Header("Existing terminals"));
+                    emitted_existing_header = true;
+                }
+            }
+            PickerChoice::NewOnServer { .. } => {
+                if !emitted_new_header {
+                    rows.push(Disp::Header(if has_existing {
+                        "Launch new on…"
+                    } else {
+                        "Launch new on which server?"
+                    }));
+                    emitted_new_header = true;
+                }
+            }
+        }
+        rows.push(Disp::Choice(i));
+    }
+
+    // Scroll window keyed on the selected choice's display row.
+    let sel_row = rows
+        .iter()
+        .position(|d| matches!(d, Disp::Choice(i) if *i == picker.selected))
+        .unwrap_or(0);
+    let max_visible = inner_h.max(1);
+    let scroll = sel_row.saturating_sub(max_visible.saturating_sub(1));
+
+    for (row_idx, disp) in rows.iter().enumerate().skip(scroll).take(max_visible).enumerate() {
+        let (_, disp) = disp;
+        let y = r.y + 1 + row_idx as u16;
+        queue!(stdout, MoveTo(r.x + 1, y))?;
+        match disp {
+            Disp::Header(h) => {
+                let line = pad_visible(&truncate(h, inner_w), inner_w);
+                queue!(stdout, SetForegroundColor(t.hint), Print(line), ResetColor)?;
+            }
+            Disp::Choice(i) => {
+                let selected = *i == picker.selected;
+                let marker = if selected { "▸ " } else { "  " };
+                let line = pad_visible(
+                    &truncate(&format!("{marker}{}", picker.choices[*i].label()), inner_w),
+                    inner_w,
+                );
+                if selected {
+                    queue!(
+                        stdout,
+                        SetForegroundColor(t.selected_fg),
+                        SetBackgroundColor(t.selected_bg),
+                        SetAttribute(Attribute::Bold),
+                        Print(line),
+                        SetAttribute(Attribute::Reset),
+                        ResetColor,
+                    )?;
+                } else {
+                    queue!(stdout, SetForegroundColor(t.name), Print(line), ResetColor)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Centered overlay listing the available row arrangements as a horizontal
+/// strip of mini-grid previews; the selected one is boxed in the accent
+/// color. Navigate with arrows, Enter applies, Esc cancels.
+fn draw_layout_overlay(stdout: &mut Stdout, lp: &LayoutPickerState) -> Result<()> {
+    let t = theme();
+    let (cols, rows) = terminal::size().unwrap_or((120, 36));
+    const CARD_W: u16 = 11; // 9-wide preview + 1 padding each side
+    const CARD_H: u16 = 6; // 1 top label gap + 3 preview + 1 label + 1
+    const GAP: u16 = 2;
+    let n = lp.options.len().max(1) as u16;
+    let strip_w = n * CARD_W + (n.saturating_sub(1)) * GAP;
+    let modal_w = (strip_w + 6).min(cols);
+    let modal_h: u16 = CARD_H + 4;
+    let modal_x = cols.saturating_sub(modal_w) / 2;
+    let modal_y = rows.saturating_sub(modal_h) / 2;
+    let b = t.borders;
+
+    let horizontal = b.h.repeat(modal_w.saturating_sub(2) as usize);
     queue!(
         stdout,
-        MoveTo(r.x + 1, r.y + 1),
-        SetForegroundColor(t.hint),
-        Print(header),
+        SetForegroundColor(t.accent),
+        MoveTo(modal_x, modal_y),
+        Print(b.tl),
+        Print(&horizontal),
+        Print(b.tr),
+    )?;
+    for y in modal_y + 1..modal_y + modal_h.saturating_sub(1) {
+        queue!(stdout, MoveTo(modal_x, y), Print(b.v))?;
+        queue!(stdout, MoveTo(modal_x + modal_w.saturating_sub(1), y), Print(b.v))?;
+        // Clear interior so panes underneath don't show through.
+        let interior = " ".repeat(modal_w.saturating_sub(2) as usize);
+        queue!(stdout, MoveTo(modal_x + 1, y), ResetColor, Print(interior), SetForegroundColor(t.accent), MoveTo(modal_x + modal_w.saturating_sub(1), y), Print(b.v))?;
+    }
+    queue!(
+        stdout,
+        MoveTo(modal_x, modal_y + modal_h.saturating_sub(1)),
+        Print(b.bl),
+        Print(&horizontal),
+        Print(b.br),
+        ResetColor,
+    )?;
+    queue!(
+        stdout,
+        MoveTo(modal_x + 2, modal_y),
+        SetForegroundColor(t.heading),
+        SetAttribute(Attribute::Bold),
+        Print(" Layout  (←/→ choose · Enter apply · Esc cancel) "),
+        SetAttribute(Attribute::Reset),
         ResetColor,
     )?;
 
-    for (row_idx, (i, server)) in servers
-        .iter()
-        .enumerate()
-        .skip(scroll)
-        .take(max_visible)
-        .enumerate()
-    {
-        let label = if server.name.is_empty() {
-            format!("{}@{}", server.username, server.host)
-        } else {
-            format!("{}  ({}@{})", server.name, server.username, server.host)
-        };
-        let marker = if i == picker.selected { "▸ " } else { "  " };
-        let line = pad_visible(&truncate(&format!("{marker}{label}"), inner_w), inner_w);
-        let y = r.y + 2 + row_idx as u16;
-        queue!(stdout, MoveTo(r.x + 1, y))?;
-        if i == picker.selected {
+    let strip_x = modal_x + (modal_w.saturating_sub(strip_w)) / 2;
+    let card_y = modal_y + 2;
+    for (i, opt) in lp.options.iter().enumerate() {
+        let cx = strip_x + i as u16 * (CARD_W + GAP);
+        let selected = i == lp.selected;
+        let color = if selected { t.accent } else { t.border_inactive };
+        let preview = partition_preview(opt);
+        for (row, line) in preview.iter().enumerate() {
+            queue!(
+                stdout,
+                MoveTo(cx + 1, card_y + row as u16),
+                SetForegroundColor(color),
+                Print(line),
+                ResetColor,
+            )?;
+        }
+        let label = partition_label(opt);
+        let label_x = cx + (CARD_W.saturating_sub(label.chars().count() as u16)) / 2;
+        queue!(stdout, MoveTo(label_x, card_y + 3))?;
+        if selected {
             queue!(
                 stdout,
                 SetForegroundColor(t.selected_fg),
                 SetBackgroundColor(t.selected_bg),
                 SetAttribute(Attribute::Bold),
-                Print(line),
+                Print(format!(" {label} ")),
                 SetAttribute(Attribute::Reset),
                 ResetColor,
             )?;
         } else {
-            queue!(stdout, SetForegroundColor(t.name), Print(line), ResetColor)?;
+            queue!(stdout, SetForegroundColor(t.hint), Print(label), ResetColor)?;
         }
     }
+    stdout.flush()?;
     Ok(())
 }
 
