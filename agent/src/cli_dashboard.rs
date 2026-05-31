@@ -1713,12 +1713,12 @@ pub async fn run_stack_open(
             maybe_msg = ws_read.next() => {
                 match maybe_msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_server_msg(&mut panes, text.as_str());
+                        handle_server_msg(&mut panes, text.as_str(), &send_tx).await;
                         draw_stack(&mut stdout, &stack_title, &panes, focused)?;
                     }
                     Some(Ok(Message::Binary(bytes))) => {
                         if let Ok(text) = std::str::from_utf8(&bytes) {
-                            handle_server_msg(&mut panes, text);
+                            handle_server_msg(&mut panes, text, &send_tx).await;
                             draw_stack(&mut stdout, &stack_title, &panes, focused)?;
                         }
                     }
@@ -2339,7 +2339,7 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
             maybe_msg = ws_read.next() => {
                 match maybe_msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_server_msg(&mut panes, text.as_str());
+                        handle_server_msg(&mut panes, text.as_str(), &send_tx).await;
                         draw_group(
                             &mut stdout,
                             &current_group,
@@ -2352,7 +2352,7 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                     }
                     Some(Ok(Message::Binary(bytes))) => {
                         if let Ok(text) = std::str::from_utf8(&bytes) {
-                            handle_server_msg(&mut panes, text);
+                            handle_server_msg(&mut panes, text, &send_tx).await;
                             draw_group(
                                 &mut stdout,
                                 &current_group,
@@ -2687,7 +2687,7 @@ async fn handle_key(
     Ok(false)
 }
 
-fn handle_server_msg(panes: &mut [Pane], text: &str) {
+async fn handle_server_msg(panes: &mut [Pane], text: &str, send_tx: &mpsc::Sender<String>) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return;
     };
@@ -2720,6 +2720,38 @@ fn handle_server_msg(panes: &mut [Pane], text: &str) {
                 .find(|p| p.session.as_ref().map(|s| s.id.as_str()) == Some(session_id))
             {
                 pane.lost = Some(reason);
+            }
+        }
+        Some("session:state") => {
+            // The dashboard has confirmed the attach and the live output
+            // pipe is now up. Nudge a resize — a one-column "wiggle" back to
+            // the pane size — so the remote shell repaints its prompt now
+            // that we're subscribed. Without this, a slow cross-server
+            // attach can race ahead of its subscription and miss the
+            // initial resize's redraw, leaving the pane blank until the user
+            // presses Enter. The two distinct sizes guarantee a SIGWINCH
+            // regardless of the session's prior size.
+            let Some(session_id) = value
+                .get("session")
+                .and_then(|s| s.get("sessionId"))
+                .and_then(|v| v.as_str())
+            else {
+                return;
+            };
+            let target = panes.iter().find_map(|p| {
+                let s = p.session.as_ref()?;
+                if s.id == session_id {
+                    Some((s.clone(), pane_inner_size(p.rect)))
+                } else {
+                    None
+                }
+            });
+            if let Some((session, (h, w))) = target {
+                let w0 = w.saturating_sub(1).max(8);
+                if w0 != w {
+                    let _ = send_ws(send_tx, client_resize_msg(&session, h, w0)).await;
+                }
+                let _ = send_ws(send_tx, client_resize_msg(&session, h, w)).await;
             }
         }
         _ => {}
