@@ -244,7 +244,17 @@ pub async fn run_attach(id: String) -> Result<()> {
         let mut out = std::io::stdout();
         let _ = bar.leave(&mut out);
     }
-    pipe_result
+
+    // Ctrl-A G that joined/created a group asks us to switch straight into
+    // that group's mosaic. Drop our raw-mode guard first so the mosaic's
+    // own terminal setup starts from a clean cooked state.
+    if let Ok(Some(group_id)) = &pipe_result {
+        let group_id = group_id.clone();
+        drop(_raw);
+        return crate::cli_dashboard::run_group_open(group_id, None).await;
+    }
+
+    pipe_result.map(|_| ())
 }
 
 /// Heart of `attach`: copies bytes both ways, watches for the detach
@@ -265,7 +275,7 @@ async fn pipe_attach(
     mut socket_writer: tokio::net::unix::OwnedWriteHalf,
     raw: &RawMode,
     session_id: String,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
 
@@ -289,7 +299,7 @@ async fn pipe_attach(
             // Bytes from the agent → write to user's stdout.
             r = socket_reader.read(&mut sock_buf) => {
                 match r {
-                    Ok(0) => return Ok(()),
+                    Ok(0) => return Ok(None),
                     Err(e) => return Err(anyhow!("socket read: {e}")),
                     Ok(n) => {
                         stdout.write_all(&sock_buf[..n]).await?;
@@ -301,7 +311,7 @@ async fn pipe_attach(
             // forward to agent.
             r = stdin.read(&mut stdin_buf) => {
                 match r {
-                    Ok(0) => return Ok(()), // local EOF, detach
+                    Ok(0) => return Ok(None), // local EOF, detach
                     Err(e) => return Err(anyhow!("stdin read: {e}")),
                     Ok(n) => {
                         let mut out: Vec<u8> = Vec::with_capacity(n);
@@ -323,7 +333,7 @@ async fn pipe_attach(
                                             socket_writer.write_all(&out).await?;
                                         }
                                         eprintln!("\r\n[managet] detached.");
-                                        return Ok(());
+                                        return Ok(None);
                                     } else if b == b'g' || b == b'G' {
                                         // Ctrl-A G: add this session to a
                                         // group / create one. Flush pending
@@ -339,14 +349,22 @@ async fn pipe_attach(
                                         raw.suspend();
                                         let _ = stdout.write_all(b"\r\n").await;
                                         let _ = stdout.flush().await;
-                                        let _ = crate::cli_dashboard::run_attach_group_prompt(
+                                        let chosen = crate::cli_dashboard::run_attach_group_prompt(
                                             session_id.clone(),
                                         )
-                                        .await;
+                                        .await
+                                        .ok()
+                                        .flatten();
                                         raw.resume();
-                                        // Repaint: SIGWINCH-style resize so
-                                        // the shell redraws its prompt under
-                                        // the now-cleared prompt area.
+                                        if let Some(group_id) = chosen {
+                                            // Detach the solo view and hand
+                                            // control back to run_attach, which
+                                            // opens this group's mosaic.
+                                            return Ok(Some(group_id));
+                                        }
+                                        // Stayed solo: repaint via a
+                                        // SIGWINCH-style resize so the shell
+                                        // redraws its prompt cleanly.
                                         let (r, c) = local_term_size().unwrap_or((24, 80));
                                         let _ = send_resize(&session_id, r, c).await;
                                     } else if b == CTRL_A {

@@ -524,7 +524,8 @@ struct CliGroupDetail {
     /// Free standalone sessions eligible to join this group (not in a
     /// stack, not in another group, still alive). Drives the "existing
     /// terminals" section of the Ctrl-A N picker. Older dashboards omit it.
-    #[serde(default)]
+    /// The API sends this as `freeSessions` (camelCase).
+    #[serde(default, rename = "freeSessions")]
     free_sessions: Vec<GroupSession>,
 }
 
@@ -877,20 +878,24 @@ pub async fn fetch_session_group_map() -> HashMap<String, String> {
 /// add the attached session to an existing group or create a new one.
 /// Runs in cooked mode (the attach loop suspends raw mode around it) and
 /// uses `inquire`, like `pick_server_interactive`. Best-effort: missing
-/// login / unreachable dashboard / API errors print a line and return Ok.
-pub async fn run_attach_group_prompt(session_id: String) -> Result<()> {
+/// login / unreachable dashboard / API errors print a line and return None.
+///
+/// Returns `Some(group_id)` of the group the session was added to / created,
+/// so the caller can immediately open that group's mosaic; `None` on
+/// cancel or error.
+pub async fn run_attach_group_prompt(session_id: String) -> Result<Option<String>> {
     let cfg = match load_config() {
         Ok(c) => c,
         Err(_) => {
             println!("\r\nNot logged in — run `managet login` first.");
-            return Ok(());
+            return Ok(None);
         }
     };
     let payload = match fetch_group_list_payload(&cfg).await {
         Ok(p) => p,
         Err(e) => {
             println!("\r\nCould not reach the dashboard: {e}");
-            return Ok(());
+            return Ok(None);
         }
     };
 
@@ -903,22 +908,31 @@ pub async fn run_attach_group_prompt(session_id: String) -> Result<()> {
         .prompt()
     {
         Ok(c) => c,
-        Err(_) => return Ok(()), // cancelled
+        Err(_) => return Ok(None), // cancelled
     };
 
     if choice == CREATE {
         let name = match Text::new("New group name:").prompt() {
             Ok(n) if !n.trim().is_empty() => n.trim().to_string(),
-            _ => return Ok(()),
+            _ => return Ok(None),
         };
         let body = serde_json::json!({ "name": name, "sessionId": session_id });
         match post_json::<_, serde_json::Value>(&cfg, "/api/cli/groups", &body).await {
-            Ok(_) => println!(
-                "{} created group {} with this terminal.",
-                "✓".green(),
-                name.white().bold()
-            ),
-            Err(e) => println!("{} {e}", "✗".red()),
+            Ok(group) => {
+                println!(
+                    "{} created group {} — opening…",
+                    "✓".green(),
+                    name.white().bold()
+                );
+                Ok(group
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()))
+            }
+            Err(e) => {
+                println!("{} {e}", "✗".red());
+                Ok(None)
+            }
         }
     } else {
         let group_id = payload
@@ -927,7 +941,7 @@ pub async fn run_attach_group_prompt(session_id: String) -> Result<()> {
             .find(|g| g.name == choice)
             .map(|g| g.id.clone());
         let Some(group_id) = group_id else {
-            return Ok(());
+            return Ok(None);
         };
         let body = serde_json::json!({ "sessionId": session_id });
         match post_json::<_, serde_json::Value>(
@@ -937,15 +951,20 @@ pub async fn run_attach_group_prompt(session_id: String) -> Result<()> {
         )
         .await
         {
-            Ok(_) => println!(
-                "{} added this terminal to {}.",
-                "✓".green(),
-                choice.white().bold()
-            ),
-            Err(e) => println!("{} {e}", "✗".red()),
+            Ok(_) => {
+                println!(
+                    "{} added to {} — opening…",
+                    "✓".green(),
+                    choice.white().bold()
+                );
+                Ok(Some(group_id))
+            }
+            Err(e) => {
+                println!("{} {e}", "✗".red());
+                Ok(None)
+            }
         }
     }
-    Ok(())
 }
 
 pub async fn run_group_list() -> Result<()> {
