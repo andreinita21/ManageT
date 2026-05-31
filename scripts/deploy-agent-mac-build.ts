@@ -169,10 +169,18 @@ async function main() {
   console.log(`  ${inst.out.trim()}`);
 
   step("5", "Re-bootstrapping launchd unit");
-  const boot = await sudo(
-    c,
-    "launchctl bootstrap system /Library/LaunchDaemons/com.managet.agent.plist && sleep 2 && launchctl print system/com.managet.agent 2>&1 | grep -E 'state =|pid =' | head -3"
-  );
+  // launchctl bootstrap intermittently fails with "Input/output error"
+  // (exit 5) when the prior bootout hasn't fully settled — the service is
+  // still half-registered. A clean bootout + a few seconds' settle before
+  // bootstrap fixes it reliably; retry once for good measure.
+  const bootCmd =
+    "launchctl bootout system/com.managet.agent 2>/dev/null; sleep 3; " +
+    "launchctl bootstrap system /Library/LaunchDaemons/com.managet.agent.plist 2>&1; " +
+    "code=$?; " +
+    "if [ $code -ne 0 ]; then sleep 3; launchctl bootstrap system /Library/LaunchDaemons/com.managet.agent.plist 2>&1; code=$?; fi; " +
+    "sleep 2; launchctl print system/com.managet.agent 2>&1 | grep -E 'state =|pid =' | head -3; " +
+    "exit $code";
+  const boot = await sudo(c, bootCmd);
   require0(boot, "bootstrap");
   console.log(`  ${boot.out.trim()}`);
 
