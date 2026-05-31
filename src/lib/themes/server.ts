@@ -18,6 +18,11 @@ import {
   type GroupViewServerLabel,
   type ThemeColors,
 } from "@/lib/themes/presets";
+import {
+  resolveActiveName,
+  sanitizeCustomThemes,
+  type MosaicTheme,
+} from "@/lib/mosaic-themes/presets";
 
 export async function loadAppearancePreferences(): Promise<AppearancePreferences> {
   let userId: string | undefined;
@@ -50,12 +55,24 @@ export async function loadAppearancePreferences(): Promise<AppearancePreferences
     }
     const groupViewServerLabel: GroupViewServerLabel =
       row.groupViewServerLabel === "name" ? "name" : "host";
+    let mosaicCustomThemes: MosaicTheme[] = [];
+    if (row.mosaicCustomThemes) {
+      try {
+        mosaicCustomThemes = sanitizeCustomThemes(
+          JSON.parse(row.mosaicCustomThemes)
+        );
+      } catch {
+        mosaicCustomThemes = [];
+      }
+    }
     return {
       themeKey: row.themeKey,
       terminalFontFamily: row.terminalFontFamily,
       terminalFontSize: row.terminalFontSize,
       customTheme: custom,
       groupViewServerLabel,
+      mosaicThemeActive: resolveActiveName(row.mosaicThemeActive, mosaicCustomThemes),
+      mosaicCustomThemes,
     };
   } catch {
     return DEFAULT_PREFERENCES;

@@ -9,6 +9,8 @@
  * spec, and add the key to the union type ThemeKey. The Appearance
  * settings page picks them up automatically from PRESETS_BY_KEY.
  */
+import type { MosaicTheme } from "@/lib/mosaic-themes/presets";
+
 export interface UiPalette {
   bg: string;
   bgSecondary: string;
@@ -1079,6 +1081,11 @@ export interface AppearancePreferences {
   terminalFontSize: number;
   customTheme: ThemeColors | null;
   groupViewServerLabel: GroupViewServerLabel;
+  /** Active CLI-mosaic theme (built-in preset key or a custom theme name).
+   *  Synced to the Rust CLI via /api/cli/themes. */
+  mosaicThemeActive: string;
+  /** User-defined CLI-mosaic themes. See src/lib/mosaic-themes/presets.ts. */
+  mosaicCustomThemes: MosaicTheme[];
 }
 
 export const DEFAULT_PREFERENCES: AppearancePreferences = {
@@ -1087,6 +1094,8 @@ export const DEFAULT_PREFERENCES: AppearancePreferences = {
   terminalFontSize: 14,
   customTheme: null,
   groupViewServerLabel: "host",
+  mosaicThemeActive: "default",
+  mosaicCustomThemes: [],
 };
 
 /**

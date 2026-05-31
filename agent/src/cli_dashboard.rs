@@ -278,6 +278,176 @@ fn resolve_theme(cfg: &DashboardCliConfig, override_name: Option<&str>) -> Resul
     })
 }
 
+// --- Server-synced theme catalog ------------------------------------------
+// The dashboard is the source of truth for the theme catalog (built-in
+// presets + the user's web-designed customs) and the active selection. The
+// CLI fetches `/api/cli/themes`, which sends each theme's colors AND the 6
+// resolved border glyphs — so new line styles are a server-only change. The
+// compiled-in presets above remain the offline fallback.
+
+#[derive(Debug, Clone, Deserialize)]
+struct ThemeCatalogDto {
+    active: String,
+    themes: Vec<MosaicThemeDto>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MosaicThemeDto {
+    name: String,
+    #[serde(default)]
+    builtin: bool,
+    colors: MosaicColorsDto,
+    borders: BordersDto,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MosaicColorsDto {
+    border_active: String,
+    border_inactive: String,
+    title_active: String,
+    title_inactive: String,
+    heading: String,
+    name: String,
+    separator: String,
+    info: String,
+    hint: String,
+    server_label: String,
+    accent: String,
+    selected_fg: String,
+    selected_bg: String,
+    warning: String,
+    danger: String,
+    status_running: String,
+    status_idle: String,
+    status_closed: String,
+    status_unknown: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BordersDto {
+    tl: String,
+    tr: String,
+    bl: String,
+    br: String,
+    h: String,
+    v: String,
+}
+
+/// Parse a transport color token into a crossterm `Color`: `#rrggbb` → Rgb,
+/// a named token → the matching `Color::*` (so the `default` theme keeps its
+/// terminal-adaptive ANSI look), anything else → grey.
+fn parse_color(s: &str) -> Color {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix('#') {
+        if hex.len() == 6 {
+            if let (Ok(r), Ok(g), Ok(b)) = (
+                u8::from_str_radix(&hex[0..2], 16),
+                u8::from_str_radix(&hex[2..4], 16),
+                u8::from_str_radix(&hex[4..6], 16),
+            ) {
+                return Color::Rgb { r, g, b };
+            }
+        }
+        return Color::Grey;
+    }
+    match s {
+        "black" => Color::Black,
+        "dark_grey" | "dark_gray" => Color::DarkGrey,
+        "red" => Color::Red,
+        "dark_red" => Color::DarkRed,
+        "green" => Color::Green,
+        "dark_green" => Color::DarkGreen,
+        "yellow" => Color::Yellow,
+        "dark_yellow" => Color::DarkYellow,
+        "blue" => Color::Blue,
+        "dark_blue" => Color::DarkBlue,
+        "magenta" => Color::Magenta,
+        "dark_magenta" => Color::DarkMagenta,
+        "cyan" => Color::Cyan,
+        "dark_cyan" => Color::DarkCyan,
+        "white" => Color::White,
+        "grey" | "gray" => Color::Grey,
+        _ => Color::Grey,
+    }
+}
+
+/// Leak a small glyph string to satisfy `Borders`' `&'static str`. The active
+/// theme is built once per process, so this is a bounded, tiny leak.
+fn leak_glyph(s: &str) -> &'static str {
+    Box::leak(s.to_string().into_boxed_str())
+}
+
+fn theme_from_dto(dto: &MosaicThemeDto) -> Theme {
+    let c = &dto.colors;
+    Theme {
+        border_active: parse_color(&c.border_active),
+        border_inactive: parse_color(&c.border_inactive),
+        title_active: parse_color(&c.title_active),
+        title_inactive: parse_color(&c.title_inactive),
+        heading: parse_color(&c.heading),
+        name: parse_color(&c.name),
+        separator: parse_color(&c.separator),
+        info: parse_color(&c.info),
+        hint: parse_color(&c.hint),
+        server_label: parse_color(&c.server_label),
+        accent: parse_color(&c.accent),
+        selected_fg: parse_color(&c.selected_fg),
+        selected_bg: parse_color(&c.selected_bg),
+        warning: parse_color(&c.warning),
+        danger: parse_color(&c.danger),
+        status_running: parse_color(&c.status_running),
+        status_idle: parse_color(&c.status_idle),
+        status_closed: parse_color(&c.status_closed),
+        status_unknown: parse_color(&c.status_unknown),
+        borders: Borders {
+            tl: leak_glyph(&dto.borders.tl),
+            tr: leak_glyph(&dto.borders.tr),
+            bl: leak_glyph(&dto.borders.bl),
+            br: leak_glyph(&dto.borders.br),
+            h: leak_glyph(&dto.borders.h),
+            v: leak_glyph(&dto.borders.v),
+        },
+    }
+}
+
+async fn fetch_theme_catalog(cfg: &DashboardCliConfig) -> Result<ThemeCatalogDto> {
+    get_json::<ThemeCatalogDto>(cfg, "/api/cli/themes").await
+}
+
+/// Resolve the active mosaic theme. Prefer the server catalog (so web-created
+/// customs and the web-chosen active apply); fall back to the compiled-in
+/// presets + local config when the dashboard is unreachable.
+async fn resolve_active_theme(
+    cfg: &DashboardCliConfig,
+    override_name: Option<&str>,
+) -> Result<Theme> {
+    match fetch_theme_catalog(cfg).await {
+        Ok(cat) => {
+            let want = override_name
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| cat.active.clone());
+            let dto = cat
+                .themes
+                .iter()
+                .find(|t| t.name == want)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "unknown theme '{want}'; available: {}",
+                        cat.themes
+                            .iter()
+                            .map(|t| t.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?;
+            Ok(theme_from_dto(dto))
+        }
+        Err(_) => resolve_theme(cfg, override_name),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ApiEnvelope<T> {
     data: T,
@@ -511,54 +681,94 @@ pub async fn run_login(
 /// List the mosaic theme presets with an inline color swatch, marking the
 /// one currently selected (config `theme`, or `default`). Doesn't require
 /// being logged in — themes are a local rendering preference.
-pub async fn run_theme_list() -> Result<()> {
-    let current = load_config()
-        .ok()
-        .and_then(|c| c.theme)
-        .unwrap_or_else(|| "default".to_string());
+/// Render one row of `managet theme list`: marker + name (+ `*` for customs),
+/// a swatch of key role colors, and a line-style preview in the border color.
+fn print_theme_row(name: &str, th: &Theme, active: bool, builtin: bool) -> Result<()> {
+    let marker = if active { "●" } else { "○" };
+    let swatch_colors = [
+        th.border_active,
+        th.accent,
+        th.heading,
+        th.server_label,
+        th.status_running,
+        th.status_idle,
+        th.status_closed,
+    ];
+    let mut stdout = std::io::stdout();
+    let tag = if builtin { "" } else { " *" };
+    let name_label = format!("{marker} {name}{tag}");
+    queue!(
+        stdout,
+        Print("  "),
+        SetForegroundColor(if active { Color::White } else { Color::Grey }),
+        SetAttribute(if active { Attribute::Bold } else { Attribute::Reset }),
+        Print(format!("{:<24}", name_label)),
+        SetAttribute(Attribute::Reset),
+        ResetColor,
+    )?;
+    for c in swatch_colors {
+        queue!(stdout, SetForegroundColor(c), Print("██"))?;
+    }
+    queue!(
+        stdout,
+        Print(" "),
+        SetForegroundColor(th.border_active),
+        Print(format!("{}{}{}", th.borders.tl, th.borders.h, th.borders.tr)),
+        ResetColor,
+        Print("\n"),
+    )?;
+    stdout.flush()?;
+    Ok(())
+}
 
+pub async fn run_theme_list() -> Result<()> {
     println!("{}", "Mosaic themes".magenta().bold());
-    for name in preset_names() {
-        let Some(th) = theme_by_name(name) else { continue };
-        let active = *name == current;
-        let marker = if active { "●" } else { "○" };
-        // A few solid blocks previewing the key roles, drawn directly with
-        // crossterm so RGB presets render true-color.
-        let swatch_colors = [
-            th.border_active,
-            th.accent,
-            th.heading,
-            th.server_label,
-            th.status_running,
-            th.status_idle,
-            th.status_closed,
-        ];
-        let mut stdout = std::io::stdout();
-        let name_label = format!("{marker} {name}");
-        queue!(
-            stdout,
-            Print("  "),
-            SetForegroundColor(if active { Color::White } else { Color::Grey }),
-            SetAttribute(if active { Attribute::Bold } else { Attribute::Reset }),
-            Print(format!("{:<22}", name_label)),
-            SetAttribute(Attribute::Reset),
-            ResetColor,
-        )?;
-        for c in swatch_colors {
-            queue!(stdout, SetForegroundColor(c), Print("██"))?;
+
+    // Prefer the server catalog (built-ins + web-designed customs + the synced
+    // active selection); fall back to the compiled-in presets when offline.
+    let rows: Vec<(String, Theme, bool)>;
+    let active: String;
+    let offline;
+    match load_config() {
+        Ok(cfg) => match fetch_theme_catalog(&cfg).await {
+            Ok(cat) => {
+                offline = false;
+                active = cat.active.clone();
+                rows = cat
+                    .themes
+                    .iter()
+                    .map(|t| (t.name.clone(), theme_from_dto(t), t.builtin))
+                    .collect();
+            }
+            Err(_) => {
+                offline = true;
+                active = cfg.theme.clone().unwrap_or_else(|| "default".to_string());
+                rows = preset_names()
+                    .iter()
+                    .filter_map(|n| theme_by_name(n).map(|t| (n.to_string(), t, true)))
+                    .collect();
+            }
+        },
+        Err(_) => {
+            offline = true;
+            active = "default".to_string();
+            rows = preset_names()
+                .iter()
+                .filter_map(|n| theme_by_name(n).map(|t| (n.to_string(), t, true)))
+                .collect();
         }
-        // Preview the line style too, in the active border color.
-        queue!(
-            stdout,
-            Print(" "),
-            SetForegroundColor(th.border_active),
-            Print(format!("{}{}{}", th.borders.tl, th.borders.h, th.borders.tr)),
-            ResetColor,
-            Print("\n"),
-        )?;
-        stdout.flush()?;
+    }
+
+    for (name, th, builtin) in &rows {
+        print_theme_row(name, th, name == &active, *builtin)?;
     }
     println!();
+    if offline {
+        println!(
+            "  {}",
+            "(offline — built-in presets only; log in to sync custom themes)".dark_grey()
+        );
+    }
     println!(
         "  {} {}",
         "Set with:".dark_grey(),
@@ -566,22 +776,24 @@ pub async fn run_theme_list() -> Result<()> {
     );
     println!(
         "  {} {}",
-        "Or per run:".dark_grey(),
-        "managet group open <id> --theme <name>".white(),
+        "Design more:".dark_grey(),
+        "dashboard → Settings → Mosaic Themes".white(),
     );
     Ok(())
 }
 
-/// Persist a theme choice into the local CLI config. Requires `managet
-/// login` to have created the config first.
+/// Set the active mosaic theme on the server (so it syncs to the dashboard
+/// and other devices) and cache it locally for offline `--theme` fallback.
+/// Requires `managet login`. Built-in names AND custom theme names are valid.
 pub async fn run_theme_set(name: String) -> Result<()> {
-    if theme_by_name(&name).is_none() {
-        bail!(
-            "unknown theme '{name}'; available: {}",
-            preset_names().join(", ")
-        );
-    }
     let mut cfg = load_config()?;
+    // The server validates the name against built-ins ∪ the user's customs.
+    put_json(
+        &cfg,
+        "/api/cli/themes/active",
+        &serde_json::json!({ "name": name }),
+    )
+    .await?;
     cfg.theme = Some(name.clone());
     save_config(&cfg)?;
     println!("{} {}", "Theme set to".green(), name.white().bold());
@@ -1359,7 +1571,9 @@ pub async fn run_stack_open(
 
     let cfg = load_config()?;
     // Lock the theme before raw mode so an unknown `--theme` errors cleanly.
-    set_active_theme(resolve_theme(&cfg, theme_override.as_deref())?);
+    // Resolves from the server catalog (customs + synced active); falls back
+    // to the compiled-in presets when offline.
+    set_active_theme(resolve_active_theme(&cfg, theme_override.as_deref()).await?);
     let stack_id = resolve_stack_id(&cfg, &selector).await?;
     let mut current_detail = fetch_stack_detail(&cfg, &stack_id).await?;
 
@@ -1656,8 +1870,9 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
 
     let cfg = load_config()?;
     // Resolve + lock the theme before any raw-mode/alt-screen switch, so an
-    // unknown `--theme` errors on a normal screen.
-    set_active_theme(resolve_theme(&cfg, theme_override.as_deref())?);
+    // unknown `--theme` errors on a normal screen. Resolves from the server
+    // catalog (customs + synced active); falls back to presets when offline.
+    set_active_theme(resolve_active_theme(&cfg, theme_override.as_deref()).await?);
     let group_id = resolve_group_id(&cfg, &selector).await?;
     let CliGroupDetail {
         group,

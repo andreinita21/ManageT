@@ -210,6 +210,11 @@ function shallowSamePrefs(
   if (a.terminalFontFamily !== b.terminalFontFamily) return false;
   if (a.terminalFontSize !== b.terminalFontSize) return false;
   if (a.groupViewServerLabel !== b.groupViewServerLabel) return false;
+  if (a.mosaicThemeActive !== b.mosaicThemeActive) return false;
+  if (
+    JSON.stringify(a.mosaicCustomThemes) !== JSON.stringify(b.mosaicCustomThemes)
+  )
+    return false;
   return JSON.stringify(a.customTheme) === JSON.stringify(b.customTheme);
 }
 
