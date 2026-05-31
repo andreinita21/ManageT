@@ -56,7 +56,13 @@ pub async fn run_loop() -> Result<()> {
     // for as long as this process keeps running. Failure to bind doesn't
     // abort the agent — heartbeats are independent and we'd rather still
     // report metrics than refuse to start over a missing /var/run.
-    let session_manager = Arc::new(SessionManager::new());
+    let session_manager = {
+        let mut sm = SessionManager::new();
+        // Let the manager push an instant "session created" notice to the
+        // dashboard (reuses the agent's heartbeat creds).
+        sm.set_dashboard(cfg.api_url_normalized().to_string(), cfg.token.clone());
+        Arc::new(sm)
+    };
     {
         let sm = session_manager.clone();
         let path = session_socket_path();

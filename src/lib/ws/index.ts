@@ -290,9 +290,6 @@ async function handleAttachLifecycle(
   // attach the live `data` listener keeps the ordering deterministic
   // ("scrollback first, then live output") and matches what the user
   // expects when they re-open a tab on an existing session.
-  console.log(
-    `[WS] attach ${sessionId.slice(0, 8)} → scrollback replay ${handle.initialBytes.length}B`
-  );
   if (handle.initialBytes.length > 0) {
     const text = decoder.write(handle.initialBytes);
     if (text.length > 0) {
@@ -610,8 +607,18 @@ async function extractUserId(req: IncomingMessage): Promise<string | null> {
 if (!__globalWs.__managetWs.listenersRegistered) {
   __globalWs.__managetWs.listenersRegistered = true;
 
+  // Liveness flag per socket. The keepalive interval below pings every
+  // client; a healthy client answers with a pong which flips this back to
+  // true. This is also what defeats the Cloudflare Tunnel's ~100s idle
+  // WebSocket timeout: without traffic the proxy silently drops idle
+  // sockets, the browser then reconnects and re-renders the replayed
+  // scrollback, which the user saw as the prompt/`logout` lines repeating.
+  const alive = new WeakMap<WebSocket, boolean>();
+
   wss.on("connection", (ws: WebSocket) => {
     console.log("[WS] client connected");
+    alive.set(ws, true);
+    ws.on("pong", () => alive.set(ws, true));
 
     ws.on("message", (raw: Buffer | string) => {
       const data = typeof raw === "string" ? raw : raw.toString("utf-8");
@@ -630,6 +637,30 @@ if (!__globalWs.__managetWs.listenersRegistered) {
       handleDisconnect(ws);
     });
   });
+
+  // Keepalive sweep: ping every client every 30s (well under the ~100s
+  // proxy idle cap); terminate any that missed the previous pong.
+  const KEEPALIVE_MS = 30_000;
+  const keepalive = setInterval(() => {
+    for (const ws of wss.clients) {
+      if (alive.get(ws) === false) {
+        try {
+          ws.terminate();
+        } catch {
+          /* ignore */
+        }
+        continue;
+      }
+      alive.set(ws, false);
+      try {
+        ws.ping();
+      } catch {
+        /* ignore */
+      }
+    }
+  }, KEEPALIVE_MS);
+  // Don't keep the event loop alive solely for the keepalive timer.
+  if (typeof keepalive.unref === "function") keepalive.unref();
 }
 
 // Unused export kept for compatibility with any old import sites.

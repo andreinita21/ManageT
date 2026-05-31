@@ -511,23 +511,33 @@ function AddMemberModal({
               </div>
             ) : (
               <div className="space-y-1.5 max-h-48 overflow-y-auto">
-                {freeSessions.map((s) => (
-                  <button
-                    key={s.id}
-                    type="button"
-                    onClick={() => void onAddExisting(s.id)}
-                    className="w-full text-left bg-mg-bg-tertiary border border-mg-border rounded-lg px-3 py-2 hover:border-mg-accent hover:bg-mg-bg-hover transition-all"
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm text-mg-text font-mono">
-                        {s.sessionName}
-                      </span>
-                      <span className="text-xs text-mg-text-tertiary">
-                        {s.status}
-                      </span>
-                    </div>
-                  </button>
-                ))}
+                {freeSessions.map((s) => {
+                  const srv = servers.find((sv) => sv.id === s.serverId);
+                  const deviceLabel = srv?.name || srv?.host || null;
+                  return (
+                    <button
+                      key={s.id}
+                      type="button"
+                      onClick={() => void onAddExisting(s.id)}
+                      className="w-full text-left bg-mg-bg-tertiary border border-mg-border rounded-lg px-3 py-2 hover:border-mg-accent hover:bg-mg-bg-hover transition-all"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-sm text-mg-text font-mono truncate">
+                          {s.sessionName}
+                          {deviceLabel && (
+                            <span className="text-mg-text-tertiary font-sans">
+                              {" "}
+                              ({deviceLabel})
+                            </span>
+                          )}
+                        </span>
+                        <span className="text-xs text-mg-text-tertiary shrink-0">
+                          {s.status}
+                        </span>
+                      </div>
+                    </button>
+                  );
+                })}
               </div>
             )}
           </div>

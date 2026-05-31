@@ -162,6 +162,11 @@ export default function TerminalPaneInner({
     // drops and we try again.
     let sessionId: string | null = mountInitialSessionId ?? null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    // True once we've had at least one open socket. On a *reconnect* the
+    // server replays the full scrollback again; without clearing first the
+    // replay would append to the existing buffer (the duplicated prompt /
+    // `logout` lines the user saw). Reset the grid before re-attaching.
+    let hasConnected = false;
     let observer: ResizeObserver | null = null;
 
     try {
@@ -327,6 +332,11 @@ export default function TerminalPaneInner({
         // to that — re-sending `session:create` would orphan the live
         // PTY and spawn a new one on every reconnect.
         if (sessionId) {
+          // Reconnect: wipe the grid so the server's scrollback replay
+          // repaints cleanly instead of stacking on the old contents.
+          if (hasConnected) {
+            try { term?.reset(); } catch {}
+          }
           ws?.send(
             JSON.stringify({
               type: "session:attach",
@@ -337,6 +347,7 @@ export default function TerminalPaneInner({
         } else {
           ws?.send(JSON.stringify({ type: "session:create", serverId }));
         }
+        hasConnected = true;
       };
 
       ws.onmessage = (event) => {

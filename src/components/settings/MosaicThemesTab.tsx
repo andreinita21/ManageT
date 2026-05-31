@@ -19,11 +19,13 @@ import {
   DEFAULT_MOSAIC_THEME,
   LINE_STYLES,
   LINE_STYLE_LIST,
+  MOSAIC_CUSTOM_MAX,
   MOSAIC_CUSTOM_NAME_MAX,
   MOSAIC_PRESETS,
   MOSAIC_PRESETS_BY_NAME,
   MOSAIC_ROLE_GROUPS,
   MOSAIC_ROLE_LABELS,
+  sanitizeCustomThemes,
   type MosaicTheme,
   type MosaicThemeColors,
 } from "@/lib/mosaic-themes/presets";
@@ -124,6 +126,72 @@ export function MosaicThemesTab() {
 
   const allThemes = useMemo(() => [...MOSAIC_PRESETS, ...customs], [customs]);
 
+  // --- Import / export ---
+  const [importOpen, setImportOpen] = useState(false);
+  const [importText, setImportText] = useState("");
+
+  const copyTheme = async (theme: MosaicTheme) => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify([theme], null, 2));
+      toast(`Copied "${theme.name}" JSON`, "success");
+    } catch {
+      toast("Clipboard unavailable", "error");
+    }
+  };
+
+  const exportAll = () => {
+    if (customs.length === 0) return toast("No custom themes to export", "error");
+    const json = JSON.stringify(customs, null, 2);
+    const blob = new Blob([json], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "mosaic-themes.json";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const runImport = async () => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(importText);
+    } catch {
+      return toast("Invalid JSON", "error");
+    }
+    const arr = Array.isArray(parsed) ? parsed : [parsed];
+    const incoming = sanitizeCustomThemes(arr); // drops built-in collisions + bad entries
+    if (incoming.length === 0) return toast("No valid custom themes in that JSON", "error");
+
+    const taken = new Set<string>([
+      ...Object.keys(MOSAIC_PRESETS_BY_NAME),
+      ...customs.map((c) => c.name),
+    ]);
+    const merged = [...customs];
+    let added = 0;
+    for (const t of incoming) {
+      if (merged.length >= MOSAIC_CUSTOM_MAX) break;
+      let name = t.name;
+      if (taken.has(name)) {
+        let n = 2;
+        while (taken.has(`${t.name} (${n})`)) n++;
+        name = `${t.name} (${n})`.slice(0, MOSAIC_CUSTOM_NAME_MAX);
+      }
+      taken.add(name);
+      merged.push({ ...t, name });
+      added += 1;
+    }
+    await commit({ customs: merged });
+    toast(`Imported ${added} theme(s)`, "success");
+    setImportOpen(false);
+    setImportText("");
+  };
+
+  const onImportFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    file.text().then((t) => setImportText(t));
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex items-start justify-between gap-4">
@@ -133,9 +201,17 @@ export function MosaicThemesTab() {
           border line style. The active theme and your custom themes sync to the CLI;
           run <span className="font-mono">managet theme list</span> to see them there.
         </p>
-        <Button size="sm" onClick={openNew} disabled={busy}>
-          + New theme
-        </Button>
+        <div className="flex items-center gap-2 shrink-0">
+          <Button size="sm" variant="ghost" onClick={() => setImportOpen(true)} disabled={busy}>
+            Import
+          </Button>
+          <Button size="sm" variant="ghost" onClick={exportAll} disabled={busy}>
+            Export
+          </Button>
+          <Button size="sm" onClick={openNew} disabled={busy}>
+            + New theme
+          </Button>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
@@ -175,6 +251,9 @@ export function MosaicThemesTab() {
                 >
                   {isActive ? "Active" : "Use"}
                 </Button>
+                <Button size="sm" variant="ghost" onClick={() => void copyTheme(theme)} disabled={busy}>
+                  Copy
+                </Button>
                 {!theme.builtin && (
                   <>
                     <Button size="sm" variant="ghost" onClick={() => openEdit(theme)} disabled={busy}>
@@ -204,6 +283,49 @@ export function MosaicThemesTab() {
           onSave={saveEditor}
           busy={busy}
         />
+      )}
+
+      {importOpen && (
+        <Modal
+          open
+          onClose={() => setImportOpen(false)}
+          title="Import mosaic themes"
+          size="lg"
+          footer={
+            <>
+              <Button variant="secondary" onClick={() => setImportOpen(false)} disabled={busy}>
+                Cancel
+              </Button>
+              <Button onClick={() => void runImport()} disabled={busy || !importText.trim()}>
+                Import
+              </Button>
+            </>
+          }
+        >
+          <div className="space-y-3">
+            <p className="text-xs text-mg-text-tertiary">
+              Paste a theme JSON (a single theme or an array, e.g. from another
+              user&apos;s Export / Copy), or load a <span className="font-mono">.json</span> file.
+              Names that collide with a built-in or an existing custom are renamed.
+            </p>
+            <label className="text-xs text-mg-text-secondary inline-flex items-center gap-2">
+              <span>Load file:</span>
+              <input
+                type="file"
+                accept=".json,application/json"
+                onChange={onImportFile}
+                className="text-xs text-mg-text-secondary file:mr-2 file:rounded file:border file:border-mg-border file:bg-mg-bg-tertiary file:px-2 file:py-1 file:text-mg-text"
+              />
+            </label>
+            <textarea
+              value={importText}
+              onChange={(e) => setImportText(e.target.value)}
+              placeholder='[{"name":"my-theme","lineStyle":"rounded","colors":{ ... }}]'
+              spellCheck={false}
+              className="w-full h-48 rounded-lg bg-mg-bg-tertiary border border-mg-border px-3 py-2 text-xs font-mono text-mg-text focus:border-mg-accent focus:outline-none resize-y"
+            />
+          </div>
+        </Modal>
       )}
     </div>
   );

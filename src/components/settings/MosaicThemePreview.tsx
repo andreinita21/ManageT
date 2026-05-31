@@ -97,7 +97,6 @@ export function MosaicThemePreview({
   const innerW = 13;
   const left = pane(theme, true, innerW);
   const right = pane(theme, false, innerW);
-  const gap = "  ";
 
   // Status bar (top): heading · name · separator · info · hint.
   const statusBar: Seg[] = [
@@ -109,13 +108,6 @@ export function MosaicThemePreview({
     { t: "^A D detach", c: tokenToCss(c.hint) },
   ];
 
-  // Compose the two panes side by side, row by row.
-  const paneRows: Seg[][] = left.map((lrow, i) => [
-    ...lrow,
-    { t: gap, c: "transparent" },
-    ...right[i],
-  ]);
-
   return (
     <div
       className={`rounded-md border border-mg-border overflow-hidden ${className}`}
@@ -124,9 +116,20 @@ export function MosaicThemePreview({
       <div className="p-2 font-mono text-[10px] leading-[1.35]">
         <Row segs={statusBar} />
         <div className="h-1" />
-        {paneRows.map((segs, i) => (
-          <Row key={i} segs={segs} />
-        ))}
+        {/* Two independent monospace columns — each pane owns its own rows so
+            cross-pane alignment can't drift. */}
+        <div className="flex gap-2">
+          <div>
+            {left.map((segs, i) => (
+              <Row key={i} segs={segs} />
+            ))}
+          </div>
+          <div>
+            {right.map((segs, i) => (
+              <Row key={i} segs={segs} />
+            ))}
+          </div>
+        </div>
         <div className="h-1" />
         {/* Status-dot legend + selected chip exercising the remaining roles. */}
         <div className="flex items-center gap-2" style={{ whiteSpace: "pre" }}>
