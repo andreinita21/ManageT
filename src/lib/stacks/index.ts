@@ -58,6 +58,53 @@ export async function replaceServicesForStack(
 }
 
 /**
+ * List live (non-trash) stacks with their ordered services. Shared by the
+ * browser `GET /api/stacks` and the CLI `GET /api/cli/stacks` so both agree
+ * on shape and trash-filtering.
+ */
+export async function listStacks(): Promise<Stack[]> {
+  const stackRows = await db
+    .select()
+    .from(stacks)
+    .where(isNull(stacks.deletedAt));
+  if (stackRows.length === 0) return [];
+
+  const stackIds = stackRows.map((s) => s.id);
+  const serviceRows = await db
+    .select()
+    .from(stackServices)
+    .where(inArray(stackServices.stackId, stackIds));
+
+  const byStack = new Map<string, StackService[]>();
+  for (const row of serviceRows) {
+    const list = byStack.get(row.stackId) ?? [];
+    list.push({
+      id: row.id,
+      stackId: row.stackId,
+      name: row.name,
+      serverId: row.serverId,
+      cwd: row.cwd ?? undefined,
+      command: row.command ?? undefined,
+      orderIndex: row.orderIndex,
+    });
+    byStack.set(row.stackId, list);
+  }
+
+  return stackRows.map((s) => ({
+    id: s.id,
+    name: s.name,
+    description: s.description ?? undefined,
+    deletedAt: s.deletedAt ?? undefined,
+    createdBy: s.createdBy,
+    createdAt: s.createdAt,
+    updatedAt: s.updatedAt,
+    services: (byStack.get(s.id) ?? []).sort(
+      (a, b) => a.orderIndex - b.orderIndex
+    ),
+  }));
+}
+
+/**
  * Fetch a stack with its ordered services.
  */
 export async function getStack(stackId: string): Promise<Stack | null> {
@@ -113,12 +160,15 @@ export async function getStack(stackId: string): Promise<Stack | null> {
  *   - `missingOnly`: legacy flag kept for API compatibility. Under the new
  *     idempotent default it's a no-op (the default already skips
  *     already-active services), but old clients passing it still work.
+ *   - `serviceIds`: launch only this subset of services (by service id).
+ *     Used by the CLI's `managet stack launch --server/--service` to start
+ *     part of a stack. Empty/omitted means the whole stack.
  *
  * Returns per-service success/failure so the UI can show partial results.
  */
 export async function launchStack(
   stackId: string,
-  opts: { missingOnly?: boolean; force?: boolean } = {}
+  opts: { missingOnly?: boolean; force?: boolean; serviceIds?: string[] } = {}
 ): Promise<LaunchStackResponse> {
   const stack = await getStack(stackId);
   if (!stack) {
@@ -158,7 +208,15 @@ export async function launchStack(
   const toCreate: StackService[] = [];
   const toKillThenCreate: { svc: StackService; row: SessRow }[] = [];
 
+  // Optional subset filter (CLI per-server/per-service launch). When unset
+  // or empty, every service is considered.
+  const wanted =
+    opts.serviceIds && opts.serviceIds.length
+      ? new Set(opts.serviceIds)
+      : null;
+
   for (const svc of stack.services) {
+    if (wanted && !wanted.has(svc.id)) continue;
     const key = `${svc.serverId}::${svc.name}`;
     const row = activeByKey.get(key);
     if (!row) {

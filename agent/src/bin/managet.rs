@@ -59,6 +59,22 @@ enum Command {
         action: GroupAction,
     },
 
+    /// List stacks from the dashboard.
+    Stacks,
+
+    /// Launch or open a dashboard stack from this CLI.
+    Stack {
+        #[command(subcommand)]
+        action: StackAction,
+    },
+
+    /// List or set the color/line theme for the group & stack mosaics.
+    /// With no subcommand, lists the presets (marking the active one).
+    Theme {
+        #[command(subcommand)]
+        action: Option<ThemeAction>,
+    },
+
     /// List active terminal sessions managed by this host's agent.
     Ls,
 
@@ -123,6 +139,10 @@ enum GroupAction {
     Attach {
         /// Group id, unique prefix, or exact group name.
         id: String,
+        /// Mosaic theme for this run (see `managet theme list`). Overrides
+        /// the saved default.
+        #[arg(long)]
+        theme: Option<String>,
     },
 
     /// Save a browser-compatible row arrangement such as 2+2 or 1+3.
@@ -161,6 +181,57 @@ enum GroupAction {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum StackAction {
+    /// Launch a stack. With no flags, launches every service on every
+    /// server (same as the dashboard's "Launch Stack"). Narrow the launch
+    /// with --server and/or --service.
+    Launch {
+        /// Stack id, unique prefix, or exact stack name.
+        id: String,
+        /// Only launch services on this server (name, host, or id).
+        #[arg(short, long)]
+        server: Option<String>,
+        /// Only launch this service (name, id, or unique id prefix).
+        #[arg(long)]
+        service: Option<String>,
+        /// Kill any already-active sessions first, then respawn.
+        #[arg(short, long)]
+        force: bool,
+    },
+
+    /// Open a stack as a multi-pane terminal mosaic across every server
+    /// involved. Services that aren't running yet show a placeholder pane
+    /// that goes live once the service starts. Detach with Ctrl-A d.
+    /// (alias: attach)
+    #[command(alias = "attach")]
+    Open {
+        /// Stack id, unique prefix, or exact stack name.
+        id: String,
+        /// Only show this server's services from the stack (name, host, or id).
+        #[arg(short, long)]
+        server: Option<String>,
+        /// Mosaic theme for this run (see `managet theme list`). Overrides
+        /// the saved default.
+        #[arg(long)]
+        theme: Option<String>,
+    },
+
+    /// List stacks (same as `managet stacks`).
+    List,
+}
+
+#[derive(Debug, Subcommand)]
+enum ThemeAction {
+    /// List the available themes, marking the active one.
+    List,
+    /// Set the default theme for the group & stack mosaics.
+    Set {
+        /// Theme name (e.g. default, ocean, solarized, mono, matrix, sunset).
+        name: String,
+    },
+}
+
 fn init_tracing() {
     // Quieter than the agent's default — `managet` is interactive, the
     // user doesn't want INFO logs by default. Only honour RUST_LOG if
@@ -187,7 +258,7 @@ async fn main() -> Result<()> {
         } => cli_dashboard::run_login(api_url, username, password).await,
         Command::Groups => cli_dashboard::run_group_list().await,
         Command::Group { action } => match action {
-            GroupAction::Attach { id } => cli_dashboard::run_group_open(id).await,
+            GroupAction::Attach { id, theme } => cli_dashboard::run_group_open(id, theme).await,
             GroupAction::Layout { id, arrangement } => {
                 cli_dashboard::run_group_layout(id, arrangement).await
             }
@@ -198,6 +269,23 @@ async fn main() -> Result<()> {
                 name,
                 command,
             } => cli_dashboard::run_group_add(id, server, name, command).await,
+        },
+        Command::Stacks => cli_dashboard::run_stack_list().await,
+        Command::Stack { action } => match action {
+            StackAction::Launch {
+                id,
+                server,
+                service,
+                force,
+            } => cli_dashboard::run_stack_launch(id, server, service, force).await,
+            StackAction::Open { id, server, theme } => {
+                cli_dashboard::run_stack_open(id, server, theme).await
+            }
+            StackAction::List => cli_dashboard::run_stack_list().await,
+        },
+        Command::Theme { action } => match action {
+            None | Some(ThemeAction::List) => cli_dashboard::run_theme_list().await,
+            Some(ThemeAction::Set { name }) => cli_dashboard::run_theme_set(name).await,
         },
         Command::Ls => {
             // Pull the dashboard's group → member map up front (when

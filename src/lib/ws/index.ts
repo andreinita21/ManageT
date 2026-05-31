@@ -290,6 +290,9 @@ async function handleAttachLifecycle(
   // attach the live `data` listener keeps the ordering deterministic
   // ("scrollback first, then live output") and matches what the user
   // expects when they re-open a tab on an existing session.
+  console.log(
+    `[WS] attach ${sessionId.slice(0, 8)} → scrollback replay ${handle.initialBytes.length}B`
+  );
   if (handle.initialBytes.length > 0) {
     const text = decoder.write(handle.initialBytes);
     if (text.length > 0) {
