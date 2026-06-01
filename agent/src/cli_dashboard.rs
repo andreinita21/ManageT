@@ -7,7 +7,7 @@
 //! user-scoped dashboard login, group metadata/layout REST calls, and a
 //! small managet-owned multi-pane terminal view over the dashboard WS.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{IsTerminal, Stdout, Write};
 use std::path::PathBuf;
@@ -15,11 +15,11 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::cursor::{Hide, MoveTo, MoveToColumn, MoveUp, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::style::{
     Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
-    Stylize,
+    StyledContent, Stylize,
 };
 use crossterm::terminal::{
     self, disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
@@ -480,6 +480,12 @@ struct GroupListPayload {
     groups: Vec<Group>,
     #[serde(default)]
     servers: Vec<CliServer>,
+    /// Every live session the dashboard knows about, across all servers.
+    /// `managet ls` uses this to list standalone terminals on *other*
+    /// hosts; the local agent only reports its own. Older dashboards omit
+    /// it (hence `default`).
+    #[serde(default)]
+    sessions: Vec<GroupSession>,
     #[serde(default)]
     preferences: GroupListPreferences,
 }
@@ -513,7 +519,20 @@ struct GroupSession {
     server_id: String,
     session_name: String,
     status: String,
+    #[serde(default)]
     group_order_index: Option<usize>,
+    /// Set when this session belongs to a group. Used by `managet ls` to
+    /// keep grouped sessions out of the "individual sessions" sections
+    /// (they're shown under "Group sessions" instead). Absent on payloads
+    /// that don't carry it (e.g. group members), hence `default`.
+    #[serde(default)]
+    group_id: Option<String>,
+    /// Live count of clients (browser + CLI) currently attached to this
+    /// session, as reported by its agent. `None` when the dashboard
+    /// couldn't reach the agent (unknown) or on payloads that don't carry
+    /// it. Drives the attached/detached indicator in `managet ls`.
+    #[serde(default)]
+    attached_clients: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -874,15 +893,25 @@ pub async fn fetch_session_group_map() -> HashMap<String, String> {
     map
 }
 
+/// What the Ctrl-A G prompt resolved to.
+enum GroupChoice {
+    /// Create a brand-new group with this (trimmed, non-empty) name.
+    CreateNew(String),
+    /// Add the session to this existing group id.
+    Existing(String),
+}
+
 /// Interactive prompt fired from a solo `managet attach` via Ctrl-A G:
-/// add the attached session to an existing group or create a new one.
-/// Runs in cooked mode (the attach loop suspends raw mode around it) and
-/// uses `inquire`, like `pick_server_interactive`. Best-effort: missing
-/// login / unreachable dashboard / API errors print a line and return None.
+/// add the attached session to a group. A purpose-built picker (not
+/// `inquire`) so the primary action — "create a new group" — has an inline
+/// editable name field with the cursor already in it: type a name, press
+/// Enter, and you're dropped into the new group's mosaic. Arrow down to
+/// pick an existing group instead. Best-effort: missing login / unreachable
+/// dashboard / API errors print a line and return None.
 ///
 /// Returns `Some(group_id)` of the group the session was added to / created,
-/// so the caller can immediately open that group's mosaic; `None` on
-/// cancel or error.
+/// so the caller can immediately open that group's mosaic; `None` on cancel
+/// or error.
 pub async fn run_attach_group_prompt(session_id: String) -> Result<Option<String>> {
     let cfg = match load_config() {
         Ok(c) => c,
@@ -899,72 +928,199 @@ pub async fn run_attach_group_prompt(session_id: String) -> Result<Option<String
         }
     };
 
-    const CREATE: &str = "➕  Create new group…";
-    let mut items: Vec<String> = payload.groups.iter().map(|g| g.name.clone()).collect();
-    items.push(CREATE.to_string());
+    let groups: Vec<(String, String)> = payload
+        .groups
+        .iter()
+        .map(|g| (g.id.clone(), g.name.clone()))
+        .collect();
 
-    let choice = match Select::new("Add this terminal to a group:", items)
-        .with_help_message("↑/↓ select · Enter confirm · Esc cancel")
-        .prompt()
-    {
-        Ok(c) => c,
-        Err(_) => return Ok(None), // cancelled
+    let choice = match prompt_group_choice(&groups) {
+        Some(c) => c,
+        None => return Ok(None), // cancelled
     };
 
-    if choice == CREATE {
-        let name = match Text::new("New group name:").prompt() {
-            Ok(n) if !n.trim().is_empty() => n.trim().to_string(),
-            _ => return Ok(None),
-        };
-        let body = serde_json::json!({ "name": name, "sessionId": session_id });
-        match post_json::<_, serde_json::Value>(&cfg, "/api/cli/groups", &body).await {
-            Ok(group) => {
-                println!(
-                    "{} created group {} — opening…",
-                    "✓".green(),
-                    name.white().bold()
-                );
-                Ok(group
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()))
-            }
-            Err(e) => {
-                println!("{} {e}", "✗".red());
-                Ok(None)
+    match choice {
+        GroupChoice::CreateNew(name) => {
+            let body = serde_json::json!({ "name": name, "sessionId": session_id });
+            match post_json::<_, serde_json::Value>(&cfg, "/api/cli/groups", &body).await {
+                Ok(group) => {
+                    println!(
+                        "{} created group {} — opening…",
+                        "✓".green(),
+                        name.white().bold()
+                    );
+                    Ok(group
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()))
+                }
+                Err(e) => {
+                    println!("{} {e}", "✗".red());
+                    Ok(None)
+                }
             }
         }
-    } else {
-        let group_id = payload
-            .groups
-            .iter()
-            .find(|g| g.name == choice)
-            .map(|g| g.id.clone());
-        let Some(group_id) = group_id else {
-            return Ok(None);
-        };
-        let body = serde_json::json!({ "sessionId": session_id });
-        match post_json::<_, serde_json::Value>(
-            &cfg,
-            &format!("/api/cli/groups/{group_id}/members"),
-            &body,
-        )
-        .await
-        {
-            Ok(_) => {
-                println!(
-                    "{} added to {} — opening…",
-                    "✓".green(),
-                    choice.white().bold()
-                );
-                Ok(Some(group_id))
-            }
-            Err(e) => {
-                println!("{} {e}", "✗".red());
-                Ok(None)
+        GroupChoice::Existing(group_id) => {
+            let name = groups
+                .iter()
+                .find(|(id, _)| *id == group_id)
+                .map(|(_, n)| n.clone())
+                .unwrap_or_default();
+            let body = serde_json::json!({ "sessionId": session_id });
+            match post_json::<_, serde_json::Value>(
+                &cfg,
+                &format!("/api/cli/groups/{group_id}/members"),
+                &body,
+            )
+            .await
+            {
+                Ok(_) => {
+                    println!("{} added to {} — opening…", "✓".green(), name.white().bold());
+                    Ok(Some(group_id))
+                }
+                Err(e) => {
+                    println!("{} {e}", "✗".red());
+                    Ok(None)
+                }
             }
         }
     }
+}
+
+/// Render + drive the Ctrl-A G group picker. Row 0 is the "create a new
+/// group" action with an inline name field; rows 1.. are existing groups
+/// (id, name). Returns the user's choice, or None on Esc / Ctrl-C / empty.
+///
+/// Draws inline (no alt-screen) in raw mode, repainting in place each key.
+fn prompt_group_choice(groups: &[(String, String)]) -> Option<GroupChoice> {
+    let mut stdout = std::io::stdout();
+    if enable_raw_mode().is_err() {
+        return None;
+    }
+
+    let mut selected: usize = 0; // 0 = create row, 1..=len = existing group
+    let mut name = String::new();
+    let mut prev_lines: u16 = 0;
+
+    let draw = |stdout: &mut Stdout, selected: usize, name: &str, prev: u16| -> u16 {
+        let _ = if prev > 0 {
+            queue!(
+                stdout,
+                MoveUp(prev),
+                MoveToColumn(0),
+                Clear(ClearType::FromCursorDown)
+            )
+        } else {
+            queue!(stdout, MoveToColumn(0), Clear(ClearType::FromCursorDown))
+        };
+
+        let mut lines = 0u16;
+        let _ = queue!(
+            stdout,
+            Print("Add this terminal to a group:".white().bold()),
+            Print(
+                "   ↑/↓ move · type a name · Enter confirm · Esc cancel"
+                    .dark_grey()
+            ),
+            Print("\r\n")
+        );
+        lines += 1;
+
+        // Create row.
+        let marker = if selected == 0 { "›".green() } else { " ".stylize() };
+        let label = "➕ Create a new group: ".stylize();
+        let typed = if name.is_empty() {
+            "(type a name)".to_string().dark_grey()
+        } else {
+            name.to_string().white().bold()
+        };
+        let cursor = if selected == 0 { "▌".grey() } else { "".stylize() };
+        let _ = queue!(
+            stdout,
+            Print(" "),
+            Print(marker),
+            Print(" "),
+            Print(label),
+            Print(typed),
+            Print(cursor),
+            Print("\r\n")
+        );
+        lines += 1;
+
+        // Existing groups.
+        for (i, (_, gname)) in groups.iter().enumerate() {
+            let row = i + 1;
+            let marker = if selected == row {
+                "›".green()
+            } else {
+                " ".stylize()
+            };
+            let name_styled = if selected == row {
+                gname.clone().white().bold()
+            } else {
+                gname.clone().stylize()
+            };
+            let _ = queue!(
+                stdout,
+                Print(" "),
+                Print(marker),
+                Print("   "),
+                Print(name_styled),
+                Print("\r\n")
+            );
+            lines += 1;
+        }
+        let _ = stdout.flush();
+        lines
+    };
+
+    let result = loop {
+        prev_lines = draw(&mut stdout, selected, &name, prev_lines);
+        let ev = match event::read() {
+            Ok(ev) => ev,
+            Err(_) => break None,
+        };
+        let Event::Key(key) = ev else { continue };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => break None,
+            KeyCode::Char('c') if ctrl => break None,
+            KeyCode::Up => {
+                if selected > 0 {
+                    selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if selected < groups.len() {
+                    selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if selected == 0 {
+                    let trimmed = name.trim();
+                    if !trimmed.is_empty() {
+                        break Some(GroupChoice::CreateNew(trimmed.to_string()));
+                    }
+                    // Empty name — ignore Enter, keep prompting.
+                } else {
+                    break Some(GroupChoice::Existing(groups[selected - 1].0.clone()));
+                }
+            }
+            KeyCode::Backspace if selected == 0 => {
+                name.pop();
+            }
+            KeyCode::Char(c) if selected == 0 && !ctrl => {
+                name.push(c);
+            }
+            _ => {}
+        }
+    };
+
+    let _ = disable_raw_mode();
+    // Land the cursor on a fresh line below the picker so subsequent
+    // messages (and the mosaic) start clean.
+    println!("\r");
+    result
 }
 
 pub async fn run_group_list() -> Result<()> {
@@ -979,33 +1135,40 @@ pub async fn run_group_list() -> Result<()> {
     Ok(())
 }
 
-/// Optional second section appended to `managet ls`. Silent (one dim
-/// hint line) when the user hasn't run `managet login` yet, since a
-/// fresh host should still get a useful local listing.
-pub async fn print_groups_section() -> Result<()> {
+/// The dashboard-derived sections appended to `managet ls`:
+/// "Individual sessions from other servers" and "Group sessions". Silent
+/// (one dim hint line) when the user hasn't run `managet login` yet, since
+/// a fresh host should still get a useful local listing.
+///
+/// `local_ids` are the session ids already printed under "from this
+/// server" so we don't list them again as "other servers".
+pub async fn print_dashboard_ls_sections(local_ids: &HashSet<String>) -> Result<()> {
     println!();
+    let unavailable = |reason: &str| {
+        println!("{}", "Individual sessions from other servers".cyan().bold());
+        println!("  {}", reason.dark_grey());
+        println!();
+        println!("{}", "Group sessions".magenta().bold());
+        println!("  {}", reason.dark_grey());
+    };
     let cfg = match load_config() {
         Ok(cfg) => cfg,
         Err(_) => {
-            println!("{}", "Group sessions".magenta().bold());
-            println!(
-                "  {}",
-                "(run `managet login` to list dashboard groups)".dark_grey()
-            );
+            unavailable("(run `managet login` to list dashboard sessions)");
             return Ok(());
         }
     };
     let payload = match fetch_group_list_payload(&cfg).await {
         Ok(p) => p,
         Err(e) => {
-            println!("{}", "Group sessions".magenta().bold());
-            println!(
-                "  {}",
-                format!("(dashboard unreachable: {e})").dark_grey()
-            );
+            unavailable(&format!("(dashboard unreachable: {e})"));
             return Ok(());
         }
     };
+
+    print_other_servers_section(&payload, local_ids);
+    println!();
+
     if payload.groups.is_empty() {
         println!("{}", "Group sessions".magenta().bold());
         println!("  {}", "(no groups yet)".dark_grey());
@@ -1021,6 +1184,107 @@ pub async fn print_groups_section() -> Result<()> {
         "managet group attach <name>".white(),
     );
     Ok(())
+}
+
+/// Attached/detached state derived from a session's live client count.
+/// `Unknown` carries the liveness status string as a fallback for when
+/// the dashboard couldn't reach the agent to count clients.
+enum Liveness {
+    Attached(u32),
+    Detached,
+    Unknown(String),
+}
+
+fn liveness_of(attached_clients: Option<u32>, status: &str) -> Liveness {
+    match attached_clients {
+        Some(n) if n > 0 => Liveness::Attached(n),
+        Some(_) => Liveness::Detached,
+        None => Liveness::Unknown(status.to_string()),
+    }
+}
+
+impl Liveness {
+    fn bullet(&self) -> StyledContent<&'static str> {
+        match self {
+            Liveness::Attached(_) => "●".green(),
+            Liveness::Detached => "○".yellow(),
+            Liveness::Unknown(_) => "•".dark_grey(),
+        }
+    }
+    /// Plain (un-styled) label, so callers can pad to a column width
+    /// before applying color.
+    fn label(&self) -> String {
+        match self {
+            Liveness::Attached(n) => format!("attached×{n}"),
+            Liveness::Detached => "detached".to_string(),
+            Liveness::Unknown(s) => s.clone(),
+        }
+    }
+    fn paint(&self, s: String) -> StyledContent<String> {
+        match self {
+            Liveness::Attached(_) => s.green(),
+            Liveness::Detached => s.yellow(),
+            Liveness::Unknown(_) => s.dark_grey(),
+        }
+    }
+}
+
+/// "Individual sessions from other servers": standalone (un-grouped) live
+/// sessions the dashboard knows about on hosts *other* than this one.
+/// Grouped sessions are skipped (they appear under "Group sessions"), as
+/// are ids the local agent already listed under "from this server".
+fn print_other_servers_section(payload: &GroupListPayload, local_ids: &HashSet<String>) {
+    println!("{}", "Individual sessions from other servers".cyan().bold());
+    let use_friendly_name = payload.preferences.group_view_server_label == "name";
+    let server_label_for = |server_id: &str| -> String {
+        if let Some(s) = payload.servers.iter().find(|s| s.id == server_id) {
+            if use_friendly_name && !s.name.is_empty() {
+                s.name.clone()
+            } else {
+                s.host.clone()
+            }
+        } else {
+            short_id(server_id)
+        }
+    };
+
+    let mut others: Vec<&GroupSession> = payload
+        .sessions
+        .iter()
+        .filter(|s| s.group_id.is_none() && !local_ids.contains(&s.id))
+        .collect();
+    if others.is_empty() {
+        println!("  {}", "(none)".dark_grey());
+        return;
+    }
+    // Group visually by server, then by name, so same-host terminals sit
+    // together.
+    others.sort_by(|a, b| {
+        server_label_for(&a.server_id)
+            .cmp(&server_label_for(&b.server_id))
+            .then_with(|| a.session_name.cmp(&b.session_name))
+    });
+
+    let name_width = others
+        .iter()
+        .map(|s| s.session_name.chars().count().min(28))
+        .max()
+        .unwrap_or(20)
+        .max(20);
+
+    for s in &others {
+        let name_col = pad_visible(&truncate(&s.session_name, name_width), name_width);
+        let live = liveness_of(s.attached_clients, &s.status);
+        let status_styled = live.paint(pad_visible(&live.label(), 12));
+        println!(
+            "  {} {}  {}  {}  {}",
+            live.bullet(),
+            name_col.white().bold(),
+            status_styled,
+            format!("[{}]", short_id(&s.id)).dark_grey(),
+            server_label_for(&s.server_id).blue(),
+        );
+    }
 }
 
 /// Shared renderer for `managet groups` and the group section of
@@ -1105,11 +1369,14 @@ fn print_group_rows(payload: &GroupListPayload) {
                 member_name_width,
             );
             let server = server_label_for(&m.server_id);
+            let live = liveness_of(m.attached_clients, &m.status);
             println!(
-                "      {branch} {name} {sep} {server}",
+                "      {branch} {name} {sep} {bullet} {state} {sep} {server}",
                 branch = branch.dark_grey(),
                 name = name_cell.white(),
                 sep = "·".dark_grey(),
+                bullet = live.bullet(),
+                state = live.paint(pad_visible(&live.label(), 11)),
                 server = server.blue(),
             );
         }
@@ -1589,6 +1856,8 @@ fn build_stack_panes(
                     session_name: svc.name.clone(),
                     status: "active".to_string(),
                     group_order_index: Some(svc.order_index),
+                    group_id: None,
+                    attached_clients: None,
                 });
             let server_label = server_labels
                 .get(&svc.server_id)
@@ -2135,6 +2404,11 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
     let mut picker: Option<PickerState> = None;
     let mut confirm: Option<ConfirmState> = None;
     let mut layout_picker: Option<LayoutPickerState> = None;
+    let mut swap: Option<SwapState> = None;
+    // Set when the loop exits because the group is gone (all sessions
+    // ended / removed); printed once on the normal screen after we tear
+    // down the alt-screen so the user knows why the mosaic closed.
+    let mut ended_msg: Option<&'static str> = None;
     loop {
         tokio::select! {
             maybe_event = event_rx.recv() => {
@@ -2304,6 +2578,70 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                         }
 
                         // Layout overlay short-circuit: arrows move the
+                        // Swap mode (Ctrl-A S): arrows move the highlight,
+                        // Enter picks the source then the destination, Esc
+                        // cancels. Short-circuits the normal key path so
+                        // nothing leaks to the focused session mid-swap.
+                        if let Some(mut sw) = swap {
+                            let mut close = false;
+                            let mut do_swap: Option<(usize, usize)> = None;
+                            match key.code {
+                                KeyCode::Esc => close = true,
+                                KeyCode::Left | KeyCode::Char('h') => {
+                                    sw.cursor = swap_nav(&panes, sw.cursor, SwapDir::Left);
+                                }
+                                KeyCode::Right | KeyCode::Char('l') => {
+                                    sw.cursor = swap_nav(&panes, sw.cursor, SwapDir::Right);
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    sw.cursor = swap_nav(&panes, sw.cursor, SwapDir::Up);
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    sw.cursor = swap_nav(&panes, sw.cursor, SwapDir::Down);
+                                }
+                                KeyCode::Char(c) if c.is_ascii_digit() => {
+                                    let slot = c.to_digit(10).unwrap_or(0) as usize;
+                                    if slot >= 1 && slot <= panes.len() {
+                                        sw.cursor = slot - 1;
+                                    }
+                                }
+                                KeyCode::Enter => match sw.source {
+                                    None => sw.source = Some(sw.cursor),
+                                    Some(src) => {
+                                        do_swap = Some((src, sw.cursor));
+                                        close = true;
+                                    }
+                                },
+                                _ => {}
+                            }
+                            swap = if close { None } else { Some(sw) };
+                            if let Some((src, dst)) = do_swap {
+                                perform_swap(
+                                    src,
+                                    dst,
+                                    &mut panes,
+                                    &send_tx,
+                                    &cfg,
+                                    &group_id,
+                                    &mut current_group,
+                                )
+                                .await?;
+                            }
+                            draw_group(
+                                &mut stdout,
+                                &current_group,
+                                &panes,
+                                focused,
+                                None,
+                                None,
+                                &current_servers,
+                            )?;
+                            if let Some(sw) = swap.as_ref() {
+                                draw_swap_overlay(&mut stdout, &panes, sw)?;
+                            }
+                            continue;
+                        }
+
                         // selection, Enter applies + persists, Esc cancels.
                         if layout_picker.is_some() {
                             let lp = layout_picker.as_mut().unwrap();
@@ -2348,6 +2686,31 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                             )?;
                             if let Some(lp) = layout_picker.as_ref() {
                                 draw_layout_overlay(&mut stdout, lp)?;
+                            }
+                            continue;
+                        }
+
+                        // Ctrl-A S opens the swap-windows overlay (needs at
+                        // least two panes to have something to swap).
+                        if escape && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) {
+                            escape = false;
+                            if panes.len() >= 2 {
+                                swap = Some(SwapState {
+                                    source: None,
+                                    cursor: focused.min(panes.len() - 1),
+                                });
+                                draw_group(
+                                    &mut stdout,
+                                    &current_group,
+                                    &panes,
+                                    focused,
+                                    None,
+                                    None,
+                                    &current_servers,
+                                )?;
+                                if let Some(sw) = swap.as_ref() {
+                                    draw_swap_overlay(&mut stdout, &panes, sw)?;
+                                }
                             }
                             continue;
                         }
@@ -2575,6 +2938,9 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                         if let Some(lp) = layout_picker.as_ref() {
                             draw_layout_overlay(&mut stdout, lp)?;
                         }
+                        if let Some(sw) = swap.as_ref() {
+                            draw_swap_overlay(&mut stdout, &panes, sw)?;
+                        }
                     }
                     _ => {}
                 }
@@ -2618,22 +2984,52 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(anyhow!("websocket error: {e}")),
                 }
+                // Live output just repainted the panes — restore the swap
+                // chrome on top so its badges/banner aren't erased.
+                if let Some(sw) = swap.as_ref() {
+                    draw_swap_overlay(&mut stdout, &panes, sw)?;
+                }
+                // Every live session reported `session:lost` — the shells
+                // all exited (or were killed) out from under us. There's
+                // nothing left to attach to or forward keystrokes into, so
+                // exit instead of freezing on a mosaic of dead panes that
+                // swallows Ctrl-C. The membership poll would eventually
+                // catch this too, but only after the server reconciles
+                // (up to 60 s) — and once it deletes the empty group the
+                // poll's fetch starts 404ing forever.
+                if all_sessions_lost(&panes) {
+                    ended_msg = Some("All sessions in this group have ended.");
+                    break;
+                }
             }
             _ = membership_poll.tick() => {
                 // Don't fight the user mid-overlay — once they've opened
                 // the inline picker or a Y/n confirm modal we freeze
                 // the periodic refresh until they finish.
-                if picker.is_some() || confirm.is_some() || layout_picker.is_some() {
+                if picker.is_some()
+                    || confirm.is_some()
+                    || layout_picker.is_some()
+                    || swap.is_some()
+                {
                     continue;
                 }
-                // Best-effort: a transient HTTP failure shouldn't drop
-                // the user out of the group view.
-                let Ok(latest) = fetch_group_detail(&cfg, &group_id).await else {
-                    continue;
+                let latest = match fetch_group_detail_status(&cfg, &group_id).await {
+                    // The server auto-deletes a group once its last live
+                    // session dies, so the endpoint 404s. Exit rather than
+                    // retry the now-missing group forever.
+                    Ok(GroupFetch::Gone) => {
+                        ended_msg = Some("All sessions in this group have ended.");
+                        break;
+                    }
+                    Ok(GroupFetch::Found(latest)) => latest,
+                    // Best-effort: a transient HTTP failure shouldn't drop
+                    // the user out of the group view.
+                    Err(_) => continue,
                 };
                 if latest.group.members.is_empty() {
                     // Last terminal removed → exit, otherwise we'd keep
                     // an empty mosaic on screen forever.
+                    ended_msg = Some("All sessions in this group have ended.");
                     break;
                 }
                 // Detect membership/order changes (Vec<String> equality
@@ -2682,7 +3078,30 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
 
     drop(send_tx);
     writer.abort();
+    // Restore the normal screen before printing so the message lands in
+    // the user's scrollback rather than being wiped by the alt-screen exit.
+    drop(_guard);
+    if let Some(msg) = ended_msg {
+        println!("{msg}");
+    }
     Ok(())
+}
+
+/// True once the group has at least one session pane and *every* session
+/// pane has reported `session:lost`. Group panes always carry a session
+/// (unlike stack placeholders), so this is the signal that the whole
+/// mosaic has gone dead and there's nothing left to drive.
+fn all_sessions_lost(panes: &[Pane]) -> bool {
+    let mut any_session = false;
+    for pane in panes {
+        if pane.session.is_some() {
+            any_session = true;
+            if pane.lost.is_none() {
+                return false;
+            }
+        }
+    }
+    any_session
 }
 
 fn build_server_labels(servers: &[CliServer]) -> HashMap<String, String> {
@@ -2781,9 +3200,12 @@ fn partition_label(p: &[usize]) -> String {
     p.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(" + ")
 }
 
-/// A small 3-line × 9-col block-grid preview of a partition (rows of cells).
+/// A small 3-line × 11-col block-grid preview of a partition (rows of
+/// cells). Width 11 is deliberate: with single-space gaps it divides
+/// evenly for 1–4 columns (11, 10/2, 9/3, 8/4), so every cell in a row is
+/// the same width — no lopsided "█ █ ██" rows.
 fn partition_preview(p: &[usize]) -> [String; 3] {
-    const W: usize = 9;
+    const W: usize = 11;
     const H: usize = 3;
     let rows = p.len().max(1);
     let mut lines: [String; 3] = [String::new(), String::new(), String::new()];
@@ -3169,7 +3591,7 @@ fn draw_status_bar(
     } else if picker_active {
         "↑/↓ pick · Enter confirm · Esc cancel"
     } else {
-        "Ctrl-A D detach · 1-6 focus · [/] cycle · N add · V layout · X detach · K kill"
+        "Ctrl-A D detach · 1-6 focus · [/] cycle · N add · S swap · V layout · X detach · K kill"
     };
 
     let t = theme();
@@ -3521,7 +3943,7 @@ fn draw_picker(stdout: &mut Stdout, picker: &PickerState, slot: usize) -> Result
 fn draw_layout_overlay(stdout: &mut Stdout, lp: &LayoutPickerState) -> Result<()> {
     let t = theme();
     let (cols, rows) = terminal::size().unwrap_or((120, 36));
-    const CARD_W: u16 = 11; // 9-wide preview + 1 padding each side
+    const CARD_W: u16 = 13; // 11-wide preview + 1 padding each side
     const CARD_H: u16 = 6; // 1 top label gap + 3 preview + 1 label + 1
     const GAP: u16 = 2;
     let n = lp.options.len().max(1) as u16;
@@ -3600,6 +4022,191 @@ fn draw_layout_overlay(stdout: &mut Stdout, lp: &LayoutPickerState) -> Result<()
         }
     }
     stdout.flush()?;
+    Ok(())
+}
+
+/// Ctrl-A S "swap windows" overlay state. Two phases: pick the source
+/// window (`source == None`), then pick where to move it (`source` set).
+#[derive(Clone, Copy)]
+struct SwapState {
+    source: Option<usize>,
+    cursor: usize,
+}
+
+#[derive(Clone, Copy)]
+enum SwapDir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Spatial pane navigation: from `cur`, the nearest pane whose center lies
+/// in `dir`. Returns `cur` unchanged when there's nothing that way, so the
+/// highlight never jumps off into empty space.
+fn swap_nav(panes: &[Pane], cur: usize, dir: SwapDir) -> usize {
+    let Some(c) = panes.get(cur).map(|p| p.rect) else {
+        return cur;
+    };
+    let ccx = c.x as i32 + c.w as i32 / 2;
+    let ccy = c.y as i32 + c.h as i32 / 2;
+    let mut best = cur;
+    let mut best_score = i32::MAX;
+    for (i, p) in panes.iter().enumerate() {
+        if i == cur {
+            continue;
+        }
+        let pcx = p.rect.x as i32 + p.rect.w as i32 / 2;
+        let pcy = p.rect.y as i32 + p.rect.h as i32 / 2;
+        let (along, ok, cross) = match dir {
+            SwapDir::Left => (ccx - pcx, pcx < ccx, (pcy - ccy).abs()),
+            SwapDir::Right => (pcx - ccx, pcx > ccx, (pcy - ccy).abs()),
+            SwapDir::Up => (ccy - pcy, pcy < ccy, (pcx - ccx).abs()),
+            SwapDir::Down => (pcy - ccy, pcy > ccy, (pcx - ccx).abs()),
+        };
+        if !ok {
+            continue;
+        }
+        // Prefer panes closely aligned on the cross axis, then nearest.
+        let score = along + cross * 3;
+        if score < best_score {
+            best_score = score;
+            best = i;
+        }
+    }
+    best
+}
+
+/// Swap the windows in slots `i` and `j`: the session content moves but the
+/// slot rectangles stay put, so it reads as the two panes trading places.
+/// Resizes both moved sessions to their new slot and persists the new order
+/// so the browser and the membership poll agree.
+async fn perform_swap(
+    i: usize,
+    j: usize,
+    panes: &mut [Pane],
+    send_tx: &mpsc::Sender<String>,
+    cfg: &DashboardCliConfig,
+    group_id: &str,
+    current_group: &mut Group,
+) -> Result<()> {
+    if i == j || i >= panes.len() || j >= panes.len() {
+        return Ok(());
+    }
+    let ri = panes[i].rect;
+    let rj = panes[j].rect;
+    panes.swap(i, j);
+    panes[i].rect = ri;
+    panes[j].rect = rj;
+    for k in [i, j] {
+        if let Some(s) = panes[k].session.clone() {
+            let (h, w) = pane_inner_size(panes[k].rect);
+            send_ws(send_tx, client_resize_msg(&s, h, w)).await?;
+        }
+    }
+    let ids: Vec<String> = panes
+        .iter()
+        .filter_map(|p| p.session.as_ref().map(|s| s.id.clone()))
+        .collect();
+    let _ = save_group_order(cfg, group_id, &ids).await;
+    // Keep the in-memory roster ordered like the panes so the membership
+    // poll doesn't see a phantom reorder and rebuild everything.
+    current_group
+        .members
+        .sort_by_key(|m| ids.iter().position(|id| id == &m.id).unwrap_or(usize::MAX));
+    Ok(())
+}
+
+/// Redraw the swap-mode chrome on top of the freshly-drawn panes: a banner
+/// across the status row, the source pane outlined as "swapping", and the
+/// cursor pane outlined as the pick / destination.
+fn draw_swap_overlay(stdout: &mut Stdout, panes: &[Pane], swap: &SwapState) -> Result<()> {
+    let t = theme();
+    let (cols, _) = terminal::size().unwrap_or((120, 36));
+    let banner = match swap.source {
+        None => {
+            "  SWAP  pick a window — ←/↑/→/↓ move · 1-6 jump · Enter select · Esc cancel"
+                .to_string()
+        }
+        Some(src) => format!(
+            "  SWAP  placing window {} — ←/↑/→/↓ move · Enter confirm · Esc cancel",
+            src + 1
+        ),
+    };
+    queue!(
+        stdout,
+        MoveTo(0, 0),
+        SetBackgroundColor(t.accent),
+        SetForegroundColor(t.selected_fg),
+        SetAttribute(Attribute::Bold),
+        Print(fit_text(&banner, cols as usize)),
+        SetAttribute(Attribute::Reset),
+        ResetColor,
+    )?;
+    if let Some(src) = swap.source {
+        if let Some(p) = panes.get(src) {
+            outline_pane(stdout, p.rect, t.selected_bg, "✦ swapping")?;
+        }
+    }
+    if let Some(p) = panes.get(swap.cursor) {
+        let label = if swap.source.is_none() {
+            "▶ pick"
+        } else {
+            "▶ place here"
+        };
+        outline_pane(stdout, p.rect, t.accent, label)?;
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
+/// Redraw a pane's border in `color`, with `badge` embedded in the top edge
+/// (e.g. `╭─ ▶ pick ─────╮`). Overwrites the existing border in place.
+fn outline_pane(stdout: &mut Stdout, r: Rect, color: Color, badge: &str) -> Result<()> {
+    let b = theme().borders;
+    let w = r.w as usize;
+    if w < 4 || r.h < 2 {
+        return Ok(());
+    }
+    let inner = w - 2; // columns between the corner glyphs
+    let label = fit_text(&format!(" {badge} "), (badge.chars().count() + 2).min(inner));
+    let label_w = label.chars().count();
+    let lead = if inner > label_w { 1 } else { 0 };
+    let fill = inner.saturating_sub(label_w + lead);
+    let mut top = String::from(b.tl);
+    for _ in 0..lead {
+        top.push_str(b.h);
+    }
+    top.push_str(&label);
+    for _ in 0..fill {
+        top.push_str(b.h);
+    }
+    top.push_str(b.tr);
+
+    queue!(
+        stdout,
+        SetForegroundColor(color),
+        SetAttribute(Attribute::Bold),
+        MoveTo(r.x, r.y),
+        Print(top),
+    )?;
+    for y in r.y + 1..r.y + r.h.saturating_sub(1) {
+        queue!(
+            stdout,
+            MoveTo(r.x, y),
+            Print(b.v),
+            MoveTo(r.x + r.w.saturating_sub(1), y),
+            Print(b.v),
+        )?;
+    }
+    let bottom = format!("{}{}{}", b.bl, b.h.repeat(inner), b.br);
+    queue!(
+        stdout,
+        MoveTo(r.x, r.y + r.h.saturating_sub(1)),
+        Print(bottom),
+        SetAttribute(Attribute::Reset),
+        ResetColor,
+    )?;
     Ok(())
 }
 
@@ -3945,6 +4552,38 @@ async fn fetch_group_list_payload(cfg: &DashboardCliConfig) -> Result<GroupListP
 
 async fn fetch_group_detail(cfg: &DashboardCliConfig, id: &str) -> Result<CliGroupDetail> {
     get_json::<CliGroupDetail>(cfg, &format!("/api/cli/groups/{id}")).await
+}
+
+/// Outcome of polling a group's detail. `Gone` distinguishes a 404 (the
+/// group was deleted server-side once its last live session died) from a
+/// transient HTTP error — the former means "stop polling", the latter
+/// "retry later".
+enum GroupFetch {
+    Found(CliGroupDetail),
+    Gone,
+}
+
+async fn fetch_group_detail_status(
+    cfg: &DashboardCliConfig,
+    id: &str,
+) -> Result<GroupFetch> {
+    let path = format!("/api/cli/groups/{id}");
+    let client = reqwest::Client::new();
+    let res = client
+        .get(format!("{}{}", cfg.api_url, path))
+        .bearer_auth(&cfg.token)
+        .send()
+        .await
+        .with_context(|| format!("GET {path}"))?;
+    if res.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(GroupFetch::Gone);
+    }
+    if !res.status().is_success() {
+        bail!("dashboard returned HTTP {} for GET {path}", res.status());
+    }
+    let envelope: ApiEnvelope<CliGroupDetail> =
+        res.json().await.context("parsing dashboard response")?;
+    Ok(GroupFetch::Found(envelope.data))
 }
 
 async fn resolve_group_id(cfg: &DashboardCliConfig, selector: &str) -> Result<String> {

@@ -14,7 +14,7 @@
 //! The dashboard speaks the same protocol over an SSH-tunnelled socket,
 //! so a session created here shows up there and vice-versa.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use managet_agent::cli::ServiceAction;
 use managet_agent::{cli_dashboard, service, sessions};
@@ -246,8 +246,27 @@ fn init_tracing() {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")?;
+    let result = rt.block_on(run());
+    // The interactive attach path uses `tokio::io::stdin()`, which parks an
+    // uncancellable blocking thread in a tty read(). When a session ends from
+    // the agent side (the user typed `exit`, the agent shut down, the socket
+    // closed) `pipe_attach` returns on the socket half while that stdin read
+    // is still parked. The default current-thread runtime drop would then
+    // block forever trying to join the orphaned read thread — freezing the
+    // terminal in canonical mode, where mashing keys rings IMAXBEL endlessly
+    // and only a newline (which completes the parked read) frees it. All
+    // terminal guards are already restored by the time `run()` returns, so
+    // tear the runtime down without waiting on the orphaned read.
+    rt.shutdown_background();
+    result
+}
+
+async fn run() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     match cli.command {
@@ -295,8 +314,10 @@ async fn main() -> Result<()> {
             // the dashboard.
             let group_map = cli_dashboard::fetch_session_group_map().await;
             let group_ref = if group_map.is_empty() { None } else { Some(&group_map) };
-            sessions::client::run_ls(group_ref).await?;
-            cli_dashboard::print_groups_section().await
+            let local_ids = sessions::client::run_ls(group_ref).await?;
+            let local_set: std::collections::HashSet<String> =
+                local_ids.into_iter().collect();
+            cli_dashboard::print_dashboard_ls_sections(&local_set).await
         }
         Command::New {
             name,

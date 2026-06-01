@@ -36,7 +36,12 @@ use super::server::socket_path;
 /// append `[groupName]` to any local session that's part of a group so
 /// the listing makes it clear which sessions are also visible in the
 /// dashboard mosaic.
-pub async fn run_ls(group_annotations: Option<&HashMap<String, String>>) -> Result<()> {
+///
+/// Returns the ids of the local sessions it listed so the dashboard
+/// "from other servers" section can skip the ones already shown here.
+pub async fn run_ls(
+    group_annotations: Option<&HashMap<String, String>>,
+) -> Result<Vec<String>> {
     let resp = round_trip(&Request::List).await?;
     let sessions = match resp {
         Response::SessionList { sessions } => sessions,
@@ -44,24 +49,37 @@ pub async fn run_ls(group_annotations: Option<&HashMap<String, String>>) -> Resu
         other => return Err(anyhow!("unexpected response: {other:?}")),
     };
 
-    println!("{}", "Individual sessions".cyan().bold());
-    if sessions.is_empty() {
-        println!(
-            "  {}",
-            "(none — start one with `managet new`)".dark_grey()
-        );
-        return Ok(());
+    println!("{}", "Individual sessions from this server".cyan().bold());
+
+    // Standalone terminals only — sessions that belong to a group are
+    // listed under "Group sessions" instead, matching the web dashboard.
+    // (When the dashboard is unreachable, `group_annotations` is None and
+    // we show everything — a local agent with no dashboard still gets a
+    // useful listing.)
+    let is_grouped = |id: &str| group_annotations.is_some_and(|m| m.contains_key(id));
+    let visible: Vec<&_> = sessions.iter().filter(|s| !is_grouped(&s.id)).collect();
+
+    if visible.is_empty() {
+        let msg = if sessions.is_empty() {
+            "(none — start one with `managet new`)"
+        } else {
+            "(none — all in groups)"
+        };
+        println!("  {}", msg.dark_grey());
+        // Still report every local id so grouped local sessions aren't
+        // re-listed under "from other servers".
+        return Ok(sessions.iter().map(|s| s.id.clone()).collect());
     }
 
     let now = chrono_now_ms();
-    let name_width = sessions
+    let name_width = visible
         .iter()
         .map(|s| s.name.chars().count().min(28))
         .max()
         .unwrap_or(20)
         .max(20);
 
-    for s in &sessions {
+    for s in &visible {
         let age = format_age(now.saturating_sub(s.created_at_ms));
         let (bullet, status_styled) = if !s.running {
             ("✗", "exited".to_string().red())
@@ -77,25 +95,16 @@ pub async fn run_ls(group_annotations: Option<&HashMap<String, String>>) -> Resu
         // column widths off.
         let name_col = pad_visible(&truncate(&s.name, name_width), name_width);
         let age_col = pad_visible(&age, 10);
-        // Group tag (e.g. `[test]`) when the dashboard knows this
-        // session is a member of a group — keeps a session that's both
-        // in the local agent list AND in a group view visible in both
-        // places without making the user guess where it came from.
-        let group_tag = group_annotations
-            .and_then(|map| map.get(&s.id))
-            .map(|name| format!("  [{name}]").magenta())
-            .unwrap_or_else(|| String::new().stylize());
         println!(
-            "  {bullet} {name}  {age}  {status}  {hint}{tag}",
+            "  {bullet} {name}  {age}  {status}  {hint}",
             bullet = bullet.green(),
             name = name_col.white().bold(),
             age = age_col.dark_grey(),
             status = status_styled,
             hint = format!("[{}]", short_id(&s.id)).dark_grey(),
-            tag = group_tag,
         );
     }
-    Ok(())
+    Ok(sessions.iter().map(|s| s.id.clone()).collect())
 }
 
 /// `managet new [NAME] [-c CMD] [--no-attach]` — spawn a fresh session
