@@ -3203,38 +3203,57 @@ fn partition_label(p: &[usize]) -> String {
 /// A small 3-line × 11-col block-grid preview of a partition (rows of
 /// cells). Width 11 is deliberate: with single-space gaps it divides
 /// evenly for 1–4 columns (11, 10/2, 9/3, 8/4), so every cell in a row is
-/// the same width — no lopsided "█ █ ██" rows.
+/// the same width — no lopsided "█ █ ██" rows. Multi-row partitions get a
+/// blank gap line between bands, mirroring the single-space gaps between
+/// columns, so e.g. "2 + 2" reads as two stacked rows rather than one.
 fn partition_preview(p: &[usize]) -> [String; 3] {
     const W: usize = 11;
     const H: usize = 3;
+    let blank = " ".repeat(W);
     let rows = p.len().max(1);
-    let mut lines: [String; 3] = [String::new(), String::new(), String::new()];
-    for (line_idx, line) in lines.iter_mut().enumerate() {
-        // Which partition band this preview line belongs to.
-        let band = (line_idx * rows / H).min(rows - 1);
-        let count = (*p.get(band).unwrap_or(&1)).max(1);
-        // Split W columns into `count` cells separated by single-space gaps.
-        let gap = count.saturating_sub(1);
-        let fill = W.saturating_sub(gap);
-        let base = fill / count;
-        let extra = fill % count;
-        let mut s = String::with_capacity(W);
-        for c in 0..count {
-            if c > 0 {
+    // Render each band's block string (columns split by single-space gaps).
+    let bands: Vec<String> = (0..rows)
+        .map(|band| {
+            let count = (*p.get(band).unwrap_or(&1)).max(1);
+            let gap = count.saturating_sub(1);
+            let fill = W.saturating_sub(gap);
+            let base = fill / count;
+            let extra = fill % count;
+            let mut s = String::with_capacity(W);
+            for c in 0..count {
+                if c > 0 {
+                    s.push(' ');
+                }
+                let cw = base + if c < extra { 1 } else { 0 };
+                for _ in 0..cw.max(1) {
+                    s.push('█');
+                }
+            }
+            while s.chars().count() < W {
                 s.push(' ');
             }
-            let cw = base + if c < extra { 1 } else { 0 };
-            for _ in 0..cw.max(1) {
-                s.push('█');
-            }
+            s
+        })
+        .collect();
+    // Stack bands top-to-bottom with a blank gap line between them, then
+    // distribute any remaining height by growing each band evenly.
+    let gaps = rows.saturating_sub(1);
+    let content = H.saturating_sub(gaps).max(rows);
+    let per = content / rows;
+    let extra = content % rows;
+    let mut lines: Vec<String> = Vec::with_capacity(H);
+    for (band, s) in bands.iter().enumerate() {
+        let bh = (per + if band < extra { 1 } else { 0 }).max(1);
+        for _ in 0..bh {
+            lines.push(s.clone());
         }
-        // Pad to width.
-        while s.chars().count() < W {
-            s.push(' ');
+        if band + 1 < rows {
+            lines.push(blank.clone());
         }
-        *line = s;
     }
-    lines
+    // Guarantee exactly H lines (truncate overflow, pad shortfall).
+    lines.resize(H, blank.clone());
+    [lines[0].clone(), lines[1].clone(), lines[2].clone()]
 }
 
 fn handle_picker_key(key: KeyEvent, picker: &mut PickerState) -> PickerKeyResult {
