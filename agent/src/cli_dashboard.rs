@@ -1599,6 +1599,8 @@ struct StackListPayload {
     servers: Vec<CliServer>,
     #[serde(default)]
     runtimes: Vec<StackRuntimeDto>,
+    #[serde(default)]
+    preferences: GroupListPreferences,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1664,6 +1666,8 @@ struct CliStackDetail {
     /// first resizes this stack, then the default equal-split is used.
     #[serde(default)]
     layout: Option<GroupLayout>,
+    #[serde(default)]
+    preferences: GroupListPreferences,
 }
 
 /// Shape of the `POST /api/cli/stacks/[id]/launch` reply (LaunchStackResponse).
@@ -1712,15 +1716,33 @@ async fn resolve_stack_id(cfg: &DashboardCliConfig, selector: &str) -> Result<St
     }
 }
 
-/// Short server label for stack output: friendly host first, then name,
-/// then a truncated id. (Stacks don't carry the per-user host/name
-/// preference that groups do, so we just prefer the host.)
-fn stack_server_label(servers: &[CliServer], server_id: &str) -> String {
+/// Short server label for stack output. Honors the dashboard's
+/// `groupViewServerLabel` preference: when `friendly` (the setting is
+/// "name") it prefers the friendly server name, otherwise the host. Falls
+/// back to the other field, then a truncated id.
+fn stack_server_label(servers: &[CliServer], server_id: &str, friendly: bool) -> String {
     match servers.iter().find(|s| s.id == server_id) {
-        Some(s) if !s.host.is_empty() => s.host.clone(),
-        Some(s) if !s.name.is_empty() => s.name.clone(),
-        _ => short_id(server_id),
+        Some(s) => {
+            let (first, second) = if friendly {
+                (&s.name, &s.host)
+            } else {
+                (&s.host, &s.name)
+            };
+            if !first.is_empty() {
+                first.clone()
+            } else if !second.is_empty() {
+                second.clone()
+            } else {
+                short_id(server_id)
+            }
+        }
+        None => short_id(server_id),
     }
+}
+
+/// True when the dashboard prefers friendly server names over hosts.
+fn prefers_friendly_name(prefs: &GroupListPreferences) -> bool {
+    prefs.group_view_server_label == "name"
 }
 
 /// Human label for a stack's rolled-up state: `active` when every service
@@ -1756,6 +1778,7 @@ pub async fn run_stack_list() -> Result<()> {
 fn print_stack_rows(payload: &StackListPayload) {
     println!("{}", "Stacks".magenta().bold());
 
+    let friendly = prefers_friendly_name(&payload.preferences);
     let runtime_for = |stack_id: &str| payload.runtimes.iter().find(|r| r.stack_id == stack_id);
 
     let name_width = payload
@@ -1804,7 +1827,7 @@ fn print_stack_rows(payload: &StackListPayload) {
         }
         let server_labels = seen
             .iter()
-            .map(|sid| stack_server_label(&payload.servers, sid))
+            .map(|sid| stack_server_label(&payload.servers, sid, friendly))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -1844,7 +1867,7 @@ fn print_stack_rows(payload: &StackListPayload) {
                 "○".dark_grey()
             };
             let name_cell = pad_visible(&truncate(&sv.name, svc_name_width), svc_name_width);
-            let server = stack_server_label(&payload.servers, &sv.server_id);
+            let server = stack_server_label(&payload.servers, &sv.server_id, friendly);
             println!(
                 "      {branch} {dot} {name} {sep} {server}",
                 branch = branch.dark_grey(),
@@ -1924,8 +1947,9 @@ pub async fn run_stack_launch(
             result.launched.len(),
             detail.stack.name.magenta(),
         );
+        let friendly = prefers_friendly_name(&detail.preferences);
         for it in &result.launched {
-            let server = stack_server_label(&detail.servers, &it.server_id);
+            let server = stack_server_label(&detail.servers, &it.server_id, friendly);
             println!(
                 "  {} {} {} {}",
                 "✓".green(),
@@ -1937,8 +1961,9 @@ pub async fn run_stack_launch(
     }
     if !result.failed.is_empty() {
         println!("{} {} service(s):", "Failed".red().bold(), result.failed.len());
+        let friendly = prefers_friendly_name(&detail.preferences);
         for it in &result.failed {
-            let server = stack_server_label(&detail.servers, &it.server_id);
+            let server = stack_server_label(&detail.servers, &it.server_id, friendly);
             println!(
                 "  {} {} {}",
                 "✗".red(),
@@ -2083,6 +2108,7 @@ fn run_stack_editor(
     mut form: StackEditForm,
     servers: &[CliServer],
     allow_delete: bool,
+    friendly: bool,
 ) -> Result<EditorOutcome> {
     if !std::io::stdout().is_terminal() {
         bail!("the stack editor requires a TTY");
@@ -2099,7 +2125,7 @@ fn run_stack_editor(
         if cursor >= rows.len() {
             cursor = rows.len() - 1;
         }
-        draw_stack_editor(&mut stdout, title, &form, servers, &rows, cursor, caret, error.as_deref())?;
+        draw_stack_editor(&mut stdout, title, &form, servers, &rows, cursor, caret, error.as_deref(), friendly)?;
 
         let ev = event::read()?;
         let key = match ev {
@@ -2260,6 +2286,7 @@ fn draw_stack_editor(
     cursor: usize,
     caret: usize,
     error: Option<&str>,
+    friendly: bool,
 ) -> Result<()> {
     let t = theme();
     let b = t.borders;
@@ -2296,7 +2323,7 @@ fn draw_stack_editor(
                 lines.push(Disp::Field { row_idx: idx, indent: 2, label: "Name", value: form.services[i].name.clone(), action: false, text: true });
             }
             EditRow::SvcServer(i) => {
-                let label = stack_server_label(servers, &form.services[i].server_id);
+                let label = stack_server_label(servers, &form.services[i].server_id, friendly);
                 lines.push(Disp::Field { row_idx: idx, indent: 2, label: "Server", value: format!("‹ {label} ›   (←/→ change)"), action: false, text: false });
             }
             EditRow::SvcCommand(i) => lines.push(Disp::Field { row_idx: idx, indent: 2, label: "Command", value: form.services[i].command.clone(), action: false, text: true }),
@@ -2427,7 +2454,8 @@ pub async fn run_stack_new() -> Result<()> {
             cwd: String::new(),
         }],
     };
-    match run_stack_editor("New stack", form, &payload.servers, false)? {
+    let friendly = prefers_friendly_name(&payload.preferences);
+    match run_stack_editor("New stack", form, &payload.servers, false, friendly)? {
         EditorOutcome::Save(f) => {
             let mut body = serde_json::Map::new();
             body.insert("name".into(), serde_json::json!(f.name.trim()));
@@ -2481,7 +2509,8 @@ pub async fn run_stack_edit(selector: String) -> Result<()> {
     };
     let stack_name = detail.stack.name.clone();
 
-    match run_stack_editor("Edit stack", form, &detail.servers, true)? {
+    let friendly = prefers_friendly_name(&detail.preferences);
+    match run_stack_editor("Edit stack", form, &detail.servers, true, friendly)? {
         EditorOutcome::Save(f) => {
             let mut body = serde_json::Map::new();
             body.insert("name".into(), serde_json::json!(f.name.trim()));
@@ -5258,28 +5287,38 @@ fn pane_grid_pos(partition: &[usize], pane: usize) -> Option<(usize, usize)> {
     None
 }
 
-/// Move `delta` of ratio into `idx` from its neighbour (the entry after it,
-/// or before it when `idx` is last). `delta > 0` grows `idx`; `< 0` shrinks
-/// it. No-op (returns false) when there's no neighbour or the move would
-/// push either entry below `RESIZE_MIN_RATIO`.
-fn nudge_ratio(ratios: &mut [f64], idx: usize, delta: f64) -> bool {
-    if ratios.len() < 2 || idx >= ratios.len() {
+/// Move the divider adjacent to track cell `i` in the screen direction
+/// `dir` (+1 = right/down, −1 = left/up) — so the boundary line always
+/// travels the way the arrow points, no matter which pane is focused. Uses
+/// the divider *after* `i`, or the one *before* it when `i` is the last
+/// cell. Moving a divider toward `dir` grows the cell behind it and shrinks
+/// the cell ahead of it. No-op (false) when there's no divider or the move
+/// would push either cell below `RESIZE_MIN_RATIO`.
+fn move_divider(ratios: &mut [f64], i: usize, dir: f64) -> bool {
+    if ratios.len() < 2 || i >= ratios.len() {
         return false;
     }
-    let neighbour = if idx + 1 < ratios.len() { idx + 1 } else { idx - 1 };
-    let new_idx = ratios[idx] + delta;
-    let new_nb = ratios[neighbour] - delta;
-    if new_idx < RESIZE_MIN_RATIO || new_nb < RESIZE_MIN_RATIO {
+    // The two cells the chosen divider separates: (left/up, right/down).
+    let (lo, hi) = if i + 1 < ratios.len() {
+        (i, i + 1) // divider just after the focused cell
+    } else {
+        (i - 1, i) // focused cell is last → use the divider before it
+    };
+    // dir > 0 (right/down) moves the line that way: `lo` grows, `hi` shrinks.
+    let step = RESIZE_STEP * dir;
+    let new_lo = ratios[lo] + step;
+    let new_hi = ratios[hi] - step;
+    if new_lo < RESIZE_MIN_RATIO || new_hi < RESIZE_MIN_RATIO {
         return false;
     }
-    ratios[idx] = new_idx;
-    ratios[neighbour] = new_nb;
+    ratios[lo] = new_lo;
+    ratios[hi] = new_hi;
     true
 }
 
-/// Grow/shrink the focused pane along one axis by nudging the layout
-/// ratios. `dx`/`dy` are −1, 0, or +1 (right/down positive). Returns true
-/// when the layout actually changed.
+/// Move the divider next to the focused pane in the pressed arrow's
+/// direction. `dx`/`dy` are −1, 0, or +1 (right/down positive). Returns
+/// true when the layout actually changed.
 fn resize_focused(layout: &mut GroupLayout, partition: &[usize], pane: usize, dx: i32, dy: i32) -> bool {
     let Some((row, col)) = pane_grid_pos(partition, pane) else {
         return false;
@@ -5287,11 +5326,11 @@ fn resize_focused(layout: &mut GroupLayout, partition: &[usize], pane: usize, dx
     let mut changed = false;
     if dx != 0 {
         if let Some(widths) = layout.col_widths_by_row.get_mut(row) {
-            changed |= nudge_ratio(widths, col, RESIZE_STEP * dx as f64);
+            changed |= move_divider(widths, col, dx as f64);
         }
     }
     if dy != 0 {
-        changed |= nudge_ratio(&mut layout.row_heights, row, RESIZE_STEP * dy as f64);
+        changed |= move_divider(&mut layout.row_heights, row, dy as f64);
     }
     changed
 }

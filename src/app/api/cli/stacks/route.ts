@@ -13,9 +13,11 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
+import { eq } from "drizzle-orm";
+
 import { requireCliUserId } from "@/lib/cli-auth";
 import { db } from "@/lib/db";
-import { servers } from "@/lib/db/schema";
+import { servers, userPreferences } from "@/lib/db/schema";
 import { createStack, getAllStackRuntimes, listStacks } from "@/lib/stacks";
 
 const serviceInputSchema = z.object({
@@ -32,13 +34,14 @@ const createStackSchema = z.object({
 });
 
 export async function GET(request: Request) {
+  let userId: string;
   try {
-    await requireCliUserId(request);
+    userId = await requireCliUserId(request);
   } catch {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const [stacks, serverRows, runtimes] = await Promise.all([
+  const [stacks, serverRows, runtimes, prefRows] = await Promise.all([
     listStacks(),
     db
       .select({
@@ -49,10 +52,25 @@ export async function GET(request: Request) {
       })
       .from(servers),
     getAllStackRuntimes(),
+    db
+      .select({ groupViewServerLabel: userPreferences.groupViewServerLabel })
+      .from(userPreferences)
+      .where(eq(userPreferences.userId, userId))
+      .limit(1),
   ]);
 
+  // Same server-label preference groups use, so `managet stacks`/`ls`
+  // render friendly names when the dashboard is set to "name".
+  const groupViewServerLabel =
+    prefRows[0]?.groupViewServerLabel === "name" ? "name" : "host";
+
   return NextResponse.json({
-    data: { stacks, servers: serverRows, runtimes },
+    data: {
+      stacks,
+      servers: serverRows,
+      runtimes,
+      preferences: { groupViewServerLabel },
+    },
   });
 }
 

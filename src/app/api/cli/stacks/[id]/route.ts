@@ -11,10 +11,11 @@
  */
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { eq } from "drizzle-orm";
 
 import { requireCliUserId } from "@/lib/cli-auth";
 import { db } from "@/lib/db";
-import { servers } from "@/lib/db/schema";
+import { servers, userPreferences } from "@/lib/db/schema";
 import {
   deleteStack,
   getStack,
@@ -53,7 +54,7 @@ export async function GET(
     return NextResponse.json({ error: "Stack not found" }, { status: 404 });
   }
 
-  const [runtime, serverRows, layout] = await Promise.all([
+  const [runtime, serverRows, layout, prefRows] = await Promise.all([
     getStackRuntime(id),
     db
       .select({
@@ -64,10 +65,24 @@ export async function GET(
       })
       .from(servers),
     getUserStackLayout(userId, id),
+    db
+      .select({ groupViewServerLabel: userPreferences.groupViewServerLabel })
+      .from(userPreferences)
+      .where(eq(userPreferences.userId, userId))
+      .limit(1),
   ]);
 
+  const groupViewServerLabel =
+    prefRows[0]?.groupViewServerLabel === "name" ? "name" : "host";
+
   return NextResponse.json({
-    data: { stack, runtime, servers: serverRows, layout },
+    data: {
+      stack,
+      runtime,
+      servers: serverRows,
+      layout,
+      preferences: { groupViewServerLabel },
+    },
   });
 }
 
