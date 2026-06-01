@@ -14,15 +14,18 @@ import { NextResponse } from "next/server";
 import { eq } from "drizzle-orm";
 import { z } from "zod";
 
+import { ne } from "drizzle-orm";
+
 import { requireCliUserId } from "@/lib/cli-auth";
 import { db } from "@/lib/db";
-import { servers, userPreferences } from "@/lib/db/schema";
+import { servers, sessions, userPreferences } from "@/lib/db/schema";
 import {
   cleanupAllEmptyGroups,
   createGroupWithFirstMember,
   GroupConstraintError,
   listGroups,
 } from "@/lib/groups";
+import { listSessions } from "@/lib/ssh/session-manager";
 import { broadcastToAll } from "@/lib/ws";
 
 export async function GET(request: Request) {
@@ -34,7 +37,7 @@ export async function GET(request: Request) {
   }
 
   await cleanupAllEmptyGroups();
-  const [groups, serverRows, prefRows] = await Promise.all([
+  const [groups, serverRows, sessionRows, prefRows] = await Promise.all([
     listGroups(),
     db
       .select({
@@ -44,6 +47,19 @@ export async function GET(request: Request) {
         username: servers.username,
       })
       .from(servers),
+    // All live sessions across every server, so `managet ls` can list
+    // standalone terminals living on *other* hosts (the local agent only
+    // knows its own). Closed sessions are dropped — they'd be noise.
+    db
+      .select({
+        id: sessions.id,
+        serverId: sessions.serverId,
+        sessionName: sessions.sessionName,
+        status: sessions.status,
+        groupId: sessions.groupId,
+      })
+      .from(sessions)
+      .where(ne(sessions.status, "closed")),
     db
       .select({ groupViewServerLabel: userPreferences.groupViewServerLabel })
       .from(userPreferences)
@@ -54,10 +70,41 @@ export async function GET(request: Request) {
   const groupViewServerLabel =
     prefRows[0]?.groupViewServerLabel === "name" ? "name" : "host";
 
+  // Live attached-client counts per session, asked of each agent. The DB
+  // doesn't persist attach state (it's a property of who's connected right
+  // now), so `managet ls` can only show attached/detached if we look it up
+  // live. Best-effort and parallel: an unreachable agent contributes
+  // nothing, so its sessions get `attachedClients: null` (= unknown) rather
+  // than failing the whole listing.
+  const liveLists = await Promise.allSettled(
+    serverRows.map((sv) => listSessions(sv.id))
+  );
+  const attachCount = new Map<string, number>();
+  for (const res of liveLists) {
+    if (res.status === "fulfilled") {
+      for (const s of res.value) attachCount.set(s.id, s.attached_clients);
+    }
+  }
+  const attachedOf = (id: string): number | null =>
+    attachCount.has(id) ? attachCount.get(id)! : null;
+
+  const sessionsOut = sessionRows.map((s) => ({
+    ...s,
+    attachedClients: attachedOf(s.id),
+  }));
+  const groupsOut = groups.map((g) => ({
+    ...g,
+    members: g.members.map((m) => ({
+      ...m,
+      attachedClients: attachedOf(m.id),
+    })),
+  }));
+
   return NextResponse.json({
     data: {
-      groups,
+      groups: groupsOut,
       servers: serverRows,
+      sessions: sessionsOut,
       preferences: { groupViewServerLabel },
     },
   });
