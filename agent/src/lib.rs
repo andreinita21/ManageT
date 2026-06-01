@@ -10,6 +10,7 @@
 //! `managet` is just the four session commands (ls/new/attach/kill).
 
 pub mod cli;
+pub mod cli_dashboard;
 pub mod collector;
 pub mod config;
 pub mod hwmon;

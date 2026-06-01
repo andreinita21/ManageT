@@ -14,7 +14,10 @@
 use std::io::{IsTerminal, Write};
 use std::os::fd::AsRawFd;
 
+use std::collections::HashMap;
+
 use anyhow::{anyhow, Context, Result};
+use crossterm::style::Stylize;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::signal::unix::{signal, SignalKind};
@@ -23,38 +26,85 @@ use super::bar::StatusBar;
 use super::protocol::{Request, Response};
 use super::server::socket_path;
 
-/// `managet ls` — print the active sessions in a small table.
-pub async fn run_ls() -> Result<()> {
+/// `managet ls` — print the active local sessions as a colored,
+/// section-headed block. The "Group sessions" section is printed by the
+/// dashboard CLI module after this returns; keeping the two halves
+/// separate means hosts that have never logged into the dashboard still
+/// get a useful local listing.
+///
+/// `group_annotations`, when present, maps sessionId → group name. We
+/// append `[groupName]` to any local session that's part of a group so
+/// the listing makes it clear which sessions are also visible in the
+/// dashboard mosaic.
+///
+/// Returns the ids of the local sessions it listed so the dashboard
+/// "from other servers" section can skip the ones already shown here.
+pub async fn run_ls(
+    group_annotations: Option<&HashMap<String, String>>,
+) -> Result<Vec<String>> {
     let resp = round_trip(&Request::List).await?;
     let sessions = match resp {
         Response::SessionList { sessions } => sessions,
         Response::Error { message } => return Err(anyhow!(message)),
         other => return Err(anyhow!("unexpected response: {other:?}")),
     };
-    if sessions.is_empty() {
-        println!("(no sessions — start one with `managet new`)");
-        return Ok(());
-    }
-    println!("{:<10}  {:<20}  {:<24}  {}", "ID", "NAME", "AGE", "STATUS");
-    let now = chrono_now_ms();
-    for s in &sessions {
-        let age = format_age(now.saturating_sub(s.created_at_ms));
-        let status = if !s.running {
-            "exited".to_string()
-        } else if s.attached_clients > 0 {
-            format!("attached×{}", s.attached_clients)
+
+    println!("{}", "Individual sessions from this server".cyan().bold());
+
+    // Standalone terminals only — sessions that belong to a group are
+    // listed under "Group sessions" instead, matching the web dashboard.
+    // (When the dashboard is unreachable, `group_annotations` is None and
+    // we show everything — a local agent with no dashboard still gets a
+    // useful listing.)
+    let is_grouped = |id: &str| group_annotations.is_some_and(|m| m.contains_key(id));
+    let visible: Vec<&_> = sessions.iter().filter(|s| !is_grouped(&s.id)).collect();
+
+    if visible.is_empty() {
+        let msg = if sessions.is_empty() {
+            "(none — start one with `managet new`)"
         } else {
-            "detached".to_string()
+            "(none — all in groups)"
         };
+        println!("  {}", msg.dark_grey());
+        // Still report every local id so grouped local sessions aren't
+        // re-listed under "from other servers".
+        return Ok(sessions.iter().map(|s| s.id.clone()).collect());
+    }
+
+    let now = chrono_now_ms();
+    let name_width = visible
+        .iter()
+        .map(|s| s.name.chars().count().min(28))
+        .max()
+        .unwrap_or(20)
+        .max(20);
+
+    for s in &visible {
+        let age = format_age(now.saturating_sub(s.created_at_ms));
+        let (bullet, status_styled) = if !s.running {
+            ("✗", "exited".to_string().red())
+        } else if s.attached_clients > 0 {
+            (
+                "●",
+                format!("attached×{}", s.attached_clients).green(),
+            )
+        } else {
+            ("○", "detached".to_string().yellow())
+        };
+        // Pad before styling — ANSI sequences would otherwise throw the
+        // column widths off.
+        let name_col = pad_visible(&truncate(&s.name, name_width), name_width);
+        let age_col = pad_visible(&age, 10);
         println!(
-            "{:<10}  {:<20}  {:<24}  {}",
-            short_id(&s.id),
-            truncate(&s.name, 20),
-            age,
-            status
+            "  {bullet} {name}  {age}  {status}  {hint}",
+            bullet = bullet.green(),
+            name = name_col.white().bold(),
+            age = age_col.dark_grey(),
+            status = status_styled,
+            hint = format!("[{}]", short_id(&s.id)).dark_grey(),
         );
     }
-    Ok(())
+    Ok(sessions.iter().map(|s| s.id.clone()).collect())
 }
 
 /// `managet new [NAME] [-c CMD] [--no-attach]` — spawn a fresh session
@@ -193,8 +243,8 @@ pub async fn run_attach(id: String) -> Result<()> {
     });
 
     // 5. Pipe stdin → socket and socket → stdout. The detach state
-    //    machine watches stdin for `Ctrl-A d`.
-    let pipe_result = pipe_attach(reader, wr).await;
+    //    machine watches stdin for `Ctrl-A d` and `Ctrl-A g` (group prompt).
+    let pipe_result = pipe_attach(reader, wr, &_raw, resolved_id.clone()).await;
 
     resize_task.abort();
     // Restore the terminal title before RawMode drops so the user's
@@ -203,7 +253,17 @@ pub async fn run_attach(id: String) -> Result<()> {
         let mut out = std::io::stdout();
         let _ = bar.leave(&mut out);
     }
-    pipe_result
+
+    // Ctrl-A G that joined/created a group asks us to switch straight into
+    // that group's mosaic. Drop our raw-mode guard first so the mosaic's
+    // own terminal setup starts from a clean cooked state.
+    if let Ok(Some(group_id)) = &pipe_result {
+        let group_id = group_id.clone();
+        drop(_raw);
+        return crate::cli_dashboard::run_group_open(group_id, None).await;
+    }
+
+    pipe_result.map(|_| ())
 }
 
 /// Heart of `attach`: copies bytes both ways, watches for the detach
@@ -222,13 +282,15 @@ pub async fn run_attach(id: String) -> Result<()> {
 async fn pipe_attach(
     mut socket_reader: BufReader<tokio::net::unix::OwnedReadHalf>,
     mut socket_writer: tokio::net::unix::OwnedWriteHalf,
-) -> Result<()> {
+    raw: &RawMode,
+    session_id: String,
+) -> Result<Option<String>> {
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
 
     // Detach escape state machine. NORMAL → ESCAPE on Ctrl-A. From
-    // ESCAPE: 'd' = detach, Ctrl-A = pass through (escape escape), any
-    // other byte = re-emit Ctrl-A then that byte.
+    // ESCAPE: 'd' = detach, 'g' = group prompt, Ctrl-A = pass through
+    // (escape escape), any other byte = re-emit Ctrl-A then that byte.
     #[derive(Copy, Clone, PartialEq)]
     enum EscState {
         Normal,
@@ -246,7 +308,7 @@ async fn pipe_attach(
             // Bytes from the agent → write to user's stdout.
             r = socket_reader.read(&mut sock_buf) => {
                 match r {
-                    Ok(0) => return Ok(()),
+                    Ok(0) => return Ok(None),
                     Err(e) => return Err(anyhow!("socket read: {e}")),
                     Ok(n) => {
                         stdout.write_all(&sock_buf[..n]).await?;
@@ -258,7 +320,7 @@ async fn pipe_attach(
             // forward to agent.
             r = stdin.read(&mut stdin_buf) => {
                 match r {
-                    Ok(0) => return Ok(()), // local EOF, detach
+                    Ok(0) => return Ok(None), // local EOF, detach
                     Err(e) => return Err(anyhow!("stdin read: {e}")),
                     Ok(n) => {
                         let mut out: Vec<u8> = Vec::with_capacity(n);
@@ -280,7 +342,40 @@ async fn pipe_attach(
                                             socket_writer.write_all(&out).await?;
                                         }
                                         eprintln!("\r\n[managet] detached.");
-                                        return Ok(());
+                                        return Ok(None);
+                                    } else if b == b'g' || b == b'G' {
+                                        // Ctrl-A G: add this session to a
+                                        // group / create one. Flush pending
+                                        // input, drop to cooked mode, run the
+                                        // inquire prompt, then restore raw
+                                        // mode and nudge the shell to repaint.
+                                        state = EscState::Normal;
+                                        if !out.is_empty() {
+                                            socket_writer.write_all(&out).await?;
+                                            socket_writer.flush().await?;
+                                            out.clear();
+                                        }
+                                        raw.suspend();
+                                        let _ = stdout.write_all(b"\r\n").await;
+                                        let _ = stdout.flush().await;
+                                        let chosen = crate::cli_dashboard::run_attach_group_prompt(
+                                            session_id.clone(),
+                                        )
+                                        .await
+                                        .ok()
+                                        .flatten();
+                                        raw.resume();
+                                        if let Some(group_id) = chosen {
+                                            // Detach the solo view and hand
+                                            // control back to run_attach, which
+                                            // opens this group's mosaic.
+                                            return Ok(Some(group_id));
+                                        }
+                                        // Stayed solo: repaint via a
+                                        // SIGWINCH-style resize so the shell
+                                        // redraws its prompt cleanly.
+                                        let (r, c) = local_term_size().unwrap_or((24, 80));
+                                        let _ = send_resize(&session_id, r, c).await;
                                     } else if b == CTRL_A {
                                         // Literal Ctrl-A — emit one and
                                         // stay in Escape so user can do
@@ -421,6 +516,25 @@ impl RawMode {
         }
         Ok(Self { fd, original })
     }
+
+    /// Temporarily restore cooked mode (e.g. to run an `inquire` prompt),
+    /// without consuming the guard. Pair with `resume`.
+    fn suspend(&self) {
+        // SAFETY: fd valid for the guard's lifetime; original is POD.
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+        }
+    }
+
+    /// Re-enter raw mode after a `suspend`.
+    fn resume(&self) {
+        let mut raw = self.original;
+        // SAFETY: same.
+        unsafe {
+            libc::cfmakeraw(&mut raw);
+            libc::tcsetattr(self.fd, libc::TCSANOW, &raw);
+        }
+    }
 }
 
 impl Drop for RawMode {
@@ -443,10 +557,26 @@ fn short_id(id: &str) -> String {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max - 1])
+        let head = s.chars().take(max.saturating_sub(1)).collect::<String>();
+        format!("{head}…")
+    }
+}
+
+/// Right-pad a string with spaces so its visible (character) width is
+/// at least `width`. Used to keep colored columns aligned — coloring
+/// happens *after* padding so the ANSI escape codes don't get counted.
+fn pad_visible(s: &str, width: usize) -> String {
+    let len = s.chars().count();
+    if len >= width {
+        s.to_string()
+    } else {
+        let mut out = String::with_capacity(s.len() + (width - len));
+        out.push_str(s);
+        out.push_str(&" ".repeat(width - len));
+        out
     }
 }
 

@@ -169,17 +169,36 @@ async function main() {
   console.log(`  ${inst.out.trim()}`);
 
   step("5", "Re-bootstrapping launchd unit");
-  const boot = await sudo(
-    c,
-    "launchctl bootstrap system /Library/LaunchDaemons/com.managet.agent.plist && sleep 2 && launchctl print system/com.managet.agent 2>&1 | grep -E 'state =|pid =' | head -3"
-  );
-  require0(boot, "bootstrap");
+  // launchctl bootstrap intermittently fails with "Input/output error"
+  // (exit 5) when the prior bootout hasn't fully settled — the service is
+  // still half-registered. A clean bootout + a few seconds' settle before
+  // bootstrap fixes it reliably; retry once for good measure.
+  // bootstrap intermittently returns exit 5 (I/O error) when the prior
+  // bootout hasn't settled, and even on a 0 exit the daemon can take a
+  // moment to actually spawn + bind its socket. So: clean bootout, settle,
+  // bootstrap (retry once), then poll until managet-agent is actually
+  // running (kickstart as a last resort).
+  const bootCmd =
+    "launchctl bootout system/com.managet.agent 2>/dev/null; sleep 3; " +
+    "launchctl bootstrap system /Library/LaunchDaemons/com.managet.agent.plist 2>&1 || " +
+    "{ sleep 3; launchctl bootstrap system /Library/LaunchDaemons/com.managet.agent.plist 2>&1; }; " +
+    "for i in 1 2 3 4 5; do pgrep -q managet-agent && break; " +
+    "launchctl kickstart system/com.managet.agent 2>/dev/null; sleep 2; done; " +
+    "launchctl print system/com.managet.agent 2>&1 | grep -E 'state =|pid =' | head -3";
+  const boot = await sudo(c, bootCmd);
   console.log(`  ${boot.out.trim()}`);
 
   step("6", "Smoke test (managet ls)");
-  const ls = await exec(c, "/usr/local/bin/managet ls 2>&1");
+  // The agent's Unix socket can lag a beat behind the process; retry rather
+  // than fail the whole deploy on a transient "connection refused".
+  let ls = { code: -1, out: "" };
+  for (let attempt = 0; attempt < 6; attempt++) {
+    ls = await exec(c, "/usr/local/bin/managet ls 2>&1");
+    if (ls.code === 0) break;
+    await new Promise((r) => setTimeout(r, 1500));
+  }
   console.log(`  $ managet ls\n${ls.out.split("\n").map((l) => "    " + l).join("\n")}`);
-  if (ls.code !== 0) throw new Error("managet ls failed on Mac mini");
+  if (ls.code !== 0) throw new Error("managet ls failed on Mac mini after retries");
 
   c.end();
   console.log("\n\x1b[1;32m✓ Mac mini agent rebuilt + redeployed.\x1b[0m");

@@ -234,12 +234,27 @@ impl Session {
     }
 }
 
+/// Where to POST an instant "session created" notification, so the dashboard
+/// shows a freshly-spawned session within a beat instead of waiting for its
+/// ~60s reconcile sweep. Populated from the agent config when available.
+#[derive(Clone)]
+struct DashboardNotify {
+    /// Normalized base URL (no trailing slash).
+    api_url: String,
+    /// Per-server agent bearer token.
+    token: String,
+}
+
 pub struct SessionManager {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     /// Shared shutdown broadcaster. Each session gets a clone in its
     /// `shutdown_pulse_tx` field; calling `broadcast_shutdown()` on
     /// the manager pulses every attached handler at once.
     shutdown_pulse_tx: broadcast::Sender<()>,
+    /// Optional dashboard push target (set via `set_dashboard`). `None` when
+    /// the agent isn't linked to a dashboard — sessions still surface via the
+    /// reconciler.
+    dashboard: Option<DashboardNotify>,
 }
 
 impl SessionManager {
@@ -248,7 +263,14 @@ impl SessionManager {
         Self {
             sessions: Mutex::new(HashMap::new()),
             shutdown_pulse_tx,
+            dashboard: None,
         }
+    }
+
+    /// Point the manager at a dashboard so `create()` fires an instant
+    /// "session created" POST. Call once at startup before wrapping in Arc.
+    pub fn set_dashboard(&mut self, api_url: String, token: String) {
+        self.dashboard = Some(DashboardNotify { api_url, token });
     }
 
     /// Pulse the shutdown broadcaster so every attach handler can
@@ -347,6 +369,11 @@ impl SessionManager {
     ) -> Result<Arc<Session>> {
         let id = uuid::Uuid::new_v4().to_string();
         let name = name.unwrap_or_else(|| format!("session-{}", &id[..8]));
+
+        // Captured before `command`/`cwd` get consumed below, for the
+        // best-effort dashboard push at the end.
+        let notify_command = command.clone();
+        let notify_cwd = cwd.clone();
 
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -754,6 +781,34 @@ impl SessionManager {
             .lock()
             .unwrap()
             .insert(id.clone(), session.clone());
+
+        // Best-effort instant push so the dashboard shows the session right
+        // away instead of waiting for its ~60s reconcile. Fire-and-forget;
+        // any failure is harmless (the reconciler still backstops).
+        if let Some(d) = &self.dashboard {
+            let url = format!("{}/api/agent/session-created", d.api_url);
+            let token = d.token.clone();
+            let sid = id.clone();
+            let sname = name.clone();
+            tokio::spawn(async move {
+                let body = serde_json::json!({
+                    "sessionId": sid,
+                    "name": sname,
+                    "command": notify_command,
+                    "cwd": notify_cwd,
+                    "status": "active",
+                });
+                let client = reqwest::Client::new();
+                let _ = client
+                    .post(&url)
+                    .bearer_auth(&token)
+                    .json(&body)
+                    .timeout(std::time::Duration::from_secs(5))
+                    .send()
+                    .await;
+            });
+        }
+
         Ok(session)
     }
 }

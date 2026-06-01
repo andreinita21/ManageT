@@ -11,7 +11,7 @@
  *   3. Stacks                  — live stacks (link out to /stacks for
  *                                create/edit/delete management).
  */
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 
 import {
@@ -73,6 +73,55 @@ export default function SessionsPage() {
   const [bulkGroupOpen, setBulkGroupOpen] = useState(false);
   const [bulkGroupName, setBulkGroupName] = useState("");
   const [bulkBusy, setBulkBusy] = useState(false);
+
+  // Live-refresh the session list when an agent reports a new session
+  // (e.g. `managet new` run directly on a server) — the dashboard broadcasts
+  // `sessions:changed` from /api/agent/session-created. One-way WS, mirrors
+  // the group view's `group:changed` subscription.
+  useEffect(() => {
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const url = `${proto}//${window.location.host}/api/ws`;
+    let ws: WebSocket | null = null;
+    let closed = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    const connect = () => {
+      try {
+        ws = new WebSocket(url);
+      } catch {
+        return;
+      }
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data as string) as { type?: string };
+          if (msg.type === "sessions:changed") {
+            void refetchSessions();
+          }
+        } catch {
+          /* unrelated frame */
+        }
+      };
+      ws.onclose = () => {
+        if (!closed) retryTimer = setTimeout(connect, 2000);
+      };
+      ws.onerror = () => {
+        try {
+          ws?.close();
+        } catch {
+          /* fall through to onclose */
+        }
+      };
+    };
+    connect();
+    return () => {
+      closed = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      try {
+        ws?.close();
+      } catch {
+        /* ignore */
+      }
+    };
+  }, [refetchSessions]);
 
   const exitSelectMode = () => {
     setSelectMode(false);

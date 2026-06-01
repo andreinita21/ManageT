@@ -35,6 +35,9 @@ interface DraftState {
   /** Held in draft only so save() round-trips the value — the Dashboard
    *  tab owns editing this field. */
   groupViewServerLabel: AppearancePreferences["groupViewServerLabel"];
+  /** Round-tripped only — the Mosaic Themes tab owns editing these. */
+  mosaicThemeActive: AppearancePreferences["mosaicThemeActive"];
+  mosaicCustomThemes: AppearancePreferences["mosaicCustomThemes"];
 }
 
 function prefsToDraft(prefs: AppearancePreferences): DraftState {
@@ -48,6 +51,8 @@ function prefsToDraft(prefs: AppearancePreferences): DraftState {
     terminalFontSize: prefs.terminalFontSize,
     customTheme: seed,
     groupViewServerLabel: prefs.groupViewServerLabel,
+    mosaicThemeActive: prefs.mosaicThemeActive,
+    mosaicCustomThemes: prefs.mosaicCustomThemes,
   };
 }
 
@@ -58,6 +63,8 @@ function draftToPrefs(d: DraftState): AppearancePreferences {
     terminalFontSize: d.terminalFontSize,
     customTheme: d.themeKey === "custom" ? d.customTheme : null,
     groupViewServerLabel: d.groupViewServerLabel,
+    mosaicThemeActive: d.mosaicThemeActive,
+    mosaicCustomThemes: d.mosaicCustomThemes,
   };
 }
 

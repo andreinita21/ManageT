@@ -14,10 +14,10 @@
 //! The dashboard speaks the same protocol over an SSH-tunnelled socket,
 //! so a session created here shows up there and vice-versa.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use managet_agent::cli::ServiceAction;
-use managet_agent::{service, sessions};
+use managet_agent::{cli_dashboard, service, sessions};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -35,6 +35,46 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Authenticate this local CLI with the ManageT dashboard.
+    Login {
+        /// Dashboard base URL, e.g. https://managet.example.com.
+        #[arg(long, env = "MANAGET_API_URL")]
+        api_url: Option<String>,
+
+        /// Dashboard username. Prompted when omitted.
+        #[arg(short, long)]
+        username: Option<String>,
+
+        /// Dashboard password. Prefer the prompt; this exists for automation.
+        #[arg(long, env = "MANAGET_PASSWORD", hide = true, hide_env_values = true)]
+        password: Option<String>,
+    },
+
+    /// List terminal groups from the dashboard.
+    Groups,
+
+    /// Open or modify a dashboard terminal group from this CLI.
+    Group {
+        #[command(subcommand)]
+        action: GroupAction,
+    },
+
+    /// List stacks from the dashboard.
+    Stacks,
+
+    /// Launch or open a dashboard stack from this CLI.
+    Stack {
+        #[command(subcommand)]
+        action: StackAction,
+    },
+
+    /// List or set the color/line theme for the group & stack mosaics.
+    /// With no subcommand, lists the presets (marking the active one).
+    Theme {
+        #[command(subcommand)]
+        action: Option<ThemeAction>,
+    },
+
     /// List active terminal sessions managed by this host's agent.
     Ls,
 
@@ -91,6 +131,107 @@ enum Command {
     Restart,
 }
 
+#[derive(Debug, Subcommand)]
+enum GroupAction {
+    /// Attach to a group as a multi-pane terminal view (alias: open).
+    /// Detach with Ctrl-A d, just like a single-session attach.
+    #[command(alias = "open")]
+    Attach {
+        /// Group id, unique prefix, or exact group name.
+        id: String,
+        /// Mosaic theme for this run (see `managet theme list`). Overrides
+        /// the saved default.
+        #[arg(long)]
+        theme: Option<String>,
+    },
+
+    /// Save a browser-compatible row arrangement such as 2+2 or 1+3.
+    Layout {
+        /// Group id, unique prefix, or exact group name.
+        id: String,
+        /// Row arrangement. Examples: 2+2, 1+3, 3+1, 4.
+        arrangement: String,
+    },
+
+    /// Swap two pane slots and persist the new order for the browser too.
+    Swap {
+        /// Group id, unique prefix, or exact group name.
+        id: String,
+        /// First 1-based slot number.
+        from: usize,
+        /// Second 1-based slot number.
+        to: usize,
+    },
+
+    /// Add a new terminal to a group. With no `--server`, opens an
+    /// interactive picker listing every server on your dashboard
+    /// account (friendly name + host).
+    Add {
+        /// Group id, unique prefix, or exact group name.
+        id: String,
+        /// Server name, host, or id. Skips the picker when given.
+        #[arg(short, long)]
+        server: Option<String>,
+        /// Friendly name for the new session.
+        #[arg(short, long)]
+        name: Option<String>,
+        /// Command to run in the session (default: server's $SHELL).
+        #[arg(short, long)]
+        command: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum StackAction {
+    /// Launch a stack. With no flags, launches every service on every
+    /// server (same as the dashboard's "Launch Stack"). Narrow the launch
+    /// with --server and/or --service.
+    Launch {
+        /// Stack id, unique prefix, or exact stack name.
+        id: String,
+        /// Only launch services on this server (name, host, or id).
+        #[arg(short, long)]
+        server: Option<String>,
+        /// Only launch this service (name, id, or unique id prefix).
+        #[arg(long)]
+        service: Option<String>,
+        /// Kill any already-active sessions first, then respawn.
+        #[arg(short, long)]
+        force: bool,
+    },
+
+    /// Open a stack as a multi-pane terminal mosaic across every server
+    /// involved. Services that aren't running yet show a placeholder pane
+    /// that goes live once the service starts. Detach with Ctrl-A d.
+    /// (alias: attach)
+    #[command(alias = "attach")]
+    Open {
+        /// Stack id, unique prefix, or exact stack name.
+        id: String,
+        /// Only show this server's services from the stack (name, host, or id).
+        #[arg(short, long)]
+        server: Option<String>,
+        /// Mosaic theme for this run (see `managet theme list`). Overrides
+        /// the saved default.
+        #[arg(long)]
+        theme: Option<String>,
+    },
+
+    /// List stacks (same as `managet stacks`).
+    List,
+}
+
+#[derive(Debug, Subcommand)]
+enum ThemeAction {
+    /// List the available themes, marking the active one.
+    List,
+    /// Set the default theme for the group & stack mosaics.
+    Set {
+        /// Theme name (e.g. default, ocean, solarized, mono, matrix, sunset).
+        name: String,
+    },
+}
+
 fn init_tracing() {
     // Quieter than the agent's default — `managet` is interactive, the
     // user doesn't want INFO logs by default. Only honour RUST_LOG if
@@ -105,13 +246,85 @@ fn init_tracing() {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")?;
+    let result = rt.block_on(run());
+    // The interactive attach path uses `tokio::io::stdin()`, which parks an
+    // uncancellable blocking thread in a tty read(). When a session ends from
+    // the agent side (the user typed `exit`, the agent shut down, the socket
+    // closed) `pipe_attach` returns on the socket half while that stdin read
+    // is still parked. The default current-thread runtime drop would then
+    // block forever trying to join the orphaned read thread — freezing the
+    // terminal in canonical mode, where mashing keys rings IMAXBEL endlessly
+    // and only a newline (which completes the parked read) frees it. All
+    // terminal guards are already restored by the time `run()` returns, so
+    // tear the runtime down without waiting on the orphaned read.
+    rt.shutdown_background();
+    result
+}
+
+async fn run() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     match cli.command {
-        Command::Ls => sessions::client::run_ls().await,
-        Command::New { name, name_flag, command, no_attach } => {
+        Command::Login {
+            api_url,
+            username,
+            password,
+        } => cli_dashboard::run_login(api_url, username, password).await,
+        Command::Groups => cli_dashboard::run_group_list().await,
+        Command::Group { action } => match action {
+            GroupAction::Attach { id, theme } => cli_dashboard::run_group_open(id, theme).await,
+            GroupAction::Layout { id, arrangement } => {
+                cli_dashboard::run_group_layout(id, arrangement).await
+            }
+            GroupAction::Swap { id, from, to } => cli_dashboard::run_group_swap(id, from, to).await,
+            GroupAction::Add {
+                id,
+                server,
+                name,
+                command,
+            } => cli_dashboard::run_group_add(id, server, name, command).await,
+        },
+        Command::Stacks => cli_dashboard::run_stack_list().await,
+        Command::Stack { action } => match action {
+            StackAction::Launch {
+                id,
+                server,
+                service,
+                force,
+            } => cli_dashboard::run_stack_launch(id, server, service, force).await,
+            StackAction::Open { id, server, theme } => {
+                cli_dashboard::run_stack_open(id, server, theme).await
+            }
+            StackAction::List => cli_dashboard::run_stack_list().await,
+        },
+        Command::Theme { action } => match action {
+            None | Some(ThemeAction::List) => cli_dashboard::run_theme_list().await,
+            Some(ThemeAction::Set { name }) => cli_dashboard::run_theme_set(name).await,
+        },
+        Command::Ls => {
+            // Pull the dashboard's group → member map up front (when
+            // logged in) so individual session rows can be tagged with
+            // `[groupName]`. Silent fall-through when offline keeps
+            // `managet ls` useful on hosts that haven't logged into
+            // the dashboard.
+            let group_map = cli_dashboard::fetch_session_group_map().await;
+            let group_ref = if group_map.is_empty() { None } else { Some(&group_map) };
+            let local_ids = sessions::client::run_ls(group_ref).await?;
+            let local_set: std::collections::HashSet<String> =
+                local_ids.into_iter().collect();
+            cli_dashboard::print_dashboard_ls_sections(&local_set).await
+        }
+        Command::New {
+            name,
+            name_flag,
+            command,
+            no_attach,
+        } => {
             let resolved = name.or(name_flag);
             sessions::client::run_new(resolved, command, no_attach).await
         }

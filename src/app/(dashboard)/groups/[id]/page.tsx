@@ -66,6 +66,62 @@ export default function GroupPage() {
     }
   }, [loading, group, router, toast]);
 
+  // Subscribe to the dashboard WS for `group:changed` pushes. The CLI
+  // and other browser tabs mutate the group via REST; the server then
+  // broadcasts so this view refetches without a manual reload. Plain
+  // `new WebSocket` here (not the xterm hook) — we only need one-way
+  // notifications, no PTY plumbing.
+  useEffect(() => {
+    if (!groupId) return;
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const url = `${proto}//${window.location.host}/api/ws`;
+    let ws: WebSocket | null = null;
+    let closed = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const connect = () => {
+      try {
+        ws = new WebSocket(url);
+      } catch {
+        return;
+      }
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data as string) as {
+            type?: string;
+            groupId?: string;
+          };
+          if (msg.type === "group:changed" && msg.groupId === groupId) {
+            void refetchGroup();
+            void refetchSessions();
+          }
+        } catch {
+          /* unrelated frame */
+        }
+      };
+      ws.onclose = () => {
+        if (!closed) retryTimer = setTimeout(connect, 2000);
+      };
+      ws.onerror = () => {
+        try {
+          ws?.close();
+        } catch {
+          /* fall through to onclose */
+        }
+      };
+    };
+    connect();
+    return () => {
+      closed = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      try {
+        ws?.close();
+      } catch {
+        /* socket already torn down */
+      }
+    };
+  }, [groupId, refetchGroup, refetchSessions]);
+
   // Open the rename modal pre-populated with the current name.
   useEffect(() => {
     if (renaming && group) setRenameValue(group.name);
@@ -455,23 +511,33 @@ function AddMemberModal({
               </div>
             ) : (
               <div className="space-y-1.5 max-h-48 overflow-y-auto">
-                {freeSessions.map((s) => (
-                  <button
-                    key={s.id}
-                    type="button"
-                    onClick={() => void onAddExisting(s.id)}
-                    className="w-full text-left bg-mg-bg-tertiary border border-mg-border rounded-lg px-3 py-2 hover:border-mg-accent hover:bg-mg-bg-hover transition-all"
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm text-mg-text font-mono">
-                        {s.sessionName}
-                      </span>
-                      <span className="text-xs text-mg-text-tertiary">
-                        {s.status}
-                      </span>
-                    </div>
-                  </button>
-                ))}
+                {freeSessions.map((s) => {
+                  const srv = servers.find((sv) => sv.id === s.serverId);
+                  const deviceLabel = srv?.name || srv?.host || null;
+                  return (
+                    <button
+                      key={s.id}
+                      type="button"
+                      onClick={() => void onAddExisting(s.id)}
+                      className="w-full text-left bg-mg-bg-tertiary border border-mg-border rounded-lg px-3 py-2 hover:border-mg-accent hover:bg-mg-bg-hover transition-all"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-sm text-mg-text font-mono truncate">
+                          {s.sessionName}
+                          {deviceLabel && (
+                            <span className="text-mg-text-tertiary font-sans">
+                              {" "}
+                              ({deviceLabel})
+                            </span>
+                          )}
+                        </span>
+                        <span className="text-xs text-mg-text-tertiary shrink-0">
+                          {s.status}
+                        </span>
+                      </div>
+                    </button>
+                  );
+                })}
               </div>
             )}
           </div>

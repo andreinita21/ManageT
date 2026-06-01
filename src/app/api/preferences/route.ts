@@ -20,6 +20,11 @@ import {
   type GroupViewServerLabel,
   type ThemeColors,
 } from "@/lib/themes/presets";
+import {
+  resolveActiveName,
+  sanitizeCustomThemes,
+  type MosaicTheme,
+} from "@/lib/mosaic-themes/presets";
 
 function rowToPrefs(
   row: typeof userPreferences.$inferSelect
@@ -34,12 +39,22 @@ function rowToPrefs(
   }
   const groupViewServerLabel: GroupViewServerLabel =
     row.groupViewServerLabel === "name" ? "name" : "host";
+  let mosaicCustomThemes: MosaicTheme[] = [];
+  if (row.mosaicCustomThemes) {
+    try {
+      mosaicCustomThemes = sanitizeCustomThemes(JSON.parse(row.mosaicCustomThemes));
+    } catch {
+      mosaicCustomThemes = [];
+    }
+  }
   return {
     themeKey: row.themeKey,
     terminalFontFamily: row.terminalFontFamily,
     terminalFontSize: row.terminalFontSize,
     customTheme: custom,
     groupViewServerLabel,
+    mosaicThemeActive: resolveActiveName(row.mosaicThemeActive, mosaicCustomThemes),
+    mosaicCustomThemes,
   };
 }
 
@@ -66,6 +81,8 @@ interface IncomingBody {
   terminalFontSize?: unknown;
   customTheme?: unknown;
   groupViewServerLabel?: unknown;
+  mosaicThemeActive?: unknown;
+  mosaicCustomThemes?: unknown;
 }
 
 export async function PUT(request: Request) {
@@ -107,6 +124,22 @@ export async function PUT(request: Request) {
   const groupViewServerLabel: GroupViewServerLabel =
     body.groupViewServerLabel === "name" ? "name" : "host";
 
+  // Mosaic themes: sanitize the custom set, then resolve the active name
+  // against built-ins ∪ that set (falls back to "default").
+  const mosaicCustomThemes = sanitizeCustomThemes(body.mosaicCustomThemes);
+  const mosaicCustomThemesJson =
+    mosaicCustomThemes.length > 0 ? JSON.stringify(mosaicCustomThemes) : null;
+  if (mosaicCustomThemesJson && mosaicCustomThemesJson.length > 32_000) {
+    return NextResponse.json(
+      { error: "mosaicCustomThemes too large" },
+      { status: 400 }
+    );
+  }
+  const mosaicThemeActive = resolveActiveName(
+    body.mosaicThemeActive,
+    mosaicCustomThemes
+  );
+
   // Custom theme only stored when actually using "custom"; for preset
   // themeKeys we clear it to avoid stale colors hanging around.
   let customThemeJson: string | null = null;
@@ -136,6 +169,8 @@ export async function PUT(request: Request) {
       terminalFontSize,
       customTheme: customThemeJson,
       groupViewServerLabel,
+      mosaicThemeActive,
+      mosaicCustomThemes: mosaicCustomThemesJson,
       updatedAt: now,
     })
     .onConflictDoUpdate({
@@ -146,6 +181,8 @@ export async function PUT(request: Request) {
         terminalFontSize,
         customTheme: customThemeJson,
         groupViewServerLabel,
+        mosaicThemeActive,
+        mosaicCustomThemes: mosaicCustomThemesJson,
         updatedAt: now,
       },
     });
@@ -159,6 +196,8 @@ export async function PUT(request: Request) {
         ? (JSON.parse(customThemeJson) as ThemeColors)
         : null,
     groupViewServerLabel,
+    mosaicThemeActive,
+    mosaicCustomThemes,
   };
   return NextResponse.json({ data: saved });
 }

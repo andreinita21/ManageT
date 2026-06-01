@@ -15,6 +15,18 @@ export const users = sqliteTable("users", {
   updatedAt: integer("updated_at").notNull(),
 });
 
+export const userCliTokens = sqliteTable("user_cli_tokens", {
+  id: text("id").primaryKey(),
+  userId: text("user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  tokenHash: text("token_hash").notNull().unique(),
+  createdAt: integer("created_at").notNull(),
+  lastUsedAt: integer("last_used_at"),
+  revokedAt: integer("revoked_at"),
+});
+
 export const servers = sqliteTable("servers", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
@@ -341,6 +353,13 @@ export const userPreferences = sqliteTable("user_preferences", {
    *  terminal's server: "host" (default — the SSH host) or "name" (the
    *  user-assigned friendly name). */
   groupViewServerLabel: text("group_view_server_label").notNull().default("host"),
+  /** Active CLI-mosaic theme name (built-in preset key or a custom theme
+   *  name). Read by `managet group/stack open` via /api/cli/themes. */
+  mosaicThemeActive: text("mosaic_theme_active").notNull().default("default"),
+  /** JSON array of user-defined mosaic themes (name + per-role colors +
+   *  line style). Null/absent means none. Shape: MosaicTheme[] from
+   *  src/lib/mosaic-themes/presets.ts. */
+  mosaicCustomThemes: text("mosaic_custom_themes"),
   updatedAt: integer("updated_at").notNull(),
 });
 
