@@ -329,6 +329,24 @@ export const stackServices = sqliteTable("stack_services", {
 });
 
 /**
+ * Per-user persisted layout for a stack's mosaic (`managet stack open`).
+ * Same JSON shape as `group_layouts` — row heights + per-row column widths
+ * as ratios — so the CLI's resize mode remembers a stack's pane sizes
+ * across sessions. One row per (userId, stackId).
+ */
+export const stackLayouts = sqliteTable("stack_layouts", {
+  id: text("id").primaryKey(),
+  userId: text("user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  stackId: text("stack_id")
+    .notNull()
+    .references(() => stacks.id, { onDelete: "cascade" }),
+  layoutJson: text("layout_json").notNull(),
+  updatedAt: integer("updated_at").notNull(),
+});
+
+/**
  * Per-user appearance preferences. One row per user; absent row means
  * "all defaults" (the legacy purple theme + JetBrains Mono 14px).
  *

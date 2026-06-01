@@ -4,13 +4,20 @@
  * scheduled triggers.
  */
 import { v4 as uuidv4 } from "uuid";
-import { eq, isNull, inArray } from "drizzle-orm";
+import { and, eq, gte, isNull, inArray } from "drizzle-orm";
 
 import { db } from "@/lib/db";
-import { stackServices, sessions, stacks } from "@/lib/db/schema";
+import {
+  stackServices,
+  stackLayouts,
+  sessions,
+  stacks,
+  metricSnapshots,
+} from "@/lib/db/schema";
 import { createSession, killSession } from "@/lib/ssh/session-manager";
 import type {
   CreateStackServiceInput,
+  GroupLayout,
   LaunchStackResponse,
   Stack,
   StackRuntime,
@@ -303,6 +310,53 @@ export async function launchStack(
   };
 }
 
+/** Freshness window for "latest" host temperatures, matching the
+ *  dashboard's metrics window. A snapshot older than this is treated as
+ *  "no current reading" so a stopped agent doesn't show a stale temp. */
+const TEMP_WINDOW_MS = 5 * 60 * 1000;
+
+/**
+ * Latest CPU/GPU temperature per server, within the freshness window.
+ * Temps are host-wide (per-server), so every service running on a given
+ * server shares the same reading. Returns an empty entry for servers that
+ * haven't reported recently.
+ */
+async function latestTempByServer(
+  serverIds: string[]
+): Promise<Map<string, { cpuTempC: number | null; gpuTempC: number | null }>> {
+  const out = new Map<
+    string,
+    { cpuTempC: number | null; gpuTempC: number | null }
+  >();
+  const unique = Array.from(new Set(serverIds));
+  if (unique.length === 0) return out;
+  const rows = await db
+    .select({
+      serverId: metricSnapshots.serverId,
+      cpuTempC: metricSnapshots.cpuTempC,
+      gpuTempC: metricSnapshots.gpuTempC,
+      capturedAt: metricSnapshots.capturedAt,
+    })
+    .from(metricSnapshots)
+    .where(
+      and(
+        inArray(metricSnapshots.serverId, unique),
+        gte(metricSnapshots.capturedAt, Date.now() - TEMP_WINDOW_MS)
+      )
+    );
+  const latestAt = new Map<string, number>();
+  for (const r of rows) {
+    if (r.capturedAt > (latestAt.get(r.serverId) ?? -1)) {
+      latestAt.set(r.serverId, r.capturedAt);
+      out.set(r.serverId, {
+        cpuTempC: r.cpuTempC ?? null,
+        gpuTempC: r.gpuTempC ?? null,
+      });
+    }
+  }
+  return out;
+}
+
 /**
  * Derive the live runtime view of a stack — which services are running,
  * what CPU/RAM they're consuming right now, and the rolled-up state pill
@@ -338,9 +392,11 @@ export async function getStackRuntime(stackId: string): Promise<StackRuntime> {
   }
 
   const now = Date.now();
+  const temps = await latestTempByServer(stack.services.map((s) => s.serverId));
   const services: StackServiceRuntime[] = stack.services.map((svc) => {
     const key = `${svc.serverId}::${svc.name}`;
     const sess = activeByKey.get(key);
+    const temp = temps.get(svc.serverId);
     if (!sess) {
       return {
         serviceId: svc.id,
@@ -351,6 +407,8 @@ export async function getStackRuntime(stackId: string): Promise<StackRuntime> {
         memoryMb: null,
         statsAgeMs: null,
         pidCount: null,
+        cpuTempC: temp?.cpuTempC ?? null,
+        gpuTempC: temp?.gpuTempC ?? null,
       };
     }
     return {
@@ -362,6 +420,8 @@ export async function getStackRuntime(stackId: string): Promise<StackRuntime> {
       memoryMb: sess.memoryMb ?? null,
       statsAgeMs: sess.statsUpdatedAt ? now - sess.statsUpdatedAt : null,
       pidCount: null,
+      cpuTempC: temp?.cpuTempC ?? null,
+      gpuTempC: temp?.gpuTempC ?? null,
     };
   });
 
@@ -419,6 +479,7 @@ export async function getAllStackRuntimes(): Promise<StackRuntime[]> {
   }
 
   const now = Date.now();
+  const temps = await latestTempByServer(serviceRows.map((sv) => sv.serverId));
   return stackRows.map((s) => {
     const svcs = (servicesByStack.get(s.id) ?? []).sort(
       (a, b) => a.orderIndex - b.orderIndex
@@ -426,6 +487,7 @@ export async function getAllStackRuntimes(): Promise<StackRuntime[]> {
     const services: StackServiceRuntime[] = svcs.map((svc) => {
       const key = `${s.id}::${svc.serverId}::${svc.name}`;
       const sess = activeByStackKey.get(key);
+      const temp = temps.get(svc.serverId);
       if (!sess) {
         return {
           serviceId: svc.id,
@@ -436,6 +498,8 @@ export async function getAllStackRuntimes(): Promise<StackRuntime[]> {
           memoryMb: null,
           statsAgeMs: null,
           pidCount: null,
+          cpuTempC: temp?.cpuTempC ?? null,
+          gpuTempC: temp?.gpuTempC ?? null,
         };
       }
       return {
@@ -447,6 +511,8 @@ export async function getAllStackRuntimes(): Promise<StackRuntime[]> {
         memoryMb: sess.memoryMb ?? null,
         statsAgeMs: sess.statsUpdatedAt ? now - sess.statsUpdatedAt : null,
         pidCount: null,
+        cpuTempC: temp?.cpuTempC ?? null,
+        gpuTempC: temp?.gpuTempC ?? null,
       };
     });
     const activeCount = services.filter((x) => x.status === "active").length;
@@ -485,4 +551,132 @@ export async function stopStack(stackId: string): Promise<{ stopped: number }> {
     )
   );
   return { stopped: rows.length };
+}
+
+/** Create a stack with its ordered services. Mirrors the browser
+ *  `POST /api/stacks`; shared so the CLI editor can create stacks too. */
+export async function createStack(
+  createdBy: string,
+  input: { name: string; description?: string; services: CreateStackServiceInput[] }
+): Promise<Stack> {
+  const now = Date.now();
+  const stackId = uuidv4();
+  await db.insert(stacks).values({
+    id: stackId,
+    name: input.name,
+    description: input.description ?? null,
+    createdBy,
+    createdAt: now,
+    updatedAt: now,
+  });
+  const services = await replaceServicesForStack(stackId, input.services);
+  return {
+    id: stackId,
+    name: input.name,
+    description: input.description,
+    createdBy,
+    createdAt: now,
+    updatedAt: now,
+    services,
+  };
+}
+
+/** Update a stack's name/description and/or replace its services. Returns
+ *  the refreshed stack, or null when the id doesn't exist. Mirrors the
+ *  browser `PUT /api/stacks/[id]`. */
+export async function updateStack(
+  stackId: string,
+  patch: {
+    name?: string;
+    description?: string | null;
+    services?: CreateStackServiceInput[];
+  }
+): Promise<Stack | null> {
+  const existing = await db
+    .select({ id: stacks.id })
+    .from(stacks)
+    .where(eq(stacks.id, stackId))
+    .limit(1);
+  if (existing.length === 0) return null;
+
+  const now = Date.now();
+  const updates: Record<string, unknown> = { updatedAt: now };
+  if (patch.name !== undefined) updates.name = patch.name;
+  if (patch.description !== undefined) updates.description = patch.description;
+  await db.update(stacks).set(updates).where(eq(stacks.id, stackId));
+
+  if (patch.services) {
+    await replaceServicesForStack(stackId, patch.services);
+  }
+  return getStack(stackId);
+}
+
+/** Soft-delete a stack (Trash), or hard-delete with `force`. Mirrors the
+ *  browser `DELETE /api/stacks/[id]`. */
+export async function deleteStack(
+  stackId: string,
+  force: boolean
+): Promise<void> {
+  if (force) {
+    await db.delete(stacks).where(eq(stacks.id, stackId));
+    return;
+  }
+  const now = Date.now();
+  await db
+    .update(stacks)
+    .set({ deletedAt: now, updatedAt: now })
+    .where(eq(stacks.id, stackId));
+}
+
+/** Fetch the persisted mosaic layout for `(userId, stackId)`, or null when
+ *  the user hasn't resized this stack yet (CLI then falls back to the
+ *  default equal-split). Same JSON shape as group layouts. */
+export async function getUserStackLayout(
+  userId: string,
+  stackId: string
+): Promise<GroupLayout | null> {
+  const rows = await db
+    .select()
+    .from(stackLayouts)
+    .where(
+      and(eq(stackLayouts.userId, userId), eq(stackLayouts.stackId, stackId))
+    )
+    .limit(1);
+  if (rows.length === 0) return null;
+  try {
+    return JSON.parse(rows[0].layoutJson) as GroupLayout;
+  } catch {
+    return null;
+  }
+}
+
+/** Upsert the per-user mosaic layout for a stack. One row per
+ *  (userId, stackId). */
+export async function saveUserStackLayout(
+  userId: string,
+  stackId: string,
+  layout: GroupLayout
+): Promise<void> {
+  const now = Date.now();
+  const existing = await db
+    .select({ id: stackLayouts.id })
+    .from(stackLayouts)
+    .where(
+      and(eq(stackLayouts.userId, userId), eq(stackLayouts.stackId, stackId))
+    )
+    .limit(1);
+  if (existing.length > 0) {
+    await db
+      .update(stackLayouts)
+      .set({ layoutJson: JSON.stringify(layout), updatedAt: now })
+      .where(eq(stackLayouts.id, existing[0].id));
+    return;
+  }
+  await db.insert(stackLayouts).values({
+    id: uuidv4(),
+    userId,
+    stackId,
+    layoutJson: JSON.stringify(layout),
+    updatedAt: now,
+  });
 }

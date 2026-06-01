@@ -237,6 +237,13 @@ export interface StackServiceRuntime {
   statsAgeMs: number | null;
   /** Number of processes summed for this service (root + descendants). */
   pidCount: number | null;
+  /** Latest CPU temperature (°C) of the host this service runs on, from the
+   *  most recent metric snapshot within the freshness window. null when the
+   *  host hasn't reported a usable sensor. Shared by all services on the
+   *  same server. */
+  cpuTempC: number | null;
+  /** Latest GPU temperature (°C) of the host, or null on GPU-less hosts. */
+  gpuTempC: number | null;
 }
 
 export interface StackRuntime {

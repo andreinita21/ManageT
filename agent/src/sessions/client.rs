@@ -37,10 +37,17 @@ use super::server::socket_path;
 /// the listing makes it clear which sessions are also visible in the
 /// dashboard mosaic.
 ///
+/// `include_grouped` controls whether sessions that belong to a group are
+/// listed here. The default `managet ls` leaves them out (they appear
+/// under "Group sessions"), but a sessions-only view (`managet ls
+/// sessions`) sets this so nothing is hidden — grouped sessions then show
+/// with their `[groupName]` tag.
+///
 /// Returns the ids of the local sessions it listed so the dashboard
 /// "from other servers" section can skip the ones already shown here.
 pub async fn run_ls(
     group_annotations: Option<&HashMap<String, String>>,
+    include_grouped: bool,
 ) -> Result<Vec<String>> {
     let resp = round_trip(&Request::List).await?;
     let sessions = match resp {
@@ -51,13 +58,18 @@ pub async fn run_ls(
 
     println!("{}", "Individual sessions from this server".cyan().bold());
 
-    // Standalone terminals only — sessions that belong to a group are
-    // listed under "Group sessions" instead, matching the web dashboard.
-    // (When the dashboard is unreachable, `group_annotations` is None and
-    // we show everything — a local agent with no dashboard still gets a
-    // useful listing.)
-    let is_grouped = |id: &str| group_annotations.is_some_and(|m| m.contains_key(id));
-    let visible: Vec<&_> = sessions.iter().filter(|s| !is_grouped(&s.id)).collect();
+    // By default, standalone terminals only — sessions that belong to a
+    // group are listed under "Group sessions" instead, matching the web
+    // dashboard. With `include_grouped`, show them too (annotated). When
+    // the dashboard is unreachable `group_annotations` is None and we show
+    // everything regardless — a local agent with no dashboard still gets a
+    // useful listing.
+    let group_name = |id: &str| group_annotations.and_then(|m| m.get(id));
+    let is_grouped = |id: &str| group_name(id).is_some();
+    let visible: Vec<&_> = sessions
+        .iter()
+        .filter(|s| include_grouped || !is_grouped(&s.id))
+        .collect();
 
     if visible.is_empty() {
         let msg = if sessions.is_empty() {
@@ -95,8 +107,12 @@ pub async fn run_ls(
         // column widths off.
         let name_col = pad_visible(&truncate(&s.name, name_width), name_width);
         let age_col = pad_visible(&age, 10);
+        let group_tag = match group_name(&s.id) {
+            Some(name) => format!("  {}", format!("[{name}]").blue()),
+            None => String::new(),
+        };
         println!(
-            "  {bullet} {name}  {age}  {status}  {hint}",
+            "  {bullet} {name}  {age}  {status}  {hint}{group_tag}",
             bullet = bullet.green(),
             name = name_col.white().bold(),
             age = age_col.dark_grey(),

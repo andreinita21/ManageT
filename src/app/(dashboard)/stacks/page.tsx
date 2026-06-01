@@ -1058,6 +1058,7 @@ function StackDetailGrid({
               <th className="px-3 py-2 font-medium">State</th>
               <th className="px-3 py-2 font-medium text-right">CPU</th>
               <th className="px-3 py-2 font-medium text-right">RAM</th>
+              <th className="px-3 py-2 font-medium text-right">Temp</th>
               <th className="px-3 py-2 font-medium">Command</th>
               <th className="px-3 py-2 font-medium text-right">Terminal</th>
             </tr>
@@ -1114,6 +1115,9 @@ function StackDetailGrid({
                     }`}
                   >
                     {r?.memoryMb != null ? `${r.memoryMb} MB` : "—"}
+                  </td>
+                  <td className="px-3 py-2 text-right font-mono text-xs text-mg-text-secondary">
+                    {r?.cpuTempC != null ? `${r.cpuTempC.toFixed(1)}°C` : "—"}
                   </td>
                   <td className="px-3 py-2 font-mono text-xs text-mg-text-tertiary truncate max-w-xs">
                     {svc.command ?? "(login shell)"}

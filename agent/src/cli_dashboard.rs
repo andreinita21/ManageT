@@ -604,6 +604,41 @@ struct Pane {
     rect: Rect,
     parser: vt100::Parser,
     lost: Option<String>,
+    /// Live resource readout for stack panes (CPU/mem from the session,
+    /// host temp from the server's latest metric snapshot). `None` for
+    /// group panes, which don't surface per-pane stats.
+    stats: Option<PaneStats>,
+}
+
+/// Compact per-pane resource readout shown on the bottom border of a stack
+/// pane. All fields optional — an older agent or a host with no sensor
+/// leaves the corresponding slot blank.
+#[derive(Debug, Clone, Default)]
+struct PaneStats {
+    cpu_percent: Option<f64>,
+    memory_mb: Option<u64>,
+    cpu_temp_c: Option<f64>,
+}
+
+impl PaneStats {
+    /// True when there's at least one value worth drawing.
+    fn any(&self) -> bool {
+        self.cpu_percent.is_some() || self.memory_mb.is_some() || self.cpu_temp_c.is_some()
+    }
+    /// `12.3% · 256MB · 54°C`, skipping absent fields.
+    fn label(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(c) = self.cpu_percent {
+            parts.push(format!("{c:.1}%"));
+        }
+        if let Some(m) = self.memory_mb {
+            parts.push(format!("{m}MB"));
+        }
+        if let Some(t) = self.cpu_temp_c {
+            parts.push(format!("{t:.0}°C"));
+        }
+        parts.join(" · ")
+    }
 }
 
 /// One selectable entry in the Ctrl-A N picker: attach an EXISTING free
@@ -1142,47 +1177,99 @@ pub async fn run_group_list() -> Result<()> {
 ///
 /// `local_ids` are the session ids already printed under "from this
 /// server" so we don't list them again as "other servers".
-pub async fn print_dashboard_ls_sections(local_ids: &HashSet<String>) -> Result<()> {
+pub async fn print_dashboard_ls_sections(
+    local_ids: &HashSet<String>,
+    show_sessions: bool,
+    show_groups: bool,
+    show_stacks: bool,
+) -> Result<()> {
     println!();
-    let unavailable = |reason: &str| {
-        println!("{}", "Individual sessions from other servers".cyan().bold());
-        println!("  {}", reason.dark_grey());
-        println!();
-        println!("{}", "Group sessions".magenta().bold());
-        println!("  {}", reason.dark_grey());
+    // Print only the requested section headers with a one-line reason
+    // (offline / unreachable), so a filtered `managet ls -g` doesn't emit
+    // noise about sections the user didn't ask for.
+    let placeholder = |reason: &str| {
+        if show_sessions {
+            println!("{}", "Individual sessions from other servers".cyan().bold());
+            println!("  {}", reason.dark_grey());
+            println!();
+        }
+        if show_groups {
+            println!("{}", "Group sessions".magenta().bold());
+            println!("  {}", reason.dark_grey());
+            println!();
+        }
+        if show_stacks {
+            println!("{}", "Stacks".magenta().bold());
+            println!("  {}", reason.dark_grey());
+        }
     };
     let cfg = match load_config() {
         Ok(cfg) => cfg,
         Err(_) => {
-            unavailable("(run `managet login` to list dashboard sessions)");
-            return Ok(());
-        }
-    };
-    let payload = match fetch_group_list_payload(&cfg).await {
-        Ok(p) => p,
-        Err(e) => {
-            unavailable(&format!("(dashboard unreachable: {e})"));
+            placeholder("(run `managet login` to list dashboard items)");
             return Ok(());
         }
     };
 
-    print_other_servers_section(&payload, local_ids);
-    println!();
-
-    if payload.groups.is_empty() {
-        println!("{}", "Group sessions".magenta().bold());
-        println!("  {}", "(no groups yet)".dark_grey());
-        return Ok(());
+    if show_sessions || show_groups {
+        match fetch_group_list_payload(&cfg).await {
+            Ok(payload) => {
+                if show_sessions {
+                    // Include grouped sessions (annotated) when the Groups
+                    // section isn't shown, so a sessions-only view is complete.
+                    print_other_servers_section(&payload, local_ids, !show_groups);
+                    println!();
+                }
+                if show_groups {
+                    if payload.groups.is_empty() {
+                        println!("{}", "Group sessions".magenta().bold());
+                        println!("  {}", "(no groups yet)".dark_grey());
+                    } else {
+                        print_group_rows(&payload);
+                    }
+                    println!();
+                }
+            }
+            Err(e) => {
+                let reason = format!("(dashboard unreachable: {e})");
+                if show_sessions {
+                    println!("{}", "Individual sessions from other servers".cyan().bold());
+                    println!("  {}", reason.as_str().dark_grey());
+                    println!();
+                }
+                if show_groups {
+                    println!("{}", "Group sessions".magenta().bold());
+                    println!("  {}", reason.as_str().dark_grey());
+                    println!();
+                }
+            }
+        }
     }
-    print_group_rows(&payload);
-    println!();
-    println!(
-        "  {} {} {} {}",
-        "Attach:".dark_grey(),
-        "managet attach <name>".white(),
-        "•".dark_grey(),
-        "managet group attach <name>".white(),
-    );
+
+    if show_stacks {
+        match fetch_stack_list_payload(&cfg).await {
+            Ok(sp) if !sp.stacks.is_empty() => print_stack_rows(&sp),
+            Ok(_) => {
+                println!("{}", "Stacks".magenta().bold());
+                println!("  {}", "(no stacks yet)".dark_grey());
+            }
+            Err(e) => {
+                println!("{}", "Stacks".magenta().bold());
+                println!("  {}", format!("(dashboard unreachable: {e})").dark_grey());
+            }
+        }
+        println!();
+    }
+
+    if show_sessions || show_groups {
+        println!(
+            "  {} {} {} {}",
+            "Attach:".dark_grey(),
+            "managet attach <name>".white(),
+            "•".dark_grey(),
+            "managet group attach <name>".white(),
+        );
+    }
     Ok(())
 }
 
@@ -1233,8 +1320,21 @@ impl Liveness {
 /// sessions the dashboard knows about on hosts *other* than this one.
 /// Grouped sessions are skipped (they appear under "Group sessions"), as
 /// are ids the local agent already listed under "from this server".
-fn print_other_servers_section(payload: &GroupListPayload, local_ids: &HashSet<String>) {
+fn print_other_servers_section(
+    payload: &GroupListPayload,
+    local_ids: &HashSet<String>,
+    include_grouped: bool,
+) {
     println!("{}", "Individual sessions from other servers".cyan().bold());
+    // group_id -> group name, for tagging in-group sessions when the
+    // Groups section isn't separately shown.
+    let group_name_for = |group_id: &str| -> Option<&str> {
+        payload
+            .groups
+            .iter()
+            .find(|g| g.id == group_id)
+            .map(|g| g.name.as_str())
+    };
     let use_friendly_name = payload.preferences.group_view_server_label == "name";
     let server_label_for = |server_id: &str| -> String {
         if let Some(s) = payload.servers.iter().find(|s| s.id == server_id) {
@@ -1251,7 +1351,7 @@ fn print_other_servers_section(payload: &GroupListPayload, local_ids: &HashSet<S
     let mut others: Vec<&GroupSession> = payload
         .sessions
         .iter()
-        .filter(|s| s.group_id.is_none() && !local_ids.contains(&s.id))
+        .filter(|s| (include_grouped || s.group_id.is_none()) && !local_ids.contains(&s.id))
         .collect();
     if others.is_empty() {
         println!("  {}", "(none)".dark_grey());
@@ -1276,13 +1376,18 @@ fn print_other_servers_section(payload: &GroupListPayload, local_ids: &HashSet<S
         let name_col = pad_visible(&truncate(&s.session_name, name_width), name_width);
         let live = liveness_of(s.attached_clients, &s.status);
         let status_styled = live.paint(pad_visible(&live.label(), 12));
+        let group_tag = match s.group_id.as_deref().and_then(group_name_for) {
+            Some(name) => format!("  {}", format!("[{name}]").blue()),
+            None => String::new(),
+        };
         println!(
-            "  {} {}  {}  {}  {}",
+            "  {} {}  {}  {}  {}{}",
             live.bullet(),
             name_col.white().bold(),
             status_styled,
             format!("[{}]", short_id(&s.id)).dark_grey(),
             server_label_for(&s.server_id).blue(),
+            group_tag,
         );
     }
 }
@@ -1501,6 +1606,8 @@ struct StackSummary {
     id: String,
     name: String,
     #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
     services: Vec<StackServiceDto>,
 }
 
@@ -1512,6 +1619,10 @@ struct StackServiceDto {
     server_id: String,
     #[serde(default)]
     order_index: usize,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1534,6 +1645,12 @@ struct StackServiceRuntimeDto {
     session_id: Option<String>,
     #[serde(default)]
     status: String,
+    #[serde(default)]
+    cpu_percent: Option<f64>,
+    #[serde(default)]
+    memory_mb: Option<u64>,
+    #[serde(default)]
+    cpu_temp_c: Option<f64>,
 }
 
 /// Shape returned by `GET /api/cli/stacks/[id]` — the multipane workhorse.
@@ -1543,6 +1660,10 @@ struct CliStackDetail {
     runtime: StackRuntimeDto,
     #[serde(default)]
     servers: Vec<CliServer>,
+    /// Per-user persisted mosaic layout (Ctrl-A R). `None` until the user
+    /// first resizes this stack, then the default equal-split is used.
+    #[serde(default)]
+    layout: Option<GroupLayout>,
 }
 
 /// Shape of the `POST /api/cli/stacks/[id]/launch` reply (LaunchStackResponse).
@@ -1602,6 +1723,20 @@ fn stack_server_label(servers: &[CliServer], server_id: &str) -> String {
     }
 }
 
+/// Human label for a stack's rolled-up state: `active` when every service
+/// is running, `partial [n/m]` when some are, `inactive` when none.
+fn stack_status_label(active: usize, total: usize) -> String {
+    if total == 0 {
+        "empty".to_string()
+    } else if active == 0 {
+        "inactive".to_string()
+    } else if active >= total {
+        "active".to_string()
+    } else {
+        format!("partial [{active}/{total}]")
+    }
+}
+
 pub async fn run_stack_list() -> Result<()> {
     let cfg = load_config()?;
     let payload = fetch_stack_list_payload(&cfg).await?;
@@ -1638,7 +1773,7 @@ fn print_stack_rows(payload: &StackListPayload) {
             let rt = runtime_for(&s.id);
             let active = rt.map(|r| r.active_count).unwrap_or(0);
             let total = rt.map(|r| r.total_count).unwrap_or(s.services.len());
-            format!("{active}/{total} running")
+            stack_status_label(active, total)
         })
         .collect();
     let run_col_width = run_texts
@@ -1673,14 +1808,24 @@ fn print_stack_rows(payload: &StackListPayload) {
             .collect::<Vec<_>>()
             .join(", ");
 
+        let active = rt.map(|r| r.active_count).unwrap_or(0);
+        let total = rt.map(|r| r.total_count).unwrap_or(st.services.len());
         let name_col = pad_visible(&truncate(&st.name, name_width), name_width);
         let run_col = pad_visible(&run_texts[stack_idx], run_col_width);
+        // Green when fully active, yellow when partial, grey when idle.
+        let run_styled = if total == 0 || active == 0 {
+            run_col.dark_grey()
+        } else if active >= total {
+            run_col.green()
+        } else {
+            run_col.yellow()
+        };
         println!(
             "  {bullet} {name} {sep} {run} {sep} {servers}",
             bullet = "▤".magenta(),
             name = name_col.white().bold(),
             sep = "│".dark_grey(),
-            run = run_col.cyan(),
+            run = run_styled,
             servers = server_labels.blue(),
         );
 
@@ -1805,6 +1950,581 @@ pub async fn run_stack_launch(
     Ok(())
 }
 
+/// `managet stack <name> start` — launch the stack (idempotently reusing
+/// any already-active sessions), then drop straight into the live mosaic.
+/// `launch` + `open` in one step.
+pub async fn run_stack_start(
+    selector: String,
+    server_selector: Option<String>,
+    theme_override: Option<String>,
+) -> Result<()> {
+    run_stack_launch(selector.clone(), server_selector.clone(), None, false).await?;
+    run_stack_open(selector, server_selector, theme_override).await
+}
+
+// ---------------------------------------------------------------------------
+// Stack editor — a full-screen form (navigate fields with ↑/↓, type to edit
+// inline, ←/→ cycles a service's server, Enter activates an action row, Esc
+// cancels). Mirrors the dashboard's create/edit form. Used by
+// `managet stack edit <name>` and `managet stack new`.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct ServiceForm {
+    name: String,
+    server_id: String,
+    command: String,
+    cwd: String,
+}
+
+#[derive(Clone)]
+struct StackEditForm {
+    name: String,
+    description: String,
+    services: Vec<ServiceForm>,
+}
+
+/// What the editor returns to its caller.
+enum EditorOutcome {
+    Save(StackEditForm),
+    Delete,
+    Cancel,
+}
+
+/// One navigable field in the editor, in top-to-bottom order.
+#[derive(Clone, Copy, PartialEq)]
+enum EditRow {
+    Name,
+    Description,
+    SvcName(usize),
+    SvcServer(usize),
+    SvcCommand(usize),
+    SvcCwd(usize),
+    SvcRemove(usize),
+    AddService,
+    Save,
+    Cancel,
+    Delete,
+}
+
+/// Build the ordered list of navigable rows for the current form. `allow_delete`
+/// adds the "Delete stack" row (edit mode only, not when creating).
+fn build_edit_rows(form: &StackEditForm, allow_delete: bool) -> Vec<EditRow> {
+    let mut rows = vec![EditRow::Name, EditRow::Description];
+    for i in 0..form.services.len() {
+        rows.push(EditRow::SvcName(i));
+        rows.push(EditRow::SvcServer(i));
+        rows.push(EditRow::SvcCommand(i));
+        rows.push(EditRow::SvcCwd(i));
+        rows.push(EditRow::SvcRemove(i));
+    }
+    rows.push(EditRow::AddService);
+    rows.push(EditRow::Save);
+    rows.push(EditRow::Cancel);
+    if allow_delete {
+        rows.push(EditRow::Delete);
+    }
+    rows
+}
+
+/// Borrow the text field a row points at, when it's a text-editable row.
+fn edit_row_text<'a>(form: &'a mut StackEditForm, row: EditRow) -> Option<&'a mut String> {
+    match row {
+        EditRow::Name => Some(&mut form.name),
+        EditRow::Description => Some(&mut form.description),
+        EditRow::SvcName(i) => form.services.get_mut(i).map(|s| &mut s.name),
+        EditRow::SvcCommand(i) => form.services.get_mut(i).map(|s| &mut s.command),
+        EditRow::SvcCwd(i) => form.services.get_mut(i).map(|s| &mut s.cwd),
+        _ => None,
+    }
+}
+
+fn insert_char_at(s: &mut String, caret: &mut usize, c: char) {
+    let mut chars: Vec<char> = s.chars().collect();
+    let idx = (*caret).min(chars.len());
+    chars.insert(idx, c);
+    *s = chars.into_iter().collect();
+    *caret = idx + 1;
+}
+
+fn backspace_at(s: &mut String, caret: &mut usize) {
+    if *caret == 0 {
+        return;
+    }
+    let mut chars: Vec<char> = s.chars().collect();
+    let idx = *caret - 1;
+    if idx < chars.len() {
+        chars.remove(idx);
+    }
+    *s = chars.into_iter().collect();
+    *caret = idx;
+}
+
+/// Cycle a service's server id to the previous/next server in the list.
+fn cycle_server(servers: &[CliServer], current: &str, dir: i32) -> String {
+    if servers.is_empty() {
+        return current.to_string();
+    }
+    let pos = servers.iter().position(|s| s.id == current).unwrap_or(0);
+    let len = servers.len();
+    let next = if dir < 0 {
+        (pos + len - 1) % len
+    } else {
+        (pos + 1) % len
+    };
+    servers[next].id.clone()
+}
+
+/// Render the editor and run its key loop. Returns the outcome. Owns the
+/// terminal (raw mode + alt screen) for its lifetime; the terminal is fully
+/// restored before this returns, so the caller can prompt normally after.
+fn run_stack_editor(
+    title: &str,
+    mut form: StackEditForm,
+    servers: &[CliServer],
+    allow_delete: bool,
+) -> Result<EditorOutcome> {
+    if !std::io::stdout().is_terminal() {
+        bail!("the stack editor requires a TTY");
+    }
+    let mut stdout = std::io::stdout();
+    let _guard = TerminalGuard::enter(&mut stdout)?;
+
+    let mut cursor = 0usize; // index into the rows vec
+    let mut caret = form.name.chars().count(); // text caret for the focused field
+    let mut error: Option<String> = None;
+
+    loop {
+        let rows = build_edit_rows(&form, allow_delete);
+        if cursor >= rows.len() {
+            cursor = rows.len() - 1;
+        }
+        draw_stack_editor(&mut stdout, title, &form, servers, &rows, cursor, caret, error.as_deref())?;
+
+        let ev = event::read()?;
+        let key = match ev {
+            Event::Key(k) => k,
+            Event::Resize(..) => continue, // redraw at loop top
+            _ => continue,
+        };
+        let row = rows[cursor];
+        let is_text = matches!(
+            row,
+            EditRow::Name | EditRow::Description | EditRow::SvcName(_) | EditRow::SvcCommand(_) | EditRow::SvcCwd(_)
+        );
+
+        match key.code {
+            KeyCode::Esc => {
+                return Ok(EditorOutcome::Cancel);
+            }
+            KeyCode::Up => {
+                cursor = cursor.saturating_sub(1);
+                caret = focused_text_len(&mut form, rows[cursor]);
+                error = None;
+            }
+            KeyCode::Down => {
+                if cursor + 1 < rows.len() {
+                    cursor += 1;
+                }
+                caret = focused_text_len(&mut form, rows[cursor]);
+                error = None;
+            }
+            KeyCode::Enter => {
+                match row {
+                    EditRow::Save => match validate_form(&form) {
+                        Ok(()) => return Ok(EditorOutcome::Save(form)),
+                        Err(msg) => error = Some(msg),
+                    },
+                    EditRow::Cancel => return Ok(EditorOutcome::Cancel),
+                    EditRow::Delete => return Ok(EditorOutcome::Delete),
+                    EditRow::AddService => {
+                        let server_id = servers.first().map(|s| s.id.clone()).unwrap_or_default();
+                        form.services.push(ServiceForm {
+                            name: String::new(),
+                            server_id,
+                            command: String::new(),
+                            cwd: String::new(),
+                        });
+                        // Jump to the new service's name field.
+                        let new_rows = build_edit_rows(&form, allow_delete);
+                        if let Some(pos) = new_rows
+                            .iter()
+                            .position(|r| *r == EditRow::SvcName(form.services.len() - 1))
+                        {
+                            cursor = pos;
+                            caret = 0;
+                        }
+                    }
+                    EditRow::SvcRemove(i) => {
+                        if form.services.len() > 1 {
+                            form.services.remove(i);
+                            cursor = cursor.min(build_edit_rows(&form, allow_delete).len() - 1);
+                        } else {
+                            error = Some("a stack needs at least one service".to_string());
+                        }
+                    }
+                    // Enter on an editable/server row just advances downward.
+                    _ => {
+                        if cursor + 1 < rows.len() {
+                            cursor += 1;
+                            caret = focused_text_len(&mut form, rows[cursor]);
+                        }
+                    }
+                }
+            }
+            KeyCode::Left if matches!(row, EditRow::SvcServer(_)) => {
+                if let EditRow::SvcServer(i) = row {
+                    if let Some(s) = form.services.get_mut(i) {
+                        s.server_id = cycle_server(servers, &s.server_id, -1);
+                    }
+                }
+            }
+            KeyCode::Right if matches!(row, EditRow::SvcServer(_)) => {
+                if let EditRow::SvcServer(i) = row {
+                    if let Some(s) = form.services.get_mut(i) {
+                        s.server_id = cycle_server(servers, &s.server_id, 1);
+                    }
+                }
+            }
+            KeyCode::Left if is_text => {
+                caret = caret.saturating_sub(1);
+            }
+            KeyCode::Right if is_text => {
+                let len = edit_row_text(&mut form, row).map(|s| s.chars().count()).unwrap_or(0);
+                caret = (caret + 1).min(len);
+            }
+            KeyCode::Home if is_text => caret = 0,
+            KeyCode::End if is_text => {
+                caret = edit_row_text(&mut form, row).map(|s| s.chars().count()).unwrap_or(0);
+            }
+            KeyCode::Backspace if is_text => {
+                if let Some(s) = edit_row_text(&mut form, row) {
+                    backspace_at(s, &mut caret);
+                }
+            }
+            KeyCode::Delete if is_text => {
+                if let Some(s) = edit_row_text(&mut form, row) {
+                    let len = s.chars().count();
+                    if caret < len {
+                        let mut tmp = caret + 1;
+                        backspace_at(s, &mut tmp);
+                        // backspace_at moved caret back to `caret`; keep it.
+                        caret = caret.min(s.chars().count());
+                    }
+                }
+            }
+            // Printable input (including spaces) goes into the focused text
+            // field. Control modifiers are ignored so they can't corrupt names.
+            KeyCode::Char(c) if is_text && !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(s) = edit_row_text(&mut form, row) {
+                    insert_char_at(s, &mut caret, c);
+                }
+                error = None;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Length (in chars) of the text a row edits, or 0 for non-text rows. Used to
+/// park the caret at the end when navigating onto a field.
+fn focused_text_len(form: &mut StackEditForm, row: EditRow) -> usize {
+    edit_row_text(form, row).map(|s| s.chars().count()).unwrap_or(0)
+}
+
+fn validate_form(form: &StackEditForm) -> std::result::Result<(), String> {
+    if form.name.trim().is_empty() {
+        return Err("stack name can't be empty".to_string());
+    }
+    if form.services.is_empty() {
+        return Err("a stack needs at least one service".to_string());
+    }
+    for (i, s) in form.services.iter().enumerate() {
+        if s.name.trim().is_empty() {
+            return Err(format!("service {} needs a name", i + 1));
+        }
+        if s.server_id.trim().is_empty() {
+            return Err(format!("service {} needs a server", i + 1));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_stack_editor(
+    stdout: &mut Stdout,
+    title: &str,
+    form: &StackEditForm,
+    servers: &[CliServer],
+    rows: &[EditRow],
+    cursor: usize,
+    caret: usize,
+    error: Option<&str>,
+) -> Result<()> {
+    let t = theme();
+    let b = t.borders;
+    let (cols, _) = terminal::size().unwrap_or((120, 36));
+    let modal_w = cols.saturating_sub(4).min(82).max(46);
+    let x0 = cols.saturating_sub(modal_w) / 2;
+    let inner_w = modal_w.saturating_sub(2) as usize;
+    const LABEL_W: usize = 12;
+
+    queue!(stdout, Hide, MoveTo(0, 0), Clear(ClearType::All))?;
+
+    // Build the display lines together with the row index each one maps to,
+    // so the focused row can be highlighted and the caret positioned.
+    enum Disp<'a> {
+        Header(String),
+        Blank,
+        Field {
+            row_idx: usize,
+            indent: usize,
+            label: &'a str,
+            value: String,
+            action: bool,
+            text: bool,
+        },
+    }
+    let mut lines: Vec<Disp> = Vec::new();
+    for (idx, row) in rows.iter().enumerate() {
+        match *row {
+            EditRow::Name => lines.push(Disp::Field { row_idx: idx, indent: 0, label: "Name", value: form.name.clone(), action: false, text: true }),
+            EditRow::Description => lines.push(Disp::Field { row_idx: idx, indent: 0, label: "Description", value: form.description.clone(), action: false, text: true }),
+            EditRow::SvcName(i) => {
+                lines.push(Disp::Blank);
+                lines.push(Disp::Header(format!("Service {}", i + 1)));
+                lines.push(Disp::Field { row_idx: idx, indent: 2, label: "Name", value: form.services[i].name.clone(), action: false, text: true });
+            }
+            EditRow::SvcServer(i) => {
+                let label = stack_server_label(servers, &form.services[i].server_id);
+                lines.push(Disp::Field { row_idx: idx, indent: 2, label: "Server", value: format!("‹ {label} ›   (←/→ change)"), action: false, text: false });
+            }
+            EditRow::SvcCommand(i) => lines.push(Disp::Field { row_idx: idx, indent: 2, label: "Command", value: form.services[i].command.clone(), action: false, text: true }),
+            EditRow::SvcCwd(i) => lines.push(Disp::Field { row_idx: idx, indent: 2, label: "Cwd", value: form.services[i].cwd.clone(), action: false, text: true }),
+            EditRow::SvcRemove(_) => lines.push(Disp::Field { row_idx: idx, indent: 2, label: "", value: "[− Remove service]".to_string(), action: true, text: false }),
+            EditRow::AddService => {
+                lines.push(Disp::Blank);
+                lines.push(Disp::Field { row_idx: idx, indent: 0, label: "", value: "[+ Add service]".to_string(), action: true, text: false });
+            }
+            EditRow::Save => {
+                lines.push(Disp::Blank);
+                lines.push(Disp::Field { row_idx: idx, indent: 0, label: "", value: "[✓ Save]".to_string(), action: true, text: false });
+            }
+            EditRow::Cancel => lines.push(Disp::Field { row_idx: idx, indent: 0, label: "", value: "[✗ Cancel]".to_string(), action: true, text: false }),
+            EditRow::Delete => lines.push(Disp::Field { row_idx: idx, indent: 0, label: "", value: "[🗑 Delete stack]".to_string(), action: true, text: false }),
+        }
+    }
+
+    // Top border with the title embedded.
+    let title_badge = format!(" {title} ");
+    let lead = 1usize;
+    let fill = inner_w.saturating_sub(title_badge.chars().count() + lead);
+    let top = format!("{}{}{}{}{}", b.tl, b.h.repeat(lead), title_badge, b.h.repeat(fill), b.tr);
+    let mut y = 1u16;
+    queue!(stdout, MoveTo(x0, y), SetForegroundColor(t.accent), Print(top), ResetColor)?;
+    y += 1;
+
+    let mut caret_pos: Option<(u16, u16)> = None;
+    let blank_inner = " ".repeat(inner_w);
+    for line in &lines {
+        queue!(stdout, MoveTo(x0, y), SetForegroundColor(t.accent), Print(b.v), ResetColor, Print(&blank_inner), SetForegroundColor(t.accent), MoveTo(x0 + modal_w - 1, y), Print(b.v), ResetColor)?;
+        match line {
+            Disp::Blank => {}
+            Disp::Header(text) => {
+                queue!(stdout, MoveTo(x0 + 2, y), SetForegroundColor(t.heading), SetAttribute(Attribute::Bold), Print(fit_text(text, inner_w - 2)), SetAttribute(Attribute::Reset), ResetColor)?;
+            }
+            Disp::Field { row_idx, indent, label, value, action, text } => {
+                let focused = *row_idx == cursor;
+                let lx = x0 + 2 + *indent as u16;
+                if !label.is_empty() {
+                    let lab = pad_visible(label, LABEL_W);
+                    queue!(stdout, MoveTo(lx, y), SetForegroundColor(t.hint), Print(lab), ResetColor)?;
+                }
+                let vx = if label.is_empty() { lx } else { lx + LABEL_W as u16 + 1 };
+                let avail = (x0 + modal_w - 1).saturating_sub(vx + 1) as usize;
+                let shown = fit_text(value, avail);
+                if focused {
+                    if *action {
+                        queue!(stdout, MoveTo(vx, y), SetForegroundColor(t.selected_fg), SetBackgroundColor(t.selected_bg), SetAttribute(Attribute::Bold), Print(&shown), SetAttribute(Attribute::Reset), ResetColor)?;
+                    } else {
+                        queue!(stdout, MoveTo(vx, y), SetForegroundColor(t.title_active), Print(&shown), ResetColor)?;
+                        // Park the hardware caret on text fields only.
+                        if *text {
+                            let cx = vx + (caret.min(value.chars().count())) as u16;
+                            caret_pos = Some((cx.min(x0 + modal_w - 2), y));
+                        }
+                    }
+                } else {
+                    let color = if *action { t.hint } else { t.name };
+                    queue!(stdout, MoveTo(vx, y), SetForegroundColor(color), Print(&shown), ResetColor)?;
+                }
+            }
+        }
+        y += 1;
+    }
+
+    // Error line (if any) then the bottom border + hint.
+    if let Some(err) = error {
+        queue!(stdout, MoveTo(x0, y), SetForegroundColor(t.accent), Print(b.v), ResetColor, Print(&blank_inner), SetForegroundColor(t.accent), MoveTo(x0 + modal_w - 1, y), Print(b.v), ResetColor)?;
+        queue!(stdout, MoveTo(x0 + 2, y), SetForegroundColor(t.danger), Print(fit_text(&format!("! {err}"), inner_w - 2)), ResetColor)?;
+        y += 1;
+    }
+    let hint = " ↑/↓ move · type to edit · Enter: act · Esc cancel ";
+    let hfill = inner_w.saturating_sub(hint.chars().count());
+    let bottom = format!("{}{}{}{}", b.bl, hint, b.h.repeat(hfill), b.br);
+    queue!(stdout, MoveTo(x0, y), SetForegroundColor(t.accent), Print(fit_text(&bottom, modal_w as usize)), ResetColor)?;
+
+    // Show the caret on text fields; hide it otherwise.
+    if let Some((cx, cy)) = caret_pos {
+        queue!(stdout, MoveTo(cx, cy), Show)?;
+    } else {
+        queue!(stdout, Hide)?;
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
+/// Body shared by create/update: the service array, omitting empty
+/// command/cwd (the API schema treats them as optional, not nullable).
+fn stack_services_json(form: &StackEditForm) -> Vec<serde_json::Value> {
+    form.services
+        .iter()
+        .map(|s| {
+            let mut m = serde_json::Map::new();
+            m.insert("name".into(), serde_json::json!(s.name.trim()));
+            m.insert("serverId".into(), serde_json::json!(s.server_id));
+            let cmd = s.command.trim();
+            if !cmd.is_empty() {
+                m.insert("command".into(), serde_json::json!(cmd));
+            }
+            let cwd = s.cwd.trim();
+            if !cwd.is_empty() {
+                m.insert("cwd".into(), serde_json::json!(cwd));
+            }
+            serde_json::Value::Object(m)
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct CreatedStack {
+    id: String,
+}
+
+pub async fn run_stack_new() -> Result<()> {
+    let cfg = load_config()?;
+    let payload = fetch_stack_list_payload(&cfg).await?;
+    if payload.servers.is_empty() {
+        bail!("no servers available — add a server in the dashboard first");
+    }
+    let form = StackEditForm {
+        name: String::new(),
+        description: String::new(),
+        services: vec![ServiceForm {
+            name: String::new(),
+            server_id: payload.servers[0].id.clone(),
+            command: String::new(),
+            cwd: String::new(),
+        }],
+    };
+    match run_stack_editor("New stack", form, &payload.servers, false)? {
+        EditorOutcome::Save(f) => {
+            let mut body = serde_json::Map::new();
+            body.insert("name".into(), serde_json::json!(f.name.trim()));
+            let desc = f.description.trim();
+            if !desc.is_empty() {
+                body.insert("description".into(), serde_json::json!(desc));
+            }
+            body.insert("services".into(), serde_json::json!(stack_services_json(&f)));
+            let created: CreatedStack =
+                post_json(&cfg, "/api/cli/stacks", &serde_json::Value::Object(body)).await?;
+            println!(
+                "{} stack {} {}",
+                "Created".green().bold(),
+                f.name.trim().magenta(),
+                format!("({})", short_id(&created.id)).dark_grey(),
+            );
+            println!(
+                "  {} {}",
+                "Open it:".dark_grey(),
+                format!("managet stack start \"{}\"", f.name.trim()).white(),
+            );
+        }
+        EditorOutcome::Cancel | EditorOutcome::Delete => {
+            println!("{}", "Cancelled — nothing created.".dark_grey());
+        }
+    }
+    Ok(())
+}
+
+pub async fn run_stack_edit(selector: String) -> Result<()> {
+    let cfg = load_config()?;
+    let stack_id = resolve_stack_id(&cfg, &selector).await?;
+    let detail = fetch_stack_detail(&cfg, &stack_id).await?;
+    if detail.servers.is_empty() {
+        bail!("no servers available — add a server in the dashboard first");
+    }
+    let mut ordered = detail.stack.services.clone();
+    ordered.sort_by_key(|s| s.order_index);
+    let form = StackEditForm {
+        name: detail.stack.name.clone(),
+        description: detail.stack.description.clone().unwrap_or_default(),
+        services: ordered
+            .iter()
+            .map(|s| ServiceForm {
+                name: s.name.clone(),
+                server_id: s.server_id.clone(),
+                command: s.command.clone().unwrap_or_default(),
+                cwd: s.cwd.clone().unwrap_or_default(),
+            })
+            .collect(),
+    };
+    let stack_name = detail.stack.name.clone();
+
+    match run_stack_editor("Edit stack", form, &detail.servers, true)? {
+        EditorOutcome::Save(f) => {
+            let mut body = serde_json::Map::new();
+            body.insert("name".into(), serde_json::json!(f.name.trim()));
+            let desc = f.description.trim();
+            // Send null to clear, a string to set — update accepts both.
+            body.insert(
+                "description".into(),
+                if desc.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(desc)
+                },
+            );
+            body.insert("services".into(), serde_json::json!(stack_services_json(&f)));
+            put_json(
+                &cfg,
+                &format!("/api/cli/stacks/{stack_id}"),
+                &serde_json::Value::Object(body),
+            )
+            .await?;
+            println!("{} stack {}", "Saved".green().bold(), f.name.trim().magenta());
+        }
+        EditorOutcome::Delete => {
+            let confirmed = inquire::Confirm::new(&format!(
+                "Delete stack \"{stack_name}\"? (moves it to Trash)"
+            ))
+            .with_default(false)
+            .prompt()
+            .unwrap_or(false);
+            if confirmed {
+                let _ = delete_request(&cfg, &format!("/api/cli/stacks/{stack_id}")).await?;
+                println!("{} stack {}", "Deleted".red().bold(), stack_name.magenta());
+            } else {
+                println!("{}", "Delete cancelled.".dark_grey());
+            }
+        }
+        EditorOutcome::Cancel => {
+            println!("{}", "Cancelled — no changes saved.".dark_grey());
+        }
+    }
+    Ok(())
+}
+
 /// Services that should become panes, in slot order: filtered to one
 /// server when `filter_id` is set, sorted by the stack's order index.
 fn stack_visible_services<'a>(
@@ -1871,9 +2591,35 @@ fn build_stack_panes(
                 rect,
                 parser: vt100::Parser::new(inner_rows, inner_cols, 0),
                 lost: None,
+                stats: service_stats(detail, &svc.id),
             }
         })
         .collect()
+}
+
+/// Pull the live resource readout for a service from the stack runtime.
+/// Returns `None` when nothing is worth drawing (no CPU/mem/temp yet).
+fn service_stats(detail: &CliStackDetail, service_id: &str) -> Option<PaneStats> {
+    detail
+        .runtime
+        .services
+        .iter()
+        .find(|r| r.service_id == service_id)
+        .map(|r| PaneStats {
+            cpu_percent: r.cpu_percent,
+            memory_mb: r.memory_mb,
+            cpu_temp_c: r.cpu_temp_c,
+        })
+        .filter(|s| s.any())
+}
+
+/// Refresh just the per-pane stat readouts from a fresh stack detail,
+/// matched by slot_key (service id). Called on every runtime poll so
+/// CPU/mem/temp stay live even when no placeholder↔live flip happened.
+fn update_stack_pane_stats(panes: &mut [Pane], detail: &CliStackDetail) {
+    for pane in panes.iter_mut() {
+        pane.stats = service_stats(detail, &pane.slot_key);
+    }
 }
 
 /// True when the dashboard's runtime no longer matches what the panes
@@ -1928,8 +2674,15 @@ async fn reconcile_stack_after_fetch(
     *current_detail = latest;
     *server_labels = build_server_labels(&current_detail.servers);
     let visible = stack_visible_services(current_detail, filter_id).len();
-    *current_partition = default_partition(visible);
-    *current_layout = layout_for_partition(current_partition);
+    // Keep the user's resized layout across reconciles when the pane count
+    // is unchanged (a placeholder flipping live doesn't add/remove panes).
+    // Only fall back to a fresh default when services were added/removed.
+    if current_partition.iter().sum::<usize>() != visible
+        || current_layout.col_widths_by_row.len() != current_partition.len()
+    {
+        *current_partition = default_partition(visible);
+        *current_layout = layout_for_partition(current_partition);
+    }
 
     let (cols, rows) = terminal::size().unwrap_or((120, 36));
     let fresh = build_stack_panes(
@@ -2015,8 +2768,12 @@ pub async fn run_stack_open(
 
     let stack_title = current_detail.stack.name.clone();
     let mut server_labels = build_server_labels(&current_detail.servers);
-    let mut current_partition = default_partition(visible_count);
-    let mut current_layout = layout_for_partition(&current_partition);
+    // Start from the user's persisted layout (Ctrl-A R resize) when its
+    // shape still matches the visible service count; otherwise the default
+    // equal-split for this many panes.
+    let mut current_layout =
+        valid_layout_or_default(current_detail.layout.clone(), visible_count);
+    let mut current_partition = active_partition(&current_layout, visible_count);
 
     let mut stdout = std::io::stdout();
     let _guard = TerminalGuard::enter(&mut stdout)?;
@@ -2092,12 +2849,103 @@ pub async fn run_stack_open(
     runtime_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut escape = false;
+    let mut resize: Option<ResizeState> = None;
     loop {
         tokio::select! {
             maybe_event = event_rx.recv() => {
                 let Some(ev) = maybe_event else { break; };
                 match ev {
                     Event::Key(key) => {
+                        // Resize mode (Ctrl-A R): same controls as the group
+                        // view. Arrows preview locally, Enter persists the
+                        // stack layout, Esc reverts to the layout on entry.
+                        if resize.is_some() {
+                            let pane_count = panes.len();
+                            let mut commit = false;
+                            let mut cancel = false;
+                            let mut changed = false;
+                            {
+                                let rs = resize.as_mut().unwrap();
+                                rs.pane = rs.pane.min(pane_count.saturating_sub(1));
+                                match key.code {
+                                    KeyCode::Esc => cancel = true,
+                                    KeyCode::Enter => commit = true,
+                                    KeyCode::Left | KeyCode::Char('h') => {
+                                        changed = resize_focused(&mut current_layout, &current_partition, rs.pane, -1, 0);
+                                    }
+                                    KeyCode::Right | KeyCode::Char('l') => {
+                                        changed = resize_focused(&mut current_layout, &current_partition, rs.pane, 1, 0);
+                                    }
+                                    KeyCode::Up | KeyCode::Char('k') => {
+                                        changed = resize_focused(&mut current_layout, &current_partition, rs.pane, 0, -1);
+                                    }
+                                    KeyCode::Down | KeyCode::Char('j') => {
+                                        changed = resize_focused(&mut current_layout, &current_partition, rs.pane, 0, 1);
+                                    }
+                                    KeyCode::Char('[') => {
+                                        if pane_count > 0 {
+                                            rs.pane = (rs.pane + pane_count - 1) % pane_count;
+                                            focused = rs.pane;
+                                        }
+                                    }
+                                    KeyCode::Char(']') => {
+                                        if pane_count > 0 {
+                                            rs.pane = (rs.pane + 1) % pane_count;
+                                            focused = rs.pane;
+                                        }
+                                    }
+                                    KeyCode::Char(c) if c.is_ascii_digit() => {
+                                        let slot = c.to_digit(10).unwrap_or(0) as usize;
+                                        if slot >= 1 && slot <= pane_count {
+                                            rs.pane = slot - 1;
+                                            focused = rs.pane;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if cancel {
+                                current_layout = resize.take().unwrap().original;
+                            } else if commit {
+                                resize = None;
+                            }
+                            if changed || cancel || commit {
+                                let (c, r) = terminal::size().unwrap_or((120, 36));
+                                apply_resize(&mut panes, &current_layout, &current_partition, c, r);
+                                for pane in &panes {
+                                    if let Some(session) = &pane.session {
+                                        let (h, w) = pane_inner_size(pane.rect);
+                                        send_ws(&send_tx, client_resize_msg(session, h, w)).await?;
+                                    }
+                                }
+                            }
+                            if commit {
+                                let _ = save_stack_layout(&cfg, &stack_id, &current_layout).await;
+                            }
+                            draw_stack(&mut stdout, &stack_title, &panes, focused)?;
+                            if let Some(rs) = resize.as_ref() {
+                                draw_resize_overlay(&mut stdout, &panes, rs)?;
+                            }
+                            continue;
+                        }
+
+                        // Ctrl-A R enters resize mode (needs >1 pane to have
+                        // something to trade space with).
+                        if escape && matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R')) {
+                            escape = false;
+                            if panes.len() >= 2 {
+                                resize = Some(ResizeState {
+                                    pane: focused.min(panes.len() - 1),
+                                    original: current_layout.clone(),
+                                });
+                                draw_stack(&mut stdout, &stack_title, &panes, focused)?;
+                                if let Some(rs) = resize.as_ref() {
+                                    draw_resize_overlay(&mut stdout, &panes, rs)?;
+                                }
+                            }
+                            continue;
+                        }
+
                         let focused_session = panes
                             .get(focused.min(panes.len().saturating_sub(1)))
                             .and_then(|p| p.session.clone());
@@ -2125,6 +2973,9 @@ pub async fn run_stack_open(
                             }
                         }
                         draw_stack(&mut stdout, &stack_title, &panes, focused)?;
+                        if let Some(rs) = resize.as_ref() {
+                            draw_resize_overlay(&mut stdout, &panes, rs)?;
+                        }
                     }
                     _ => {}
                 }
@@ -2145,26 +2996,37 @@ pub async fn run_stack_open(
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(anyhow!("websocket error: {e}")),
                 }
+                if let Some(rs) = resize.as_ref() {
+                    draw_resize_overlay(&mut stdout, &panes, rs)?;
+                }
             }
             _ = runtime_poll.tick() => {
                 let Ok(latest) = fetch_stack_detail(&cfg, &stack_id).await else {
                     continue;
                 };
-                if !stack_state_changed(&panes, &latest, filter_id.as_deref()) {
+                // Don't disturb the panes mid-resize; refresh once it's done.
+                if resize.is_some() {
                     continue;
                 }
-                reconcile_stack_after_fetch(
-                    latest,
-                    filter_id.as_deref(),
-                    &mut current_detail,
-                    &mut server_labels,
-                    &mut current_layout,
-                    &mut current_partition,
-                    &mut panes,
-                    &mut focused,
-                    &send_tx,
-                )
-                .await?;
+                if stack_state_changed(&panes, &latest, filter_id.as_deref()) {
+                    reconcile_stack_after_fetch(
+                        latest,
+                        filter_id.as_deref(),
+                        &mut current_detail,
+                        &mut server_labels,
+                        &mut current_layout,
+                        &mut current_partition,
+                        &mut panes,
+                        &mut focused,
+                        &send_tx,
+                    )
+                    .await?;
+                } else {
+                    // No structural change — just refresh the live CPU/mem/
+                    // temp readouts so the per-pane stats stay current.
+                    current_detail = latest;
+                    update_stack_pane_stats(&mut panes, &current_detail);
+                }
                 draw_stack(&mut stdout, &stack_title, &panes, focused)?;
             }
         }
@@ -2198,7 +3060,7 @@ fn draw_stack_status_bar(
     let running = panes.iter().filter(|p| p.session.is_some()).count();
     let total = panes.len();
     let active_text = format!("{running}/{total} running · focus {active_slot}:{active_name}");
-    let hints = "Ctrl-A D detach · 1-6 focus · [/] cycle";
+    let hints = "Ctrl-A D detach · 1-6 focus · [/] cycle · R resize";
 
     let t = theme();
     let segments: [(&str, Color, bool); 7] = [
@@ -2405,6 +3267,7 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
     let mut confirm: Option<ConfirmState> = None;
     let mut layout_picker: Option<LayoutPickerState> = None;
     let mut swap: Option<SwapState> = None;
+    let mut resize: Option<ResizeState> = None;
     // Set when the loop exits because the group is gone (all sessions
     // ended / removed); printed once on the normal screen after we tear
     // down the alt-screen so the user knows why the mosaic closed.
@@ -2690,6 +3553,91 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                             continue;
                         }
 
+                        // Resize mode (Ctrl-A R): arrows grow/shrink the
+                        // targeted pane (live, local-only preview), [ ] and
+                        // digits move the target, Enter persists to the
+                        // dashboard, Esc reverts to the layout on entry.
+                        if resize.is_some() {
+                            let pane_count = panes.len();
+                            let mut commit = false;
+                            let mut cancel = false;
+                            let mut changed = false;
+                            {
+                                let rs = resize.as_mut().unwrap();
+                                rs.pane = rs.pane.min(pane_count.saturating_sub(1));
+                                match key.code {
+                                    KeyCode::Esc => cancel = true,
+                                    KeyCode::Enter => commit = true,
+                                    KeyCode::Left | KeyCode::Char('h') => {
+                                        changed = resize_focused(&mut current_layout, &current_partition, rs.pane, -1, 0);
+                                    }
+                                    KeyCode::Right | KeyCode::Char('l') => {
+                                        changed = resize_focused(&mut current_layout, &current_partition, rs.pane, 1, 0);
+                                    }
+                                    KeyCode::Up | KeyCode::Char('k') => {
+                                        changed = resize_focused(&mut current_layout, &current_partition, rs.pane, 0, -1);
+                                    }
+                                    KeyCode::Down | KeyCode::Char('j') => {
+                                        changed = resize_focused(&mut current_layout, &current_partition, rs.pane, 0, 1);
+                                    }
+                                    KeyCode::Char('[') => {
+                                        if pane_count > 0 {
+                                            rs.pane = (rs.pane + pane_count - 1) % pane_count;
+                                            focused = rs.pane;
+                                        }
+                                    }
+                                    KeyCode::Char(']') => {
+                                        if pane_count > 0 {
+                                            rs.pane = (rs.pane + 1) % pane_count;
+                                            focused = rs.pane;
+                                        }
+                                    }
+                                    KeyCode::Char(c) if c.is_ascii_digit() => {
+                                        let slot = c.to_digit(10).unwrap_or(0) as usize;
+                                        if slot >= 1 && slot <= pane_count {
+                                            rs.pane = slot - 1;
+                                            focused = rs.pane;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if cancel {
+                                current_layout = resize.take().unwrap().original;
+                            } else if commit {
+                                resize = None;
+                            }
+                            // Re-lay the panes (preview on change, restore on
+                            // cancel) and tell live sessions their new size.
+                            if changed || cancel || commit {
+                                let (c, r) = terminal::size().unwrap_or((120, 36));
+                                apply_resize(&mut panes, &current_layout, &current_partition, c, r);
+                                for pane in &panes {
+                                    if let Some(session) = &pane.session {
+                                        let (h, w) = pane_inner_size(pane.rect);
+                                        send_ws(&send_tx, client_resize_msg(session, h, w)).await?;
+                                    }
+                                }
+                            }
+                            if commit {
+                                // Persist so the browser mosaic matches.
+                                let _ = save_group_layout(&cfg, &group_id, &current_layout).await;
+                            }
+                            draw_group(
+                                &mut stdout,
+                                &current_group,
+                                &panes,
+                                focused,
+                                None,
+                                None,
+                                &current_servers,
+                            )?;
+                            if let Some(rs) = resize.as_ref() {
+                                draw_resize_overlay(&mut stdout, &panes, rs)?;
+                            }
+                            continue;
+                        }
+
                         // Ctrl-A S opens the swap-windows overlay (needs at
                         // least two panes to have something to swap).
                         if escape && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) {
@@ -2736,6 +3684,32 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                                 )?;
                                 if let Some(lp) = layout_picker.as_ref() {
                                     draw_layout_overlay(&mut stdout, lp)?;
+                                }
+                            }
+                            continue;
+                        }
+
+                        // Ctrl-A R enters resize mode for the focused pane.
+                        // Only useful when there's something to trade space
+                        // with (>1 column in a row, or >1 row).
+                        if escape && matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R')) {
+                            escape = false;
+                            if panes.len() >= 2 {
+                                resize = Some(ResizeState {
+                                    pane: focused.min(panes.len() - 1),
+                                    original: current_layout.clone(),
+                                });
+                                draw_group(
+                                    &mut stdout,
+                                    &current_group,
+                                    &panes,
+                                    focused,
+                                    None,
+                                    None,
+                                    &current_servers,
+                                )?;
+                                if let Some(rs) = resize.as_ref() {
+                                    draw_resize_overlay(&mut stdout, &panes, rs)?;
                                 }
                             }
                             continue;
@@ -2941,6 +3915,9 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                         if let Some(sw) = swap.as_ref() {
                             draw_swap_overlay(&mut stdout, &panes, sw)?;
                         }
+                        if let Some(rs) = resize.as_ref() {
+                            draw_resize_overlay(&mut stdout, &panes, rs)?;
+                        }
                     }
                     _ => {}
                 }
@@ -2989,6 +3966,9 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                 if let Some(sw) = swap.as_ref() {
                     draw_swap_overlay(&mut stdout, &panes, sw)?;
                 }
+                if let Some(rs) = resize.as_ref() {
+                    draw_resize_overlay(&mut stdout, &panes, rs)?;
+                }
                 // Every live session reported `session:lost` — the shells
                 // all exited (or were killed) out from under us. There's
                 // nothing left to attach to or forward keystrokes into, so
@@ -3010,6 +3990,7 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                     || confirm.is_some()
                     || layout_picker.is_some()
                     || swap.is_some()
+                    || resize.is_some()
                 {
                     continue;
                 }
@@ -3610,7 +4591,7 @@ fn draw_status_bar(
     } else if picker_active {
         "↑/↓ pick · Enter confirm · Esc cancel"
     } else {
-        "Ctrl-A D detach · 1-6 focus · [/] cycle · N add · S swap · V layout · X detach · K kill"
+        "Ctrl-A D detach · 1-6 focus · [/] cycle · N add · S swap · V layout · R resize · X detach · K kill"
     };
 
     let t = theme();
@@ -3758,6 +4739,26 @@ fn draw_pane(stdout: &mut Stdout, pane: &Pane, active: bool, slot: usize) -> Res
         written += len;
     }
     queue!(stdout, ResetColor)?;
+
+    // Stack panes carry a live resource readout (CPU/mem/temp). Paint it
+    // right-aligned on the bottom border so it never collides with the
+    // title or the inner terminal. Group panes leave `stats` None.
+    if let Some(stats) = pane.stats.as_ref().filter(|s| s.any()) {
+        let badge = format!(" {} ", stats.label());
+        let badge_w = badge.chars().count();
+        if (r.w as usize) > badge_w + 3 {
+            let bx = r.x + r.w.saturating_sub(1) - badge_w as u16;
+            let stat_color = if active { t.info } else { t.hint };
+            queue!(
+                stdout,
+                MoveTo(bx, r.y + r.h.saturating_sub(1)),
+                SetForegroundColor(stat_color),
+                Print(badge),
+                SetForegroundColor(border_color),
+                ResetColor,
+            )?;
+        }
+    }
 
     let inner_w = r.w.saturating_sub(2);
     let inner_h = r.h.saturating_sub(2);
@@ -4229,6 +5230,98 @@ fn outline_pane(stdout: &mut Stdout, r: Rect, color: Color, badge: &str) -> Resu
     Ok(())
 }
 
+/// Ctrl-A R "resize windows" overlay state. `pane` is the window the
+/// arrows currently grow/shrink ([ ] / digits move it); `original` is the
+/// layout captured on entry so Esc can restore it without a round-trip.
+#[derive(Clone)]
+struct ResizeState {
+    pane: usize,
+    original: GroupLayout,
+}
+
+/// Smallest share any row/column may shrink to, as a ratio of its track.
+/// Keeps a pane from collapsing to nothing (and below the per-pane min the
+/// allocator enforces anyway).
+const RESIZE_MIN_RATIO: f64 = 0.12;
+/// How much ratio one arrow press moves between a pane and its neighbour.
+const RESIZE_STEP: f64 = 0.04;
+
+/// (row, col-within-row) of the `pane`-th window for a given partition.
+fn pane_grid_pos(partition: &[usize], pane: usize) -> Option<(usize, usize)> {
+    let mut base = 0usize;
+    for (row, &count) in partition.iter().enumerate() {
+        if pane < base + count {
+            return Some((row, pane - base));
+        }
+        base += count;
+    }
+    None
+}
+
+/// Move `delta` of ratio into `idx` from its neighbour (the entry after it,
+/// or before it when `idx` is last). `delta > 0` grows `idx`; `< 0` shrinks
+/// it. No-op (returns false) when there's no neighbour or the move would
+/// push either entry below `RESIZE_MIN_RATIO`.
+fn nudge_ratio(ratios: &mut [f64], idx: usize, delta: f64) -> bool {
+    if ratios.len() < 2 || idx >= ratios.len() {
+        return false;
+    }
+    let neighbour = if idx + 1 < ratios.len() { idx + 1 } else { idx - 1 };
+    let new_idx = ratios[idx] + delta;
+    let new_nb = ratios[neighbour] - delta;
+    if new_idx < RESIZE_MIN_RATIO || new_nb < RESIZE_MIN_RATIO {
+        return false;
+    }
+    ratios[idx] = new_idx;
+    ratios[neighbour] = new_nb;
+    true
+}
+
+/// Grow/shrink the focused pane along one axis by nudging the layout
+/// ratios. `dx`/`dy` are −1, 0, or +1 (right/down positive). Returns true
+/// when the layout actually changed.
+fn resize_focused(layout: &mut GroupLayout, partition: &[usize], pane: usize, dx: i32, dy: i32) -> bool {
+    let Some((row, col)) = pane_grid_pos(partition, pane) else {
+        return false;
+    };
+    let mut changed = false;
+    if dx != 0 {
+        if let Some(widths) = layout.col_widths_by_row.get_mut(row) {
+            changed |= nudge_ratio(widths, col, RESIZE_STEP * dx as f64);
+        }
+    }
+    if dy != 0 {
+        changed |= nudge_ratio(&mut layout.row_heights, row, RESIZE_STEP * dy as f64);
+    }
+    changed
+}
+
+/// Redraw the resize-mode chrome: a banner across the status row and the
+/// targeted pane outlined with grow/shrink hints.
+fn draw_resize_overlay(stdout: &mut Stdout, panes: &[Pane], rs: &ResizeState) -> Result<()> {
+    let t = theme();
+    let (cols, _) = terminal::size().unwrap_or((120, 36));
+    let banner = format!(
+        "  RESIZE  window {} — ←/→ width · ↑/↓ height · [ ] next · Enter apply · Esc cancel",
+        rs.pane + 1
+    );
+    queue!(
+        stdout,
+        MoveTo(0, 0),
+        SetBackgroundColor(t.accent),
+        SetForegroundColor(t.selected_fg),
+        SetAttribute(Attribute::Bold),
+        Print(fit_text(&banner, cols as usize)),
+        SetAttribute(Attribute::Reset),
+        ResetColor,
+    )?;
+    if let Some(p) = panes.get(rs.pane) {
+        outline_pane(stdout, p.rect, t.accent, "⤡ resizing")?;
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
 /// Small Y/n confirm modal anchored over the focused pane. Drawn after
 /// the panes so it overlays whatever they were rendering. Red border to
 /// make the destructive intent visually loud — picker uses cyan, this
@@ -4369,6 +5462,7 @@ fn build_panes(
                 rect,
                 parser: vt100::Parser::new(inner_rows, inner_cols, 0),
                 lost: None,
+                stats: None,
             }
         })
         .collect()
@@ -4639,6 +5733,14 @@ async fn save_group_layout(
     layout: &GroupLayout,
 ) -> Result<()> {
     put_json(cfg, &format!("/api/cli/groups/{group_id}/layout"), layout).await
+}
+
+async fn save_stack_layout(
+    cfg: &DashboardCliConfig,
+    stack_id: &str,
+    layout: &GroupLayout,
+) -> Result<()> {
+    put_json(cfg, &format!("/api/cli/stacks/{stack_id}/layout"), layout).await
 }
 
 async fn save_group_order(

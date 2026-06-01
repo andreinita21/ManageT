@@ -15,7 +15,7 @@
 //! so a session created here shows up there and vice-versa.
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use managet_agent::cli::ServiceAction;
 use managet_agent::{cli_dashboard, service, sessions};
 
@@ -75,8 +75,27 @@ enum Command {
         action: Option<ThemeAction>,
     },
 
-    /// List active terminal sessions managed by this host's agent.
-    Ls,
+    /// List sessions, groups, and stacks (this host's agent + the dashboard).
+    ///
+    /// With no argument, lists everything. Narrow it with a target —
+    /// `managet ls sessions|groups|stacks` — or the equivalent flags
+    /// `-s` (sessions), `-g` (groups), `-st` (stacks). Sessions cover both
+    /// this server and other servers, individual *and* in-group (the group
+    /// is named when the groups section isn't also shown).
+    Ls {
+        /// What to list: sessions, groups, or stacks. Omit for everything.
+        #[arg(value_enum)]
+        target: Option<LsTarget>,
+        /// Sessions only (same as `managet ls sessions`).
+        #[arg(short = 's', long)]
+        sessions: bool,
+        /// Groups only (same as `managet ls groups`).
+        #[arg(short = 'g', long)]
+        groups: bool,
+        /// Stacks only (same as `managet ls stacks`; also accepts `-st`).
+        #[arg(long)]
+        stacks: bool,
+    },
 
     /// Spawn a new persistent terminal session and attach to it.
     ///
@@ -129,6 +148,41 @@ enum Command {
 
     /// Shorthand for `managet service restart`.
     Restart,
+}
+
+/// `managet ls` target. Accepts the singular form and short alias as
+/// values too, so `managet ls session` / `managet ls g` also work.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LsTarget {
+    #[value(alias = "session", alias = "s")]
+    Sessions,
+    #[value(alias = "group", alias = "g")]
+    Groups,
+    #[value(alias = "stack", alias = "st")]
+    Stacks,
+}
+
+/// Resolve the (sessions, groups, stacks) visibility triple from the
+/// positional target plus the `-s`/`-g`/`-st` flags. When nothing is
+/// selected, everything is shown.
+fn resolve_ls_filter(
+    target: Option<LsTarget>,
+    sessions: bool,
+    groups: bool,
+    stacks: bool,
+) -> (bool, bool, bool) {
+    let mut show = (sessions, groups, stacks);
+    match target {
+        Some(LsTarget::Sessions) => show.0 = true,
+        Some(LsTarget::Groups) => show.1 = true,
+        Some(LsTarget::Stacks) => show.2 = true,
+        None => {}
+    }
+    if !show.0 && !show.1 && !show.2 {
+        (true, true, true)
+    } else {
+        show
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -217,6 +271,31 @@ enum StackAction {
         theme: Option<String>,
     },
 
+    /// Create a new stack with a friendly full-screen editor (navigate
+    /// fields with ↑/↓, type to edit, Enter on a row to act, Esc to cancel).
+    New,
+
+    /// Edit a stack in the full-screen editor — name, description, and each
+    /// service's name/server/command/cwd. Add or remove services, or delete
+    /// the whole stack. Save with the [✓ Save] row.
+    Edit {
+        /// Stack id, unique prefix, or exact stack name.
+        id: String,
+    },
+
+    /// Launch the stack, then open its live mosaic in one step
+    /// (`launch` + `open`). Already-running services are reused.
+    Start {
+        /// Stack id, unique prefix, or exact stack name.
+        id: String,
+        /// Only this server's services (name, host, or id).
+        #[arg(short, long)]
+        server: Option<String>,
+        /// Mosaic theme for this run (see `managet theme list`).
+        #[arg(long)]
+        theme: Option<String>,
+    },
+
     /// List stacks (same as `managet stacks`).
     List,
 }
@@ -268,7 +347,17 @@ fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     init_tracing();
-    let cli = Cli::parse();
+    // `-st` isn't a real short flag (clap would read it as `-s -t`), but the
+    // docs advertise it for "stacks only", so rewrite the bare token to the
+    // long form before parsing.
+    let argv = std::env::args().map(|a| {
+        if a == "-st" {
+            "--stacks".to_string()
+        } else {
+            a
+        }
+    });
+    let cli = Cli::parse_from(argv);
     match cli.command {
         Command::Login {
             api_url,
@@ -300,13 +389,25 @@ async fn run() -> Result<()> {
             StackAction::Open { id, server, theme } => {
                 cli_dashboard::run_stack_open(id, server, theme).await
             }
+            StackAction::Start { id, server, theme } => {
+                cli_dashboard::run_stack_start(id, server, theme).await
+            }
+            StackAction::New => cli_dashboard::run_stack_new().await,
+            StackAction::Edit { id } => cli_dashboard::run_stack_edit(id).await,
             StackAction::List => cli_dashboard::run_stack_list().await,
         },
         Command::Theme { action } => match action {
             None | Some(ThemeAction::List) => cli_dashboard::run_theme_list().await,
             Some(ThemeAction::Set { name }) => cli_dashboard::run_theme_set(name).await,
         },
-        Command::Ls => {
+        Command::Ls {
+            target,
+            sessions: only_sessions,
+            groups: only_groups,
+            stacks: only_stacks,
+        } => {
+            let (show_sessions, show_groups, show_stacks) =
+                resolve_ls_filter(target, only_sessions, only_groups, only_stacks);
             // Pull the dashboard's group → member map up front (when
             // logged in) so individual session rows can be tagged with
             // `[groupName]`. Silent fall-through when offline keeps
@@ -314,10 +415,22 @@ async fn run() -> Result<()> {
             // the dashboard.
             let group_map = cli_dashboard::fetch_session_group_map().await;
             let group_ref = if group_map.is_empty() { None } else { Some(&group_map) };
-            let local_ids = sessions::client::run_ls(group_ref).await?;
-            let local_set: std::collections::HashSet<String> =
-                local_ids.into_iter().collect();
-            cli_dashboard::print_dashboard_ls_sections(&local_set).await
+            let mut local_set: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            if show_sessions {
+                // Include grouped local sessions (annotated with their group)
+                // when the Groups section isn't also being shown, so a
+                // sessions-only view hides nothing.
+                let local_ids = sessions::client::run_ls(group_ref, !show_groups).await?;
+                local_set = local_ids.into_iter().collect();
+            }
+            cli_dashboard::print_dashboard_ls_sections(
+                &local_set,
+                show_sessions,
+                show_groups,
+                show_stacks,
+            )
+            .await
         }
         Command::New {
             name,
