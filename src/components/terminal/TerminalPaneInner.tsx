@@ -452,6 +452,14 @@ export default function TerminalPaneInner({
         // is set to the id the server returned, and we want to attach
         // to that — re-sending `session:create` would orphan the live
         // PTY and spawn a new one on every reconnect.
+        // Fit before attach/create so the rows/cols we send describe the
+        // grid the user is looking at *right now*. The mount-time fit
+        // runs before the WS opens (and its term.onResize fired into a
+        // closed socket), so without re-measuring here a session opened
+        // on one monitor and re-attached on another would report the old
+        // shape — the PTY stays the wrong size and full-screen TUIs
+        // render garbled until a zoom/resize forces a refit.
+        try { fit?.fit(); } catch {}
         if (sessionId) {
           // Reconnect: wipe the grid so the server's scrollback replay
           // repaints cleanly instead of stacking on the old contents.
@@ -463,10 +471,19 @@ export default function TerminalPaneInner({
               type: "session:attach",
               sessionId,
               serverId,
+              rows: term?.rows,
+              cols: term?.cols,
             })
           );
         } else {
-          ws?.send(JSON.stringify({ type: "session:create", serverId }));
+          ws?.send(
+            JSON.stringify({
+              type: "session:create",
+              serverId,
+              rows: term?.rows,
+              cols: term?.cols,
+            })
+          );
         }
         hasConnected = true;
       };
@@ -477,17 +494,40 @@ export default function TerminalPaneInner({
           if (msg.type === "terminal:output" && typeof msg.data === "string") {
             term?.write(msg.data);
           } else if (msg.type === "session:state" && msg.session) {
-            // Only accept the first session:state — repeats indicate a
-            // double-subscribe that would cross-route input to the wrong PTY.
-            if (sessionId) return;
-            sessionId = msg.session.sessionId as string;
-            // Deliberately NOT writing "Session ready" into the xterm
-            // grid — it would push the agent's scrollback replay (or a
-            // fresh shell's first prompt) down by one line and confuse
-            // users who think their history vanished.
+            const sid = msg.session.sessionId as string;
+            if (!sessionId) {
+              sessionId = sid;
+              // Deliberately NOT writing "Session ready" into the xterm
+              // grid — it would push the agent's scrollback replay (or a
+              // fresh shell's first prompt) down by one line and confuse
+              // users who think their history vanished.
+              term?.focus();
+              onSessionReadyRef.current?.(sessionId);
+            } else if (sessionId !== sid) {
+              // A session:state for a *different* id indicates a
+              // double-subscribe that would cross-route input to the
+              // wrong PTY — ignore it.
+              return;
+            }
+            // Every session:state marks a completed attach/create. Sync
+            // the PTY to this client's grid: the attach message already
+            // carried rows/cols, but the container can resize during the
+            // agent round-trip (panel layout settling, window drag), and
+            // term.onResize won't fire if xterm's numbers didn't change
+            // even though the remote PTY disagrees. An explicit resize
+            // here makes the size converge on every (re)attach.
             try { fit?.fit(); } catch {}
-            term?.focus();
-            onSessionReadyRef.current?.(sessionId);
+            if (term && ws?.readyState === WebSocket.OPEN) {
+              ws.send(
+                JSON.stringify({
+                  type: "terminal:resize",
+                  sessionId,
+                  cols: term.cols,
+                  rows: term.rows,
+                  serverId,
+                })
+              );
+            }
           } else if (msg.type === "session:lost") {
             if (mounted) {
               setStatus("lost");

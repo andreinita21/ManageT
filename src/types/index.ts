@@ -393,8 +393,8 @@ export interface SessionSnapshot {
 export type ClientMessage =
   | { type: "terminal:input"; sessionId: string; data: string }
   | { type: "terminal:resize"; sessionId: string; cols: number; rows: number; serverId?: string }
-  | { type: "session:create"; serverId: string; command?: string; name?: string; cwd?: string }
-  | { type: "session:attach"; sessionId: string; serverId: string }
+  | { type: "session:create"; serverId: string; command?: string; name?: string; cwd?: string; rows?: number; cols?: number }
+  | { type: "session:attach"; sessionId: string; serverId: string; rows?: number; cols?: number }
   | { type: "session:detach"; sessionId: string }
   | { type: "session:kill"; sessionId: string; serverId: string };
 

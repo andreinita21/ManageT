@@ -152,11 +152,22 @@ interface IncomingCreate {
   command?: string;
   name?: string;
   cwd?: string; // accepted but currently unused — agent doesn't honor it yet
+  /** Initial PTY size, so the shell is born at the client's grid shape
+   * instead of the agent default. */
+  rows?: number;
+  cols?: number;
 }
 interface IncomingAttach {
   type: "session:attach";
   sessionId: string;
   serverId: string;
+  /** Client's current grid size. The agent resizes the PTY to this at
+   * attach time (SIGWINCH), which is what makes a session opened on one
+   * monitor render correctly when re-attached from another. Without it
+   * the PTY keeps the previous client's shape and full-screen TUIs
+   * paint garbage until something else triggers a resize. */
+  rows?: number;
+  cols?: number;
 }
 interface IncomingDetach {
   type: "session:detach";
@@ -449,9 +460,17 @@ async function handleMessage(ws: WebSocket, raw: string): Promise<void> {
           command: msg.command,
           name: msg.name,
           user: username,
+          rows: msg.rows,
+          cols: msg.cols,
         });
         // Immediately attach this WS to the new session.
-        await handleAttachLifecycle(ws, msg.serverId, created.sessionId);
+        await handleAttachLifecycle(
+          ws,
+          msg.serverId,
+          created.sessionId,
+          msg.rows,
+          msg.cols
+        );
       } catch (err) {
         const m = err instanceof Error ? err.message : String(err);
         console.error(`[WS] create failed: ${m}`);
@@ -474,7 +493,13 @@ async function handleMessage(ws: WebSocket, raw: string): Promise<void> {
           });
           break;
         }
-        await handleAttachLifecycle(ws, msg.serverId, msg.sessionId);
+        await handleAttachLifecycle(
+          ws,
+          msg.serverId,
+          msg.sessionId,
+          msg.rows,
+          msg.cols
+        );
       } catch (err) {
         const m = err instanceof Error ? err.message : String(err);
         console.error(`[WS] attach failed: ${m}`);
