@@ -8,7 +8,7 @@ import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { servers } from "@/lib/db/schema";
-import { rowToServer } from "@/lib/db/transform";
+import { toPublicServer } from "@/lib/db/transform";
 import { eq } from "drizzle-orm";
 import { encryptPassword } from "@/lib/crypto";
 import { sshUninstallAgent } from "@/lib/agent/uninstaller";
@@ -75,7 +75,7 @@ export async function GET(
     return NextResponse.json({ error: "Server not found" }, { status: 404 });
   }
 
-  return NextResponse.json({ data: rowToServer(rows[0]) });
+  return NextResponse.json({ data: toPublicServer(rows[0]) });
 }
 
 export async function PUT(
@@ -178,7 +178,7 @@ export async function PUT(
   await db.update(servers).set(updates).where(eq(servers.id, id));
 
   const updated = await db.select().from(servers).where(eq(servers.id, id)).limit(1);
-  return NextResponse.json({ data: rowToServer(updated[0]) });
+  return NextResponse.json({ data: toPublicServer(updated[0]) });
 }
 
 /**

@@ -7,7 +7,7 @@ import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { servers } from "@/lib/db/schema";
-import { rowToServer } from "@/lib/db/transform";
+import { toPublicServer } from "@/lib/db/transform";
 import { encryptPassword } from "@/lib/crypto";
 import { installAgent } from "@/lib/agent/installer";
 import { eq } from "drizzle-orm";
@@ -34,7 +34,7 @@ export async function GET() {
   }
 
   const rows = await db.select().from(servers);
-  const data: Server[] = rows.map(rowToServer);
+  const data: Server[] = rows.map(toPublicServer);
 
   return NextResponse.json({ data });
 }
@@ -90,7 +90,7 @@ export async function POST(request: Request) {
   // Read the freshly-inserted row so we return the exact shape the client
   // will see on subsequent GETs — including the default agent_status.
   const inserted = await db.select().from(servers).where(eq(servers.id, id)).limit(1);
-  const server: Server = rowToServer(inserted[0]);
+  const server: Server = toPublicServer(inserted[0]);
 
   // Fire the SSH-push agent install in the background. The client should poll
   // GET /api/servers/:id and watch `agentStatus` / `agentInstallStage` to render

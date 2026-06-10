@@ -16,6 +16,7 @@ import { userPreferences } from "@/lib/db/schema";
 import {
   DEFAULT_PREFERENCES,
   PRESETS_BY_KEY,
+  isSafeCustomTheme,
   type AppearancePreferences,
   type GroupViewServerLabel,
   type ThemeColors,
@@ -144,6 +145,17 @@ export async function PUT(request: Request) {
   // themeKeys we clear it to avoid stale colors hanging around.
   let customThemeJson: string | null = null;
   if (themeKey === "custom" && body.customTheme && typeof body.customTheme === "object") {
+    // Every colour value is later concatenated into an inline <style> and
+    // injected with dangerouslySetInnerHTML. Validate each value against a
+    // strict colour grammar so a crafted value can't break out of the CSS
+    // declaration (stored CSS/HTML injection) and so malformed colours can't
+    // silently corrupt the app shell.
+    if (!isSafeCustomTheme(body.customTheme)) {
+      return NextResponse.json(
+        { error: "customTheme contains invalid colour values" },
+        { status: 400 }
+      );
+    }
     try {
       customThemeJson = JSON.stringify(body.customTheme);
       // Soft cap so a runaway client can't fill the row with megabytes.

@@ -52,6 +52,20 @@ export function rowToServer(r: ServerRow): Server {
   };
 }
 
+/**
+ * Public-facing server shape for API responses. Strips secrets that the
+ * internal `rowToServer` carries for the SSH/agent code paths — the
+ * encrypted password ciphertext and the agent token hash must never reach
+ * a client — and exposes a `hasPassword` boolean instead. Use this at every
+ * HTTP response boundary; use `rowToServer` only inside the server.
+ */
+export function toPublicServer(r: ServerRow): Server {
+  const { passwordEncrypted, agentTokenHash, ...safe } = rowToServer(r);
+  void passwordEncrypted;
+  void agentTokenHash;
+  return { ...safe, hasPassword: !!r.passwordEncrypted };
+}
+
 export function rowToSession(r: SessionRow): Session {
   return {
     id: r.id,

@@ -1133,8 +1133,60 @@ export const UI_CSS_VAR_MAP: Record<keyof UiPalette, string> = {
  */
 export function uiPaletteToCssVars(palette: UiPalette): string {
   return (Object.keys(UI_CSS_VAR_MAP) as (keyof UiPalette)[])
-    .map((k) => `${UI_CSS_VAR_MAP[k]}:${palette[k]};`)
+    .map((k) => {
+      // Defence-in-depth: this string is injected via dangerouslySetInnerHTML.
+      // Even though the write path validates customTheme, drop any value that
+      // isn't a safe colour (e.g. a row persisted before validation existed)
+      // so it can never break out of the CSS declaration. `inherit` is an
+      // innocuous fallback that just leaves the cascade untouched.
+      const raw = palette[k];
+      const safe = isSafeColorValue(raw) ? raw : "inherit";
+      return `${UI_CSS_VAR_MAP[k]}:${safe};`;
+    })
     .join("");
+}
+
+/**
+ * Strict allow-list for a single CSS colour value. Custom-theme colours are
+ * concatenated into an inline `<style>` block via `uiPaletteToCssVars` and
+ * injected with `dangerouslySetInnerHTML`, so a value containing `;`, `}` or
+ * `</style>` would break out of the declaration. We accept only hex, rgb/rgba,
+ * hsl/hsla and plain colour keywords — none of which can contain a CSS/HTML
+ * break-out character. Reject everything else.
+ */
+const SAFE_COLOR_PATTERNS: RegExp[] = [
+  /^#[0-9a-fA-F]{3,8}$/,
+  /^rgb\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*\)$/,
+  /^rgba\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*(?:0|1|0?\.\d+)\s*\)$/,
+  /^hsl\(\s*\d{1,3}(?:\.\d+)?\s*,\s*\d{1,3}(?:\.\d+)?%\s*,\s*\d{1,3}(?:\.\d+)?%\s*\)$/,
+  /^hsla\(\s*\d{1,3}(?:\.\d+)?\s*,\s*\d{1,3}(?:\.\d+)?%\s*,\s*\d{1,3}(?:\.\d+)?%\s*,\s*(?:0|1|0?\.\d+)\s*\)$/,
+  /^[a-zA-Z]{3,20}$/, // CSS colour keyword (e.g. "rebeccapurple", "transparent")
+];
+
+export function isSafeColorValue(v: unknown): v is string {
+  return typeof v === "string" && v.length <= 64 && SAFE_COLOR_PATTERNS.some((re) => re.test(v));
+}
+
+/**
+ * Validate an untrusted `customTheme` payload: it must be a plain object
+ * whose every string leaf is a safe CSS colour (see {@link isSafeColorValue}).
+ * Walks nested objects (the `ui` / `terminal` palettes) and rejects arrays,
+ * functions, or any unsafe colour string. Returns true only if the whole
+ * structure is safe to persist and later inject as CSS.
+ */
+export function isSafeCustomTheme(obj: unknown, depth = 0): boolean {
+  if (depth > 3) return false; // ThemeColors is { ui: {...}, terminal: {...} }
+  if (obj === null || typeof obj !== "object" || Array.isArray(obj)) return false;
+  for (const value of Object.values(obj as Record<string, unknown>)) {
+    if (typeof value === "string") {
+      if (!isSafeColorValue(value)) return false;
+    } else if (value !== null && typeof value === "object") {
+      if (!isSafeCustomTheme(value, depth + 1)) return false;
+    } else {
+      return false; // numbers, booleans, functions, undefined — not allowed
+    }
+  }
+  return true;
 }
 
 /**

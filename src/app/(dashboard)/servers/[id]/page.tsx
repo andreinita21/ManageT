@@ -11,7 +11,7 @@ import { and, eq, ne } from "drizzle-orm";
 import { auth } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { servers, sessions as sessionsTable } from "@/lib/db/schema";
-import { rowToServer, rowToSession } from "@/lib/db/transform";
+import { toPublicServer, rowToSession } from "@/lib/db/transform";
 import {
   defaultMetricsWindow,
   fetchMetricBuckets,
@@ -54,7 +54,7 @@ export default async function ServerDetailPage({
     notFound();
   }
 
-  const initialServer = rowToServer(serverRows[0]);
+  const initialServer = toPublicServer(serverRows[0]);
   const initialMetrics = bucketRows as unknown as MetricSnapshot[];
   const initialSessions = sessionRows.map(rowToSession);
 

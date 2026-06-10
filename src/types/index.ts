@@ -36,7 +36,15 @@ export interface Server {
   username: string;
   authMethod: "key" | "password";
   privateKeyPath?: string;
+  /**
+   * AES-GCM ciphertext of the SSH password. INTERNAL ONLY — populated by
+   * `rowToServer` for the SSH/agent code paths and must never be sent to a
+   * client. API responses go through `toPublicServer`, which strips it and
+   * exposes `hasPassword` instead.
+   */
   passwordEncrypted?: string;
+  /** True when a password credential is stored. Safe to send to clients. */
+  hasPassword?: boolean;
   labels: string[];
   groupName?: string;
   status: "connected" | "disconnected" | "reconnecting" | "unreachable" | "unknown";
