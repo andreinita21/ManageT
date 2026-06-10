@@ -30,7 +30,8 @@
  * `data/agent-binaries/` cache between installs so each host builds
  * fresh for itself.
  */
-import { existsSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 /** Rust target triples the build script produces. */
@@ -106,4 +107,60 @@ export function cliBinaryExists(target: AgentTarget): boolean {
   } catch {
     return false;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Binary integrity (checksums)
+// ---------------------------------------------------------------------------
+//
+// Binaries can be built on a remote target host and then cached + redistributed
+// to the rest of the fleet and served over HTTP. To stop a single compromised
+// host (or a tampered cache file) from silently poisoning the fleet, we record
+// a SHA-256 sidecar when a binary is first cached and verify it before every
+// upload/serve. First-record is trust-on-first-use; any later mismatch is
+// refused.
+
+/** Path to a binary's checksum sidecar. */
+export function checksumPath(binaryFilePath: string): string {
+  return `${binaryFilePath}.sha256`;
+}
+
+/** Compute the SHA-256 hex digest of a file. */
+export function computeSha256(binaryFilePath: string): string {
+  return createHash("sha256").update(readFileSync(binaryFilePath)).digest("hex");
+}
+
+/** Record (or overwrite) a binary's checksum sidecar. Returns the digest. */
+export function recordChecksum(binaryFilePath: string): string {
+  const digest = computeSha256(binaryFilePath);
+  writeFileSync(checksumPath(binaryFilePath), `${digest}  managet-agent\n`);
+  return digest;
+}
+
+export interface ChecksumVerification {
+  ok: boolean;
+  actual: string;
+  expected?: string;
+  /** True when no sidecar existed and we recorded one (trust-on-first-use). */
+  recorded?: boolean;
+}
+
+/**
+ * Verify a cached binary against its recorded checksum. If no sidecar exists
+ * yet (e.g. a binary cached before checksums were introduced), record one and
+ * accept. If a sidecar exists and the file no longer matches, fail closed.
+ */
+export function verifyOrRecordChecksum(binaryFilePath: string): ChecksumVerification {
+  const actual = computeSha256(binaryFilePath);
+  let expected: string | undefined;
+  try {
+    expected = readFileSync(checksumPath(binaryFilePath), "utf8").trim().split(/\s+/)[0];
+  } catch {
+    /* no sidecar yet */
+  }
+  if (!expected) {
+    writeFileSync(checksumPath(binaryFilePath), `${actual}  managet-agent\n`);
+    return { ok: true, actual, recorded: true };
+  }
+  return { ok: actual === expected, actual, expected };
 }

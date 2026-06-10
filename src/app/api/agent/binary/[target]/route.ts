@@ -15,10 +15,15 @@
  * rather than going through HTTP, so this route is only for manual curl.
  */
 import { NextResponse } from "next/server";
-import { createReadStream, statSync, readFileSync } from "node:fs";
+import { createReadStream, statSync } from "node:fs";
 import { Readable } from "node:stream";
 import { auth } from "@/lib/auth";
-import { binaryExists, binaryPath, isAgentTarget } from "@/lib/agent/targets";
+import {
+  binaryExists,
+  binaryPath,
+  isAgentTarget,
+  verifyOrRecordChecksum,
+} from "@/lib/agent/targets";
 
 export async function GET(
   _request: Request,
@@ -41,16 +46,22 @@ export async function GET(
   }
 
   const path = binaryPath(target);
-  const size = statSync(path).size;
 
-  // Optional: include SHA256 header if the sha256 file is next to the binary.
-  let sha256: string | undefined;
-  try {
-    const sumFile = readFileSync(`${path}.sha256`, "utf8");
-    sha256 = sumFile.trim().split(/\s+/)[0];
-  } catch {
-    /* optional */
+  // Integrity gate: never serve a binary whose contents no longer match the
+  // checksum recorded when it was cached. First serve records the checksum
+  // (trust-on-first-use); a later mismatch is refused.
+  const integrity = verifyOrRecordChecksum(path);
+  if (!integrity.ok) {
+    console.error(
+      `[agent] checksum mismatch serving ${target}: expected ${integrity.expected}, got ${integrity.actual}`
+    );
+    return NextResponse.json(
+      { error: "Binary integrity check failed; refusing to serve." },
+      { status: 409 }
+    );
   }
+  const sha256 = integrity.actual;
+  const size = statSync(path).size;
 
   // Next.js 16 can consume a Web ReadableStream as the body. We convert the
   // node stream into a web stream so the runtime can pipe it efficiently.

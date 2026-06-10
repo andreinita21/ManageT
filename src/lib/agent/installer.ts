@@ -41,7 +41,9 @@ import {
   binaryPath,
   cliBinaryExists,
   cliBinaryPath,
+  recordChecksum,
   targetFromUname,
+  verifyOrRecordChecksum,
   type AgentTarget,
 } from "./targets";
 
@@ -146,6 +148,17 @@ export async function installAgent(serverId: string): Promise<InstallResult> {
     );
     if (mkdirRes.exitCode !== 0) {
       throw new Error(`mkdir staging failed: ${mkdirRes.stderr || mkdirRes.stdout}`);
+    }
+    // Integrity gate: refuse to push a cached binary whose contents no longer
+    // match the checksum recorded when it was cached. Stops a tampered cache
+    // file from being redistributed to the fleet.
+    const integrity = verifyOrRecordChecksum(localPath);
+    if (!integrity.ok) {
+      throw new Error(
+        `Refusing to upload ${target} agent binary: checksum mismatch ` +
+          `(expected ${integrity.expected}, got ${integrity.actual}). ` +
+          `The cached binary may be corrupt or tampered — rebuild it.`
+      );
     }
     await sftpUpload(client, localPath, remotePath);
     if (haveCli) {
@@ -540,6 +553,9 @@ async function buildAgentOnTarget(
     mkdirSync(dirname(localDest), { recursive: true });
     await sftpDownload(client, remoteBinary, localDest);
     await chmod(localDest, 0o755);
+    // Record the integrity checksum for the freshly-built binary so later
+    // uploads/serves can detect tampering of the cache.
+    recordChecksum(localDest);
     // Best-effort download of the second binary. If `cargo build` didn't
     // produce it (older source tree, missing [[bin]] entry, etc.), fall
     // through silently — the agent's installer falls back to a symlink.
