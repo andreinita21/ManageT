@@ -4,7 +4,7 @@
  * DELETE /api/restart-policies/[id] — delete a rule
  */
 import { NextResponse } from "next/server";
-import { auth } from "@/lib/auth";
+import { requireRole } from "@/lib/auth/guard";
 import { db } from "@/lib/db";
 import { restartRules } from "@/lib/db/schema";
 import { eq } from "drizzle-orm";
@@ -14,7 +14,8 @@ import type { RestartRule } from "@/types";
 const updateRuleSchema = z.object({
   scope: z.enum(["global", "server", "session"]).optional(),
   scopeId: z.string().nullable().optional(),
-  pattern: z.string().min(1).optional(),
+  // Bounded to limit ReDoS exposure for regex patterns (see POST route).
+  pattern: z.string().min(1).max(500).optional(),
   patternType: z.enum(["glob", "regex", "exact"]).optional(),
   action: z.enum(["auto", "ask", "never"]).optional(),
   priority: z.number().int().optional(),
@@ -34,10 +35,8 @@ export async function PUT(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const session = await auth();
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const gate = await requireRole("operator");
+  if (gate instanceof NextResponse) return gate;
 
   const { id } = await params;
 
@@ -91,10 +90,8 @@ export async function DELETE(
   _request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const session = await auth();
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const gate = await requireRole("operator");
+  if (gate instanceof NextResponse) return gate;
 
   const { id } = await params;
   const existing = await db

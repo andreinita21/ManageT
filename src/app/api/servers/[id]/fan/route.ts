@@ -18,7 +18,7 @@ import { NextResponse } from "next/server";
 import { eq } from "drizzle-orm";
 import { z } from "zod";
 
-import { auth } from "@/lib/auth";
+import { requireRole } from "@/lib/auth/guard";
 import { db } from "@/lib/db";
 import { servers } from "@/lib/db/schema";
 
@@ -37,10 +37,9 @@ export async function PUT(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const session = await auth();
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  // Fan control writes to host hardware (PWM/SMC) — admin only.
+  const gate = await requireRole("admin");
+  if (gate instanceof NextResponse) return gate;
 
   const { id } = await params;
   const rows = await db.select().from(servers).where(eq(servers.id, id)).limit(1);

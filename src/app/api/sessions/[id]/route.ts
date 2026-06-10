@@ -5,7 +5,7 @@
  * DELETE /api/sessions/[id] — kill the session and remove it
  */
 import { NextResponse } from "next/server";
-import { auth } from "@/lib/auth";
+import { requireRole } from "@/lib/auth/guard";
 import { db } from "@/lib/db";
 import { sessions } from "@/lib/db/schema";
 import { rowToSession } from "@/lib/db/transform";
@@ -29,10 +29,8 @@ export async function GET(
   _request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const session = await auth();
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const gate = await requireRole("viewer");
+  if (gate instanceof NextResponse) return gate;
 
   const { id } = await params;
   const rows = await db
@@ -52,10 +50,8 @@ export async function PUT(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const session = await auth();
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const gate = await requireRole("operator");
+  if (gate instanceof NextResponse) return gate;
 
   const { id } = await params;
 
@@ -134,10 +130,8 @@ export async function DELETE(
   _request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const session = await auth();
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const gate = await requireRole("operator");
+  if (gate instanceof NextResponse) return gate;
 
   const { id } = await params;
 

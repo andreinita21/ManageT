@@ -5,7 +5,7 @@
  */
 import { NextResponse } from "next/server";
 import { eq } from "drizzle-orm";
-import { auth } from "@/lib/auth";
+import { requireRole } from "@/lib/auth/guard";
 import { db } from "@/lib/db";
 import { stacks } from "@/lib/db/schema";
 import { getStack } from "@/lib/stacks";
@@ -14,10 +14,8 @@ export async function POST(
   _request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const session = await auth();
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const gate = await requireRole("operator");
+  if (gate instanceof NextResponse) return gate;
   const { id } = await params;
   const existing = await db
     .select()

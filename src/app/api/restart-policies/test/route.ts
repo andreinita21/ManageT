@@ -3,7 +3,7 @@
  * POST /api/restart-policies/test — test a command against rules (placeholder)
  */
 import { NextResponse } from "next/server";
-import { auth } from "@/lib/auth";
+import { requireRole } from "@/lib/auth/guard";
 import { db } from "@/lib/db";
 import { restartRules } from "@/lib/db/schema";
 import { z } from "zod";
@@ -11,16 +11,14 @@ import { classifyCommand } from "@/lib/restart/classify";
 import type { RestartRule, TestRestartRuleResponse } from "@/types";
 
 const testRuleSchema = z.object({
-  command: z.string().min(1),
+  command: z.string().min(1).max(4_000),
   serverId: z.string().optional(),
   sessionId: z.string().optional(),
 });
 
 export async function POST(request: Request) {
-  const session = await auth();
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const gate = await requireRole("operator");
+  if (gate instanceof NextResponse) return gate;
 
   let body: unknown;
   try {

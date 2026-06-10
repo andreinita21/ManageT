@@ -17,6 +17,7 @@ import { z } from "zod";
 import { eq } from "drizzle-orm";
 
 import { auth } from "@/lib/auth";
+import { requireRole } from "@/lib/auth/guard";
 import { db } from "@/lib/db";
 import { stacks } from "@/lib/db/schema";
 import { getStack, replaceServicesForStack } from "@/lib/stacks";
@@ -54,10 +55,8 @@ export async function PUT(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const session = await auth();
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const gate = await requireRole("operator");
+  if (gate instanceof NextResponse) return gate;
   const { id } = await params;
   let body: unknown;
   try {
@@ -100,10 +99,8 @@ export async function DELETE(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const session = await auth();
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const gate = await requireRole("operator");
+  if (gate instanceof NextResponse) return gate;
   const { id } = await params;
   const force = new URL(request.url).searchParams.get("force") === "true";
   if (force) {

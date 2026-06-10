@@ -4,17 +4,16 @@
  * show a "3/4 launched" badge etc.
  */
 import { NextResponse } from "next/server";
-import { auth } from "@/lib/auth";
+import { requireRole } from "@/lib/auth/guard";
 import { launchStack } from "@/lib/stacks";
 
 export async function POST(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const session = await auth();
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  // Launching a stack spawns shell sessions on hosts — operator+.
+  const gate = await requireRole("operator");
+  if (gate instanceof NextResponse) return gate;
   const { id } = await params;
   // Launch is idempotent by default — services with an active session
   // (matched by stackId+serverId+sessionName) are reused instead of

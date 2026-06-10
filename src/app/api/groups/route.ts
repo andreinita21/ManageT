@@ -7,6 +7,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 
 import { auth } from "@/lib/auth";
+import { requireRole } from "@/lib/auth/guard";
 import {
   cleanupAllEmptyGroups,
   createGroupWithFirstMember,
@@ -32,10 +33,8 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
-  const session = await auth();
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const gate = await requireRole("operator");
+  if (gate instanceof NextResponse) return gate;
   let body: unknown;
   try {
     body = await request.json();
@@ -53,7 +52,7 @@ export async function POST(request: Request) {
     const group = await createGroupWithFirstMember({
       name: parsed.data.name,
       sessionId: parsed.data.sessionId,
-      createdBy: session.user.id,
+      createdBy: gate.id,
     });
     return NextResponse.json({ data: group }, { status: 201 });
   } catch (err) {

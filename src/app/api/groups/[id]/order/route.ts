@@ -5,7 +5,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
-import { auth } from "@/lib/auth";
+import { requireRole } from "@/lib/auth/guard";
 import { GroupConstraintError, reorderMembers } from "@/lib/groups";
 
 const reorderSchema = z.object({
@@ -16,10 +16,8 @@ export async function PUT(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const session = await auth();
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const gate = await requireRole("operator");
+  if (gate instanceof NextResponse) return gate;
   const { id } = await params;
   let body: unknown;
   try {

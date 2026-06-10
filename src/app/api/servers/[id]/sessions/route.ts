@@ -11,6 +11,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { and, eq, ne } from "drizzle-orm";
 import { auth } from "@/lib/auth";
+import { requireRole } from "@/lib/auth/guard";
 import { db } from "@/lib/db";
 import { sessions, servers } from "@/lib/db/schema";
 import { rowToSession } from "@/lib/db/transform";
@@ -59,10 +60,9 @@ export async function POST(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const session = await auth();
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  // Spawning a session runs a shell on the host via the agent — operator+.
+  const gate = await requireRole("operator");
+  if (gate instanceof NextResponse) return gate;
   const { id: serverId } = await params;
 
   let body: unknown = {};

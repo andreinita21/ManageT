@@ -6,17 +6,15 @@
  */
 import { NextResponse } from "next/server";
 
-import { auth } from "@/lib/auth";
+import { requireRole } from "@/lib/auth/guard";
 import { GroupConstraintError, removeMember } from "@/lib/groups";
 
 export async function DELETE(
   _request: Request,
   { params }: { params: Promise<{ id: string; sessionId: string }> }
 ) {
-  const session = await auth();
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const gate = await requireRole("operator");
+  if (gate instanceof NextResponse) return gate;
   const { id, sessionId } = await params;
   try {
     const group = await removeMember(id, sessionId);

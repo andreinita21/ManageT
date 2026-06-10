@@ -8,7 +8,7 @@
 import { NextResponse } from "next/server";
 import { eq } from "drizzle-orm";
 
-import { auth } from "@/lib/auth";
+import { requireRole } from "@/lib/auth/guard";
 import { db } from "@/lib/db";
 import { servers } from "@/lib/db/schema";
 import { retryInstall } from "@/lib/agent/installer";
@@ -17,10 +17,9 @@ export async function POST(
   _request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const session = await auth();
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  // Re-runs the SSH-push installer with stored credentials — admin only.
+  const gate = await requireRole("admin");
+  if (gate instanceof NextResponse) return gate;
 
   const { id } = await params;
   const rows = await db.select().from(servers).where(eq(servers.id, id)).limit(1);

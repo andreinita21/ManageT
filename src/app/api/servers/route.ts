@@ -5,6 +5,7 @@
  */
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
+import { requireRole } from "@/lib/auth/guard";
 import { db } from "@/lib/db";
 import { servers } from "@/lib/db/schema";
 import { toPublicServer } from "@/lib/db/transform";
@@ -40,10 +41,10 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
-  const session = await auth();
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  // Creating a server triggers an SSH-push agent install with stored
+  // credentials — admin only.
+  const gate = await requireRole("admin");
+  if (gate instanceof NextResponse) return gate;
 
   let body: unknown;
   try {
@@ -82,7 +83,7 @@ export async function POST(request: Request) {
     groupName: input.groupName ?? null,
     status: "unknown",
     lastConnectedAt: null,
-    createdBy: session.user.id,
+    createdBy: gate.id,
     createdAt: now,
     updatedAt: now,
   });

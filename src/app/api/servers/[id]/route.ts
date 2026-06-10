@@ -6,6 +6,7 @@
  */
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
+import { requireRole } from "@/lib/auth/guard";
 import { db } from "@/lib/db";
 import { servers } from "@/lib/db/schema";
 import { toPublicServer } from "@/lib/db/transform";
@@ -82,10 +83,10 @@ export async function PUT(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const session = await auth();
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  // Editing a server can change stored credentials and push an agent
+  // reconfigure over SSH — admin only.
+  const gate = await requireRole("admin");
+  if (gate instanceof NextResponse) return gate;
 
   const { id } = await params;
 
@@ -191,10 +192,9 @@ export async function DELETE(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const session = await auth();
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  // Deleting a server uninstalls the remote agent over SSH — admin only.
+  const gate = await requireRole("admin");
+  if (gate instanceof NextResponse) return gate;
 
   const { id } = await params;
   const url = new URL(request.url);

@@ -5,6 +5,7 @@
  */
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
+import { requireRole } from "@/lib/auth/guard";
 import { db } from "@/lib/db";
 import { restartRules } from "@/lib/db/schema";
 import { v4 as uuidv4 } from "uuid";
@@ -14,7 +15,9 @@ import type { RestartRule } from "@/types";
 const createRuleSchema = z.object({
   scope: z.enum(["global", "server", "session"]),
   scopeId: z.string().optional(),
-  pattern: z.string().min(1),
+  // Bounded to limit catastrophic-backtracking (ReDoS) exposure when a
+  // patternType="regex" rule is later compiled and matched.
+  pattern: z.string().min(1).max(500),
   patternType: z.enum(["glob", "regex", "exact"]),
   action: z.enum(["auto", "ask", "never"]),
   priority: z.number().int().optional().default(0),
@@ -43,10 +46,8 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
-  const session = await auth();
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const gate = await requireRole("operator");
+  if (gate instanceof NextResponse) return gate;
 
   let body: unknown;
   try {
@@ -75,7 +76,7 @@ export async function POST(request: Request) {
     patternType: input.patternType,
     action: input.action,
     priority: input.priority,
-    createdBy: session.user.id,
+    createdBy: gate.id,
     createdAt: now,
   });
 
@@ -87,7 +88,7 @@ export async function POST(request: Request) {
     patternType: input.patternType,
     action: input.action,
     priority: input.priority,
-    createdBy: session.user.id,
+    createdBy: gate.id,
     createdAt: now,
   };
 

@@ -12,6 +12,7 @@ import { v4 as uuidv4 } from "uuid";
 import { z } from "zod";
 import { isNull, isNotNull } from "drizzle-orm";
 import { auth } from "@/lib/auth";
+import { requireRole } from "@/lib/auth/guard";
 import { db } from "@/lib/db";
 import { stacks, stackServices } from "@/lib/db/schema";
 import type { Stack, StackService } from "@/types";
@@ -83,10 +84,8 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
-  const session = await auth();
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const gate = await requireRole("operator");
+  if (gate instanceof NextResponse) return gate;
   let body: unknown;
   try {
     body = await request.json();
@@ -108,7 +107,7 @@ export async function POST(request: Request) {
     id: stackId,
     name: input.name,
     description: input.description ?? null,
-    createdBy: session.user.id,
+    createdBy: gate.id,
     createdAt: now,
     updatedAt: now,
   });
@@ -141,7 +140,7 @@ export async function POST(request: Request) {
     id: stackId,
     name: input.name,
     description: input.description,
-    createdBy: session.user.id,
+    createdBy: gate.id,
     createdAt: now,
     updatedAt: now,
     services,
