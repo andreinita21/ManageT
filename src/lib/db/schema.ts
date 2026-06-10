@@ -25,6 +25,9 @@ export const userCliTokens = sqliteTable("user_cli_tokens", {
   createdAt: integer("created_at").notNull(),
   lastUsedAt: integer("last_used_at"),
   revokedAt: integer("revoked_at"),
+  // Absolute expiry (epoch ms). NULL = legacy token with no expiry (still
+  // honored for backwards compatibility); new tokens always set this.
+  expiresAt: integer("expires_at"),
 });
 
 export const servers = sqliteTable("servers", {

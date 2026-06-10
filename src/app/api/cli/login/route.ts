@@ -10,6 +10,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 
 import { createCliToken } from "@/lib/cli-auth";
+import { RateLimiter, clientIpFromRequest } from "@/lib/rate-limit";
 
 const loginSchema = z.object({
   username: z.string().trim().min(1),
@@ -17,7 +18,21 @@ const loginSchema = z.object({
   name: z.string().trim().min(1).max(80).optional(),
 });
 
+// Brute-force protection: this endpoint mints a bearer token, so throttle by
+// client IP. 10 attempts per 5 minutes is generous for a human and cuts an
+// online guessing attack to a crawl.
+const loginLimiter = new RateLimiter(10, 5 * 60_000);
+
 export async function POST(request: Request) {
+  const ip = clientIpFromRequest(request);
+  const limit = loginLimiter.check(`cli-login:${ip}`, Date.now());
+  if (!limit.allowed) {
+    return NextResponse.json(
+      { error: "Too many login attempts. Try again later." },
+      { status: 429, headers: { "Retry-After": String(limit.retryAfterSec) } }
+    );
+  }
+
   let body: unknown;
   try {
     body = await request.json();
@@ -35,6 +50,8 @@ export async function POST(request: Request) {
 
   try {
     const data = await createCliToken(parsed.data);
+    // Successful login: clear the IP's failure budget.
+    loginLimiter.reset(`cli-login:${ip}`);
     return NextResponse.json({ data });
   } catch {
     return NextResponse.json(

@@ -1,11 +1,11 @@
 import { randomBytes } from "node:crypto";
 import { v4 as uuidv4 } from "uuid";
-import { eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 
 import { verifyPassword } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { userCliTokens, users } from "@/lib/db/schema";
-import { CLI_TOKEN_PREFIX, hashCliToken } from "./token";
+import { CLI_TOKEN_PREFIX, CLI_TOKEN_TTL_MS, hashCliToken } from "./token";
 export { extractBearerToken, getUserIdForCliToken, requireCliUserId } from "./token";
 
 export async function createCliToken(input: {
@@ -36,10 +36,28 @@ export async function createCliToken(input: {
     createdAt: now,
     lastUsedAt: now,
     revokedAt: null,
+    expiresAt: now + CLI_TOKEN_TTL_MS,
   });
 
   return {
     token,
     user: { id: user.id, username: user.username, role: user.role },
   };
+}
+
+/**
+ * Revoke every active CLI token belonging to a user ("log out all CLI
+ * sessions"). Idempotent. Returns the number of tokens revoked.
+ */
+export async function revokeAllCliTokensForUser(userId: string): Promise<number> {
+  const active = await db
+    .select({ id: userCliTokens.id })
+    .from(userCliTokens)
+    .where(and(eq(userCliTokens.userId, userId), isNull(userCliTokens.revokedAt)));
+  if (active.length === 0) return 0;
+  await db
+    .update(userCliTokens)
+    .set({ revokedAt: Date.now() })
+    .where(and(eq(userCliTokens.userId, userId), isNull(userCliTokens.revokedAt)));
+  return active.length;
 }
