@@ -10,11 +10,13 @@
 //!      both sides switch to raw bytes for the lifetime of the
 //!      connection. Otherwise the server closes after the response.
 //!
-//! Permissions: we chmod the socket to 0666 so any local user on the
-//! box can list/attach. Sessions inherit the agent's UID (root, in our
-//! deployment), which means `managet attach` puts the user in a root
-//! shell. For the single-admin Pi/Mini setup this is acceptable; per-
-//! user session isolation is a follow-up.
+//! Permissions: the socket is chmod 0666 so any local user on the box
+//! can connect, but connecting is not the same as being trusted. Every
+//! `New` request is authorized against the peer's verified SO_PEERCRED
+//! UID (see `authorize_user`): a non-root peer can only open a session
+//! running as themselves, never as root or another user. Root peers are
+//! fully trusted. This makes the open socket safe — it grants a caller
+//! exactly the privileges they already have on the host, nothing more.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -88,7 +90,67 @@ pub async fn run(manager: Arc<SessionManager>, path: &Path) -> Result<()> {
     }
 }
 
+/// Authorize the requested target user for a session against the
+/// connecting peer's verified SO_PEERCRED uid.
+///
+/// Returns the username the session must run as (`None` means "the
+/// agent's own identity", which is only ever returned for a root peer).
+/// A non-root peer is pinned to their own identity: an absent `user`
+/// defaults to them (never the agent's root), and an explicit `user` is
+/// only honored if it resolves to their own uid. This is what makes the
+/// world-connectable socket safe — it never grants more privilege than
+/// the caller already has.
+fn authorize_user(peer_uid: u32, requested: Option<String>) -> Result<Option<String>, String> {
+    // Root peers are fully trusted: the kernel already lets root act as
+    // anyone, so honor whatever they ask for (None = agent identity).
+    if peer_uid == 0 {
+        return Ok(requested);
+    }
+
+    // Non-root peer: resolve their own name so we can default to it and
+    // validate any explicit request against it.
+    let peer = match nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(peer_uid)) {
+        Ok(Some(u)) => u,
+        Ok(None) => return Err(format!("connecting uid {peer_uid} has no passwd entry")),
+        Err(e) => return Err(format!("looking up connecting uid {peer_uid}: {e}")),
+    };
+
+    match requested {
+        // No explicit user → drop to the peer, never the agent's root.
+        None => Ok(Some(peer.name)),
+        // Explicit user must resolve to the peer's own uid.
+        Some(name) => {
+            let target = nix::unistd::User::from_name(&name)
+                .map_err(|e| format!("looking up user '{name}': {e}"))?
+                .ok_or_else(|| format!("user '{name}' does not exist on this host"))?;
+            if target.uid.as_raw() == peer_uid {
+                Ok(Some(name))
+            } else {
+                Err(format!(
+                    "not permitted to open a session as '{name}' (you are uid {peer_uid})"
+                ))
+            }
+        }
+    }
+}
+
 async fn handle_client(stream: UnixStream, manager: Arc<SessionManager>) -> Result<()> {
+    // Read the peer's credentials *before* splitting the stream. We fail
+    // closed: if the kernel won't tell us who connected, we refuse.
+    let peer_uid = match stream.peer_cred() {
+        Ok(cred) => cred.uid(),
+        Err(e) => {
+            let (_, mut wr) = stream.into_split();
+            let _ = send_resp(
+                &mut wr,
+                &Response::Error {
+                    message: format!("cannot read peer credentials: {e}"),
+                },
+            )
+            .await;
+            return Ok(());
+        }
+    };
     let (rd, mut wr) = stream.into_split();
     let mut reader = BufReader::new(rd);
     let mut req_line = String::new();
@@ -154,6 +216,17 @@ async fn handle_client(stream: UnixStream, manager: Arc<SessionManager>) -> Resu
                     return Ok(());
                 }
             }
+            // Bind the session to the connecting peer's identity. A
+            // non-root caller can never escalate to root or impersonate
+            // another user via the `user` field; root callers keep full
+            // flexibility.
+            let user = match authorize_user(peer_uid, user) {
+                Ok(u) => u,
+                Err(message) => {
+                    send_resp(&mut wr, &Response::Error { message }).await?;
+                    return Ok(());
+                }
+            };
             match manager.create(name, command, r, c, user, cwd) {
                 Ok(sess) => {
                     // Snapshot the name *before* the `await` so we don't

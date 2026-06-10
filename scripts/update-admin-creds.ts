@@ -1,18 +1,23 @@
 /**
  * One-off: rename the existing admin user and reset their password.
  *
- *   npx tsx scripts/update-admin-creds.ts
+ *   MANAGET_ADMIN_PASSWORD='…' npx tsx scripts/update-admin-creds.ts
+ *   (optionally MANAGET_ADMIN_USERNAME, defaults to "admin")
  *
- * Hardcodes the new credentials per the user's request. Idempotent —
+ * Credentials come from the environment — never hardcode them. Idempotent;
  * re-running just rewrites the row.
  */
 import { eq } from "drizzle-orm";
 import { hashPassword } from "../src/lib/auth/index.js";
 import { db } from "../src/lib/db/index.js";
 import { users } from "../src/lib/db/schema.js";
+import { requireEnv } from "./_creds.js";
 
-const NEW_USERNAME = "andrei";
-const NEW_PASSWORD = "2006";
+const NEW_USERNAME = process.env.MANAGET_ADMIN_USERNAME || "admin";
+const NEW_PASSWORD = requireEnv(
+  "MANAGET_ADMIN_PASSWORD",
+  "Choose a strong new admin password."
+);
 
 async function main() {
   // Find the existing admin row (by role first, falling back to the seed
@@ -47,7 +52,7 @@ async function main() {
     .where(eq(users.id, target.id));
 
   console.log(
-    `Updated admin user ${target.id.slice(0, 8)}: username=${NEW_USERNAME}, password=${NEW_PASSWORD}`
+    `Updated admin user ${target.id.slice(0, 8)}: username=${NEW_USERNAME}, password=(set via MANAGET_ADMIN_PASSWORD)`
   );
 }
 

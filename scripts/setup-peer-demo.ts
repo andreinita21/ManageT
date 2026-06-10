@@ -9,14 +9,16 @@
  *   4. Launch the stack and report per-service status + the URLs to
  *      open in a browser.
  *
- *   MANAGET_DEV_PASSWORD='2006' npx tsx scripts/setup-peer-demo.ts
+ *   MANAGET_ADMIN_PASSWORD='…' MANAGET_DEV_PASSWORD='…' \
+ *     npx tsx scripts/setup-peer-demo.ts
  */
 import { readFileSync } from "node:fs";
 import { Client, type SFTPWrapper } from "ssh2";
+import { adminPassword } from "./_creds.js";
 
 const BASE = "http://localhost:3000";
 const ADMIN_EMAIL = "andrei@test.com";
-const ADMIN_PASSWORD = "2006";
+const ADMIN_PASSWORD = adminPassword();
 const PI_HOST = "192.168.100.82";
 const MAC_HOST = "192.168.100.95";
 

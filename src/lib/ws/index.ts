@@ -712,12 +712,30 @@ export function handleUpgrade(
   socket: Duplex,
   head: Buffer
 ): void {
+  // The raw upgrade socket can emit 'error' (ECONNRESET/EPIPE) at any time,
+  // including during the awaited auth work below. With no listener, Node
+  // re-throws on the socket and crashes the whole process (a pre-auth remote
+  // DoS). Attach a listener first so a client reset just tears down the one
+  // connection.
+  socket.on("error", () => {
+    socket.destroy();
+  });
+
+  // Best-effort write that never throws on an already-dead socket.
+  const refuse = (statusLine: string) => {
+    try {
+      if (!socket.destroyed) socket.write(statusLine);
+    } catch {
+      /* socket already gone */
+    }
+    socket.destroy();
+  };
+
   if (!isOriginAllowed(req)) {
     console.log(
       `[WS] upgrade rejected: origin '${req.headers.origin ?? "<none>"}' not allowed for host '${req.headers.host ?? "<none>"}'`
     );
-    socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
-    socket.destroy();
+    refuse("HTTP/1.1 403 Forbidden\r\n\r\n");
     return;
   }
   // `extractUserId` is now async (it verifies the JWT). The upgrade
@@ -728,10 +746,11 @@ export function handleUpgrade(
   // legitimate browser will reconnect over a fresh TCP handshake.
   void (async () => {
     const userId = await extractUserId(req);
+    // The client may have reset the connection while we verified the JWT.
+    if (socket.destroyed) return;
     if (!userId) {
       console.log("[WS] upgrade rejected: invalid or missing session");
-      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
-      socket.destroy();
+      refuse("HTTP/1.1 401 Unauthorized\r\n\r\n");
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws: WebSocket) => {

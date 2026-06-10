@@ -7,11 +7,13 @@
  *   4. List trashed afterwards: should be empty (assuming nothing else
  *      was already in the trash).
  *
- *   npx tsx scripts/smoke-trash.ts
+ *   MANAGET_ADMIN_PASSWORD='…' npx tsx scripts/smoke-trash.ts
  */
+import { adminPassword } from "./_creds.js";
+
 const BASE = "http://localhost:3000";
 const ADMIN_EMAIL = "andrei@test.com";
-const ADMIN_PASSWORD = "2006";
+const ADMIN_PASSWORD = adminPassword();
 
 interface Cookies { jar: Map<string, string> }
 const cookieHeader = (c: Cookies) =>

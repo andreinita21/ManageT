@@ -2,8 +2,10 @@
  * Trigger an install-retry on the Mac mini (192.168.100.95). Used after
  * fixing agent source code so the dashboard rebuilds + redeploys.
  *
- *   MANAGET_DEV_PASSWORD='2006' npx tsx scripts/dev-retry-mac.ts
+ *   MANAGET_ADMIN_PASSWORD='…' npx tsx scripts/dev-retry-mac.ts
  */
+import { adminPassword } from "./_creds.js";
+
 const BASE = "http://localhost:3000";
 
 interface Cookies { jar: Map<string, string> }
@@ -28,7 +30,7 @@ async function login(): Promise<Cookies> {
   const body = new URLSearchParams({
     csrfToken,
     email: "admin@managet.local",
-    password: "admin",
+    password: adminPassword(),
     callbackUrl: `${BASE}/dashboard`,
     json: "true",
   });

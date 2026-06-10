@@ -154,7 +154,12 @@ class AlertEngine extends EventEmitter {
 
   /** Bound handler so we can cleanly remove the listener. */
   private handleSnapshot = (snapshot: MetricSnapshot): void => {
-    void this.evaluate(snapshot);
+    // evaluate() awaits DB writes; a transient failure (locked DB, disk
+    // full, constraint) must not become an unhandled rejection that takes
+    // down the single dashboard process. Log and keep the listener alive.
+    void this.evaluate(snapshot).catch((err) => {
+      console.error("[alert-engine] evaluate failed:", err);
+    });
   };
 
   /**

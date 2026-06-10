@@ -58,3 +58,4 @@ next-env.d.ts
 
 # Benchmark output (regenerate with scripts/benchmark-memory-storage.py)
 /reports/
+__pycache__/

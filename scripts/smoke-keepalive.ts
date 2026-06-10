@@ -19,11 +19,12 @@
  */
 import { exec } from "node:child_process";
 import { WebSocket } from "ws";
+import { adminPassword } from "./_creds.js";
 
 const BASE = "http://localhost:3000";
 const PI_HOST = "192.168.100.82";
 const ADMIN_EMAIL = "admin@managet.local";
-const ADMIN_PASSWORD = "admin";
+const ADMIN_PASSWORD = adminPassword();
 
 interface Cookies { jar: Map<string, string> }
 function cookieHeader(c: Cookies): string {

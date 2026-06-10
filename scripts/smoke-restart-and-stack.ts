@@ -13,6 +13,7 @@
 import { exec, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { WebSocket } from "ws";
+import { adminPassword } from "./_creds.js";
 
 const BASE = "http://localhost:3000";
 const PI_HOST = "192.168.100.82";
@@ -48,7 +49,7 @@ async function login(): Promise<Cookies> {
     body: new URLSearchParams({
       csrfToken,
       email: "admin@managet.local",
-      password: "admin",
+      password: adminPassword(),
       callbackUrl: `${BASE}/dashboard`,
       json: "true",
     }),

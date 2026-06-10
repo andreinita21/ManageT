@@ -30,7 +30,9 @@ async fn main() -> Result<()> {
         Command::Run => reporter::run_loop().await,
         Command::Uninstall => installer::run_uninstall().await,
         Command::Status => collector::print_status_snapshot(),
-        Command::Ls => sessions::client::run_ls(None).await.map(|_| ()),
+        // No dashboard annotations available from the bare agent binary,
+        // so list everything (include grouped sessions).
+        Command::Ls => sessions::client::run_ls(None, true).await.map(|_| ()),
         Command::New { name, name_flag, command, no_attach } => {
             // Positional name wins if both are given (defensible default
             // when an old script with `-n foo` is invoked alongside a

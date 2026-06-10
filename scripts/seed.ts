@@ -2,16 +2,22 @@
  * Seed script for ManageT.
  * Creates a default admin user in the database.
  *
- * Usage: npx tsx scripts/seed.ts
+ * Usage:
+ *   MANAGET_ADMIN_PASSWORD='…' npx tsx scripts/seed.ts
+ *   (optionally MANAGET_ADMIN_USERNAME, defaults to "admin")
  */
 import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { execSync } from "node:child_process";
 import { v4 as uuidv4 } from "uuid";
 import { eq } from "drizzle-orm";
+import { requireEnv } from "./_creds.js";
 
-const USERNAME = "andrei";
-const PASSWORD = "2006";
+const USERNAME = process.env.MANAGET_ADMIN_USERNAME || "admin";
+const PASSWORD = requireEnv(
+  "MANAGET_ADMIN_PASSWORD",
+  "Choose a strong password for the seeded admin user."
+);
 const ROLE = "admin" as const;
 
 async function seed() {
@@ -61,7 +67,7 @@ async function seed() {
   console.log("");
   console.log("=== Default Admin User Created ===");
   console.log(`  Username: ${USERNAME}`);
-  console.log(`  Password: ${PASSWORD}`);
+  console.log(`  Password: (set via MANAGET_ADMIN_PASSWORD)`);
   console.log(`  Role:     ${ROLE}`);
   console.log("==================================");
   console.log("");

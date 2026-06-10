@@ -91,12 +91,20 @@ async function downsample(
 function startPruner(): void {
   if (pruneTimer !== null) return;
 
-  // Run once immediately, then every hour
-  void pruneOnce();
+  // Run once immediately, then every hour. A rejected prune (locked DB,
+  // disk error) must not become an unhandled rejection that crashes the
+  // process — log it and let the next interval retry.
+  const runPrune = () => {
+    void pruneOnce().catch((err) => {
+      console.error("[pruner] pruneOnce failed:", err);
+    });
+  };
 
-  pruneTimer = setInterval(() => {
-    void pruneOnce();
-  }, PRUNE_INTERVAL);
+  runPrune();
+
+  pruneTimer = setInterval(runPrune, PRUNE_INTERVAL);
+  // Don't let the prune timer keep the event loop alive on shutdown.
+  pruneTimer.unref?.();
 }
 
 /**

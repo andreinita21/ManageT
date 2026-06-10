@@ -10,6 +10,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { Client } from "ssh2";
 import Database from "better-sqlite3";
 import { decryptPassword } from "../src/lib/crypto";
+import { requireEnv } from "./_creds.js";
 
 if (existsSync(".env.local")) {
   for (const line of readFileSync(".env.local", "utf8").split("\n")) {
@@ -146,13 +147,15 @@ async function main() {
   const miniC = await sshConnect(mini, miniPwd);
 
   step("1", "Pi agent: rewrite config + restart systemd unit");
-  // Token recovered from the inventory dump that ran before the heredoc bug
-  // truncated /etc/managet-agent/config.toml to 0 bytes. The dashboard's
-  // agent_token_hash for the Pi row is sha256 of this string, so reusing it
-  // means we don't need to re-mint and update the DB.
+  // The Pi's agent token must match the dashboard's agent_token_hash
+  // (sha256 of the plaintext). Pass it via the environment rather than
+  // hardcoding it — committed tokens leak into git history forever.
   await rewriteConfig(piC, piPwd, "/etc/managet-agent/config.toml", "http://127.0.0.1:3000", {
     serverId: PI_ID,
-    token: "9d408091b3c16d5ed219880de975205acd28680073a7f9a200fcbecd29fe6279",
+    token: requireEnv(
+      "MANAGET_PI_AGENT_TOKEN",
+      "The Pi's agent token (matching its agent_token_hash in the DB)."
+    ),
   });
   const piRestart = await sudo(
     piC,

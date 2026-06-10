@@ -5,11 +5,14 @@
  * fails.
  *
  * Usage:
- *   MANAGET_DEV_PASSWORD='2006' npx tsx scripts/dev-add-servers.ts
+ *   MANAGET_ADMIN_PASSWORD='…' MANAGET_DEV_PASSWORD='…' \
+ *     npx tsx scripts/dev-add-servers.ts
  */
+import { adminPassword } from "./_creds.js";
+
 const BASE = process.env.MANAGET_BASE_URL || "http://localhost:3000";
 const ADMIN_EMAIL = "admin@managet.local";
-const ADMIN_PASSWORD = "admin";
+const ADMIN_PASSWORD = adminPassword();
 const DEV_PASSWORD = process.env.MANAGET_DEV_PASSWORD;
 if (!DEV_PASSWORD) {
   console.error("MANAGET_DEV_PASSWORD must be set");

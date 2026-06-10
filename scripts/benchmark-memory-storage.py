@@ -39,7 +39,11 @@ from pathlib import Path
 REPO_ROOT = Path("/home/andrei/managet")
 REPORT_DIR = REPO_ROOT / "reports"
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
-SSH_PASSWORD = "2006"
+# SSH password for the dev hosts comes from the environment — never hardcode
+# secrets in committed scripts. e.g. MANAGET_DEV_PASSWORD='…' python3 scripts/benchmark-memory-storage.py
+SSH_PASSWORD = os.environ.get("MANAGET_DEV_PASSWORD")
+if not SSH_PASSWORD:
+    raise SystemExit("Set MANAGET_DEV_PASSWORD before running this benchmark.")
 SSH_OPTS = [
     "-o", "StrictHostKeyChecking=no",
     "-o", "UserKnownHostsFile=/dev/null",
