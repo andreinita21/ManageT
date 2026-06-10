@@ -6,7 +6,10 @@
 import { EventEmitter } from "node:events";
 import { Client } from "ssh2";
 import { readFileSync } from "node:fs";
+import { eq } from "drizzle-orm";
 import { decryptPassword } from "@/lib/crypto";
+import { db } from "@/lib/db";
+import { servers as serversTable } from "@/lib/db/schema";
 import type { Server } from "@/types";
 
 /** Events emitted by the ConnectionPool */
@@ -103,6 +106,37 @@ export class ConnectionPool extends EventEmitter<ConnectionPoolEvents> {
         keepaliveInterval: 15000,
         keepaliveCountMax: 3,
         readyTimeout: 20000,
+        // Host-key verification (trust-on-first-use). ssh2's default accepts
+        // ANY host key, so an on-path attacker could impersonate a managed
+        // host and capture the password/sudo creds we send. With hostHash set,
+        // hostVerifier receives the SHA-256 fingerprint as a hex string.
+        hostHash: "sha256",
+        hostVerifier: (fingerprint: string): boolean => {
+          const known = server.hostKeyFingerprint;
+          if (!known) {
+            // First connection: record the fingerprint and trust it.
+            try {
+              db.update(serversTable)
+                .set({ hostKeyFingerprint: fingerprint })
+                .where(eq(serversTable.id, server.id))
+                .run();
+              server.hostKeyFingerprint = fingerprint;
+              console.log(
+                `[SSH] learned host key for server ${server.id} (${server.host})`
+              );
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              console.error(`[SSH] failed to persist host key for ${server.id}: ${msg}`);
+            }
+            return true;
+          }
+          if (fingerprint === known) return true;
+          console.error(
+            `[SSH] HOST KEY MISMATCH for server ${server.id} (${server.host}) — refusing connection. ` +
+              `If the host was legitimately rebuilt, clear its stored fingerprint to re-trust.`
+          );
+          return false;
+        },
       };
 
       if (server.authMethod === "key" && server.privateKeyPath) {

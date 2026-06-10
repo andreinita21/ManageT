@@ -22,6 +22,7 @@ export function rowToServer(r: ServerRow): Server {
     authMethod: r.authMethod as Server["authMethod"],
     privateKeyPath: r.privateKeyPath ?? undefined,
     passwordEncrypted: r.passwordEncrypted ?? undefined,
+    hostKeyFingerprint: r.hostKeyFingerprint ?? undefined,
     labels: JSON.parse(r.labels) as string[],
     groupName: r.groupName ?? undefined,
     status: r.status as Server["status"],

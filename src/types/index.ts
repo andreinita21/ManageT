@@ -45,6 +45,8 @@ export interface Server {
   passwordEncrypted?: string;
   /** True when a password credential is stored. Safe to send to clients. */
   hasPassword?: boolean;
+  /** SHA-256 fingerprint of the host's SSH public key (TOFU). Not secret. */
+  hostKeyFingerprint?: string;
   labels: string[];
   groupName?: string;
   status: "connected" | "disconnected" | "reconnecting" | "unreachable" | "unknown";

@@ -39,6 +39,9 @@ export const servers = sqliteTable("servers", {
   authMethod: text("auth_method", { enum: ["key", "password"] }).notNull(),
   privateKeyPath: text("private_key_path"),
   passwordEncrypted: text("password_encrypted"),
+  // SHA-256 fingerprint of the host's SSH public key, learned on first connect
+  // (trust-on-first-use) and verified on every subsequent connect.
+  hostKeyFingerprint: text("host_key_fingerprint"),
   labels: text("labels").notNull().default("[]"),
   groupName: text("group_name"),
   status: text("status", {
