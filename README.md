@@ -9,9 +9,78 @@
 [![SQLite + Drizzle](https://img.shields.io/badge/db-SQLite-blue?logo=sqlite)](https://orm.drizzle.team)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](#license)
 
-[Features](#features) · [Architecture](#architecture) · [Quick start](#quick-start) · [Terminals](#terminals) · [Groups](#terminal-groups) · [Stacks](#stacks) · [Command palette](#command-palette) · [Images into terminals](#sending-images-into-terminals) · [CLI](#the-managet-cli) · [Themes](#theming) · [Security](#security)
+[Quick reference](#quick-reference) · [Features](#features) · [Architecture](#architecture) · [Quick start](#quick-start) · [Terminals](#terminals) · [Groups](#terminal-groups) · [Stacks](#stacks) · [Command palette](#command-palette) · [Images into terminals](#sending-images-into-terminals) · [CLI](#the-managet-cli) · [Themes](#theming) · [Security](#security)
 
 </div>
+
+---
+
+## Quick reference
+
+Everything you'd come back to this page to look up. The "what is what and how" follows below.
+
+### Commands
+
+```bash
+# Sessions (local agent — works offline from the dashboard)
+managet new [NAME] [-c CMD] [--no-attach]   # create a persistent session + attach
+managet ls [sessions|groups|stacks]          # list everything (-s / -g / -st filters)
+managet attach <id|name>                     # attach (prefix match works)
+managet kill <id|name>                       # SIGTERM the session's root process
+
+# Dashboard-backed (run `managet login` once per host/user)
+managet login                                # get a bearer token → ~/.config/managet/config.toml
+managet groups                               # list terminal groups
+managet group attach <name>                  # open a group as a CLI mosaic
+managet stacks                               # list stacks + runtime state
+managet stack open <name>                    # open a stack as a CLI mosaic
+managet stack launch <name>                  # launch a stack's services
+managet stack new | edit <name>              # interactive stack editor
+managet theme list | set <name>              # mosaic color/line themes
+
+# Agent admin (usually driven by the dashboard)
+managet-agent install | run | status | uninstall
+managet-agent reconfigure [--api-url URL] [--interval-secs N] [--bar-color C] [--bar-fields LIST]
+
+# Dashboard host
+npm run dev | build | start                  # dev / production bundle / serve
+bash scripts/build-and-deploy-cli.sh         # rebuild + push the CLI to all hosts (no agent restart)
+```
+
+### Keybindings — `managet attach` (single session)
+
+| Keys | Action |
+|---|---|
+| `Ctrl-A d` | Detach (session keeps running) |
+| `Ctrl-A p` | Command palette — `1-9`/`Enter` paste, `a` add, `e` edit, `d` delete, `Shift-↑↓` move, `Esc` close |
+| `Ctrl-A g` | Add this session to a group / create one, then jump into its mosaic |
+| `Ctrl-A Ctrl-A` | Send a literal Ctrl-A through to the shell |
+
+### Keybindings — mosaics (`managet group attach` / `managet stack open`)
+
+| Keys | Action | Group | Stack |
+|---|---|:-:|:-:|
+| `Ctrl-A d` | Detach from the mosaic | ✅ | ✅ |
+| `Ctrl-A 1-6` | Focus pane N | ✅ | ✅ |
+| `Ctrl-A [` / `]` | Cycle focus | ✅ | ✅ |
+| `Ctrl-A s` | **Swap** two panes (persisted order) | ✅ | ✅ |
+| `Ctrl-A v` | **Layout** arrangement picker (persisted) | ✅ | ✅ |
+| `Ctrl-A r` | Resize mode — arrows grow/shrink, Enter persists, Esc reverts | ✅ | ✅ |
+| `Ctrl-A p` | Command palette → pastes into the **focused** pane | ✅ | ✅ |
+| `Ctrl-A n` | Add a terminal to the group (inline picker) | ✅ | — |
+| `Ctrl-A x` | Remove focused pane from the group (shell keeps running) | ✅ | — |
+| `Ctrl-A k` | Kill the focused session (with confirm) | ✅ | — |
+
+### Web UI quick map
+
+| Where | Control | Action |
+|---|---|---|
+| Any terminal pane | `Ctrl+V` / drag-drop / 📷 | Send an image — uploads to the host, pastes its path (Claude Code attaches it as `[Image #N]`) |
+| Terminal tab bar / mosaic pane bar | `>_` | Command palette — `1-9` pastes into that pane, `↑↓`+`Enter`, per-row edit/delete/move |
+| `/groups/<id>` header | arrangement picker | Choose the row split (e.g. `3+1`, `2+2`) |
+| `/groups/<id>` / `/stacks/<id>/terminals` | drag a pane's title bar | Swap two panes (persisted) |
+| Pane dividers | drag | Resize rows/columns (persisted per user) |
+| `/terminal` | `+` | New session on a server, or re-attach a saved one |
 
 ---
 
@@ -286,32 +355,7 @@ managet theme list|set       # mosaic color/line themes
 
 ### Keybindings
 
-All multiplexer keys are behind the **Ctrl-A** prefix (press `Ctrl-A`, release, then the key — `Ctrl-A Ctrl-A` sends a literal Ctrl-A through).
-
-**Inside `managet attach` (single session):**
-
-| Keys | Action |
-|---|---|
-| `Ctrl-A d` | Detach (session keeps running) |
-| `Ctrl-A p` | Command palette (arrows/1-9 paste, `a/e/d` manage, `Shift-↑↓` move) |
-| `Ctrl-A g` | Add this session to a group / create one, then jump into its mosaic |
-
-**Inside `managet group attach` / `managet stack open` (mosaic):**
-
-| Keys | Action | Group | Stack |
-|---|---|:-:|:-:|
-| `Ctrl-A d` | Detach from the mosaic | ✅ | ✅ |
-| `Ctrl-A 1-6` | Focus pane N | ✅ | ✅ |
-| `Ctrl-A [` / `]` | Cycle focus | ✅ | ✅ |
-| `Ctrl-A s` | **Swap** two panes (persisted order) | ✅ | ✅ |
-| `Ctrl-A v` | **Layout** arrangement picker (persisted) | ✅ | ✅ |
-| `Ctrl-A r` | Resize mode (arrows grow/shrink, Enter persists) | ✅ | ✅ |
-| `Ctrl-A p` | Command palette → pastes into the focused pane | ✅ | ✅ |
-| `Ctrl-A n` | Add a terminal to the group (inline picker) | ✅ | — |
-| `Ctrl-A x` | Remove focused pane from the group (shell keeps running) | ✅ | — |
-| `Ctrl-A k` | Kill the focused session (with confirm) | ✅ | — |
-
-The hint bar at the bottom of each mosaic lists exactly what's available there.
+All multiplexer keys are behind the **Ctrl-A** prefix (press `Ctrl-A`, release, then the key — `Ctrl-A Ctrl-A` sends a literal Ctrl-A through). The full tables live in the [Quick reference](#quick-reference) at the top of this page; the hint bar at the bottom of each mosaic also lists exactly what's available there.
 
 ### Agent admin (`managet-agent`)
 
