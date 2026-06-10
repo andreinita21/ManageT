@@ -3584,25 +3584,48 @@ pub async fn run_stack_open(
                         if let Some(rs) = resize.as_ref() {
                             draw_resize_overlay(&mut stdout, &panes, rs)?;
                         }
+                        if let Some(sw) = swap.as_ref() {
+                            draw_swap_overlay(&mut stdout, &panes, sw)?;
+                        }
+                        if let Some(lp) = layout_picker.as_ref() {
+                            draw_layout_overlay(&mut stdout, lp)?;
+                        }
+                        if let Some(pv) = palette_ov.as_ref() {
+                            draw_mosaic_palette(&mut stdout, pv)?;
+                        }
                     }
                     _ => {}
                 }
             }
             maybe_msg = ws_read.next() => {
+                // Skip the pane repaint while a centered modal (layout
+                // picker / command palette) is up so it isn't erased;
+                // output is still parsed and shows once the overlay
+                // closes.
+                let modal_open = layout_picker.is_some() || palette_ov.is_some();
                 match maybe_msg {
                     Some(Ok(Message::Text(text))) => {
                         handle_server_msg(&mut panes, text.as_str(), &send_tx).await;
-                        draw_stack(&mut stdout, &stack_title, &panes, focused)?;
+                        if !modal_open {
+                            draw_stack(&mut stdout, &stack_title, &panes, focused)?;
+                        }
                     }
                     Some(Ok(Message::Binary(bytes))) => {
                         if let Ok(text) = std::str::from_utf8(&bytes) {
                             handle_server_msg(&mut panes, text, &send_tx).await;
-                            draw_stack(&mut stdout, &stack_title, &panes, focused)?;
+                            if !modal_open {
+                                draw_stack(&mut stdout, &stack_title, &panes, focused)?;
+                            }
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(anyhow!("websocket error: {e}")),
+                }
+                // Live output just repainted the panes — restore the
+                // swap/resize chrome on top so it isn't erased.
+                if let Some(sw) = swap.as_ref() {
+                    draw_swap_overlay(&mut stdout, &panes, sw)?;
                 }
                 if let Some(rs) = resize.as_ref() {
                     draw_resize_overlay(&mut stdout, &panes, rs)?;
@@ -4582,6 +4605,9 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                         if let Some(rs) = resize.as_ref() {
                             draw_resize_overlay(&mut stdout, &panes, rs)?;
                         }
+                        if let Some(pv) = palette_ov.as_ref() {
+                            draw_mosaic_palette(&mut stdout, pv)?;
+                        }
                     }
                     _ => {}
                 }
@@ -4590,10 +4616,11 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                 match maybe_msg {
                     Some(Ok(Message::Text(text))) => {
                         handle_server_msg(&mut panes, text.as_str(), &send_tx).await;
-                        // Skip the repaint while the layout overlay is up so
-                        // it isn't erased; output is still parsed above and
-                        // shows once the overlay closes.
-                        if layout_picker.is_none() {
+                        // Skip the repaint while a centered modal (layout
+                        // picker / command palette) is up so it isn't erased;
+                        // output is still parsed above and shows once the
+                        // overlay closes.
+                        if layout_picker.is_none() && palette_ov.is_none() {
                             draw_group(
                                 &mut stdout,
                                 &current_group,
@@ -4608,7 +4635,7 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                     Some(Ok(Message::Binary(bytes))) => {
                         if let Ok(text) = std::str::from_utf8(&bytes) {
                             handle_server_msg(&mut panes, text, &send_tx).await;
-                            if layout_picker.is_none() {
+                            if layout_picker.is_none() && palette_ov.is_none() {
                                 draw_group(
                                     &mut stdout,
                                     &current_group,
@@ -4655,6 +4682,7 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                     || layout_picker.is_some()
                     || swap.is_some()
                     || resize.is_some()
+                    || palette_ov.is_some()
                 {
                     continue;
                 }
