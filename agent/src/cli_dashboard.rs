@@ -3293,12 +3293,32 @@ pub async fn run_stack_open(
 
     let mut escape = false;
     let mut resize: Option<ResizeState> = None;
+    let mut palette_ov: Option<MosaicPaletteState> = None;
     loop {
         tokio::select! {
             maybe_event = event_rx.recv() => {
                 let Some(ev) = maybe_event else { break; };
                 match ev {
                     Event::Key(key) => {
+                        // Command-palette overlay (Ctrl-A P): same overlay as
+                        // the group mosaic; pastes into the focused pane.
+                        if palette_ov.is_some() {
+                            handle_palette_overlay_key(
+                                key,
+                                &mut palette_ov,
+                                &panes,
+                                focused,
+                                &send_tx,
+                                &cfg,
+                            )
+                            .await?;
+                            draw_stack(&mut stdout, &stack_title, &panes, focused)?;
+                            if let Some(pv) = palette_ov.as_ref() {
+                                draw_mosaic_palette(&mut stdout, pv)?;
+                            }
+                            continue;
+                        }
+
                         // Resize mode (Ctrl-A R): same controls as the group
                         // view. Arrows preview locally, Enter persists the
                         // stack layout, Esc reverts to the layout on entry.
@@ -3385,6 +3405,18 @@ pub async fn run_stack_open(
                                 if let Some(rs) = resize.as_ref() {
                                     draw_resize_overlay(&mut stdout, &panes, rs)?;
                                 }
+                            }
+                            continue;
+                        }
+
+                        // Ctrl-A P opens the command palette; the picked
+                        // command pastes into the focused pane.
+                        if escape && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P')) {
+                            escape = false;
+                            palette_ov = open_palette_overlay(&cfg).await;
+                            draw_stack(&mut stdout, &stack_title, &panes, focused)?;
+                            if let Some(pv) = palette_ov.as_ref() {
+                                draw_mosaic_palette(&mut stdout, pv)?;
                             }
                             continue;
                         }
@@ -3503,7 +3535,7 @@ fn draw_stack_status_bar(
     let running = panes.iter().filter(|p| p.session.is_some()).count();
     let total = panes.len();
     let active_text = format!("{running}/{total} running · focus {active_slot}:{active_name}");
-    let hints = "Ctrl-A D detach · 1-6 focus · [/] cycle · R resize";
+    let hints = "Ctrl-A D detach · 1-6 focus · [/] cycle · R resize · P palette";
 
     let t = theme();
     let segments: [(&str, Color, bool); 7] = [
@@ -4001,219 +4033,15 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                         // keys as the solo-attach palette, drawn as a modal
                         // over the mosaic. Pastes into the focused pane.
                         if palette_ov.is_some() {
-                            let mut close = false;
-                            let mut paste: Option<String> = None;
-                            let mut dirty = false;
-                            {
-                                let pv = palette_ov.as_mut().unwrap();
-                                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-                                let entry_slot =
-                                    |entries: &[PaletteEntryDto], slot: u8| -> Option<usize> {
-                                        entries.iter().position(|e| e.slot == slot)
-                                    };
-                                match &mut pv.mode {
-                                    PaletteMode::Browse => match key.code {
-                                        KeyCode::Esc | KeyCode::Char('q') => close = true,
-                                        KeyCode::Char('c') if ctrl => close = true,
-                                        KeyCode::Up if shift => {
-                                            if entry_slot(&pv.entries, pv.selected).is_some()
-                                                && pv.selected > 1
-                                            {
-                                                let (a, b) = (pv.selected, pv.selected - 1);
-                                                for e in pv.entries.iter_mut() {
-                                                    if e.slot == a {
-                                                        e.slot = b;
-                                                    } else if e.slot == b {
-                                                        e.slot = a;
-                                                    }
-                                                }
-                                                pv.entries.sort_by_key(|e| e.slot);
-                                                pv.selected = b;
-                                                dirty = true;
-                                            }
-                                        }
-                                        KeyCode::Down if shift => {
-                                            if entry_slot(&pv.entries, pv.selected).is_some()
-                                                && pv.selected < 9
-                                            {
-                                                let (a, b) = (pv.selected, pv.selected + 1);
-                                                for e in pv.entries.iter_mut() {
-                                                    if e.slot == a {
-                                                        e.slot = b;
-                                                    } else if e.slot == b {
-                                                        e.slot = a;
-                                                    }
-                                                }
-                                                pv.entries.sort_by_key(|e| e.slot);
-                                                pv.selected = b;
-                                                dirty = true;
-                                            }
-                                        }
-                                        KeyCode::Up => {
-                                            if pv.selected > 1 {
-                                                pv.selected -= 1;
-                                            }
-                                        }
-                                        KeyCode::Down => {
-                                            if pv.selected < 9 {
-                                                pv.selected += 1;
-                                            }
-                                        }
-                                        KeyCode::Char(c @ '1'..='9') => {
-                                            let slot = c as u8 - b'0';
-                                            match entry_slot(&pv.entries, slot) {
-                                                Some(i) => {
-                                                    paste =
-                                                        Some(pv.entries[i].command.clone());
-                                                    close = true;
-                                                }
-                                                None => pv.selected = slot,
-                                            }
-                                        }
-                                        KeyCode::Enter => {
-                                            match entry_slot(&pv.entries, pv.selected) {
-                                                Some(i) => {
-                                                    paste =
-                                                        Some(pv.entries[i].command.clone());
-                                                    close = true;
-                                                }
-                                                None => {
-                                                    pv.mode = PaletteMode::Edit {
-                                                        slot: pv.selected,
-                                                        label: String::new(),
-                                                        command: String::new(),
-                                                        field: 0,
-                                                    };
-                                                }
-                                            }
-                                        }
-                                        KeyCode::Char('a') | KeyCode::Char('A') => {
-                                            let free = if entry_slot(&pv.entries, pv.selected)
-                                                .is_none()
-                                            {
-                                                Some(pv.selected)
-                                            } else {
-                                                (1..=9u8).find(|s| {
-                                                    entry_slot(&pv.entries, *s).is_none()
-                                                })
-                                            };
-                                            if let Some(slot) = free {
-                                                pv.selected = slot;
-                                                pv.mode = PaletteMode::Edit {
-                                                    slot,
-                                                    label: String::new(),
-                                                    command: String::new(),
-                                                    field: 0,
-                                                };
-                                            }
-                                        }
-                                        KeyCode::Char('e') | KeyCode::Char('E') => {
-                                            if let Some(i) =
-                                                entry_slot(&pv.entries, pv.selected)
-                                            {
-                                                pv.mode = PaletteMode::Edit {
-                                                    slot: pv.entries[i].slot,
-                                                    label: pv.entries[i]
-                                                        .label
-                                                        .clone()
-                                                        .unwrap_or_default(),
-                                                    command: pv.entries[i].command.clone(),
-                                                    field: 1,
-                                                };
-                                            }
-                                        }
-                                        KeyCode::Char('d')
-                                        | KeyCode::Char('D')
-                                        | KeyCode::Delete => {
-                                            let sel = pv.selected;
-                                            if entry_slot(&pv.entries, sel).is_some() {
-                                                pv.entries.retain(|e| e.slot != sel);
-                                                dirty = true;
-                                            }
-                                        }
-                                        _ => {}
-                                    },
-                                    PaletteMode::Edit {
-                                        slot,
-                                        label,
-                                        command,
-                                        field,
-                                    } => match key.code {
-                                        KeyCode::Esc => pv.mode = PaletteMode::Browse,
-                                        KeyCode::Char('c') if ctrl => {
-                                            pv.mode = PaletteMode::Browse
-                                        }
-                                        KeyCode::Tab | KeyCode::Up | KeyCode::Down => {
-                                            *field = (*field + 1) % 2
-                                        }
-                                        KeyCode::Enter => {
-                                            let cmd = command.trim().to_string();
-                                            if cmd.is_empty() {
-                                                *field = 1;
-                                            } else {
-                                                let lbl = label.trim().to_string();
-                                                let slot = *slot;
-                                                pv.entries.retain(|e| e.slot != slot);
-                                                pv.entries.push(PaletteEntryDto {
-                                                    slot,
-                                                    label: if lbl.is_empty() {
-                                                        None
-                                                    } else {
-                                                        Some(lbl)
-                                                    },
-                                                    command: cmd,
-                                                });
-                                                pv.entries.sort_by_key(|e| e.slot);
-                                                pv.mode = PaletteMode::Browse;
-                                                dirty = true;
-                                            }
-                                        }
-                                        KeyCode::Backspace => {
-                                            if *field == 0 {
-                                                label.pop();
-                                            } else {
-                                                command.pop();
-                                            }
-                                        }
-                                        KeyCode::Char(c) if !ctrl => {
-                                            if *field == 0 {
-                                                if label.chars().count() < 60 {
-                                                    label.push(c);
-                                                }
-                                            } else if command.chars().count() < 4000 {
-                                                command.push(c);
-                                            }
-                                        }
-                                        _ => {}
-                                    },
-                                }
-                            }
-                            if dirty {
-                                let entries = &palette_ov.as_ref().unwrap().entries;
-                                let body = serde_json::json!({ "commands": entries });
-                                let _ = put_json(&cfg, "/api/cli/palette", &body).await;
-                            }
-                            if close {
-                                palette_ov = None;
-                            }
-                            if let Some(cmd) = paste {
-                                if let Some(pane) = panes.get(focused) {
-                                    if let Some(session) = &pane.session {
-                                        // Honour the inner app's bracketed-paste
-                                        // mode (vt100 tracks DECSET 2004) so a
-                                        // multi-line command lands as one paste.
-                                        let text = if pane.parser.screen().bracketed_paste()
-                                        {
-                                            format!("\x1b[200~{cmd}\x1b[201~")
-                                        } else {
-                                            cmd
-                                        };
-                                        send_ws(&send_tx, client_input_msg(session, &text))
-                                            .await?;
-                                    }
-                                }
-                            }
+                            handle_palette_overlay_key(
+                                key,
+                                &mut palette_ov,
+                                &panes,
+                                focused,
+                                &send_tx,
+                                &cfg,
+                            )
+                            .await?;
                             draw_group(
                                 &mut stdout,
                                 &current_group,
@@ -4369,22 +4197,9 @@ pub async fn run_group_open(selector: String, theme_override: Option<String>) ->
                         // picked command pastes into the focused pane.
                         if escape && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P')) {
                             escape = false;
-                            match get_json::<PalettePayload>(&cfg, "/api/cli/palette").await {
-                                Ok(mut p) => {
-                                    p.commands.sort_by_key(|e| e.slot);
-                                    let selected =
-                                        p.commands.first().map(|e| e.slot).unwrap_or(1);
-                                    palette_ov = Some(MosaicPaletteState {
-                                        entries: p.commands,
-                                        selected,
-                                        mode: PaletteMode::Browse,
-                                    });
-                                }
-                                Err(_) => {
-                                    // Dashboard unreachable / not logged in —
-                                    // nothing to show; stay in the mosaic.
-                                }
-                            }
+                            // None when the dashboard is unreachable / the CLI
+                            // isn't logged in — stay in the mosaic.
+                            palette_ov = open_palette_overlay(&cfg).await;
                             draw_group(
                                 &mut stdout,
                                 &current_group,
@@ -5302,7 +5117,7 @@ fn draw_status_bar(
     } else if picker_active {
         "↑/↓ pick · Enter confirm · Esc cancel"
     } else {
-        "Ctrl-A D detach · 1-6 focus · [/] cycle · N add · S swap · V layout · R resize · X detach · K kill"
+        "Ctrl-A D detach · 1-6 focus · [/] cycle · N add · S swap · V layout · R resize · P palette · X detach · K kill"
     };
 
     let t = theme();
@@ -5671,12 +5486,225 @@ fn draw_picker(stdout: &mut Stdout, picker: &PickerState, slot: usize) -> Result
 /// Centered overlay listing the available row arrangements as a horizontal
 /// strip of mini-grid previews; the selected one is boxed in the accent
 /// color. Navigate with arrows, Enter applies, Esc cancels.
-/// Ctrl-A P state for the group mosaic — same data and key model as the
-/// solo-attach palette (`prompt_palette`), drawn as a centered modal.
+/// Ctrl-A P state for the group/stack mosaics — same data and key model
+/// as the solo-attach palette (`prompt_palette`), drawn as a centered
+/// modal.
 struct MosaicPaletteState {
     entries: Vec<PaletteEntryDto>,
     selected: u8,
     mode: PaletteMode,
+}
+
+/// Fetch the palette and build the overlay state, or None when the
+/// dashboard is unreachable / the CLI isn't logged in.
+async fn open_palette_overlay(cfg: &DashboardCliConfig) -> Option<MosaicPaletteState> {
+    match get_json::<PalettePayload>(cfg, "/api/cli/palette").await {
+        Ok(mut p) => {
+            p.commands.sort_by_key(|e| e.slot);
+            let selected = p.commands.first().map(|e| e.slot).unwrap_or(1);
+            Some(MosaicPaletteState {
+                entries: p.commands,
+                selected,
+                mode: PaletteMode::Browse,
+            })
+        }
+        Err(_) => None,
+    }
+}
+
+/// Drive one key through the palette overlay. Mutates the overlay
+/// (clearing it on Esc / after a paste), persists edits to the
+/// dashboard, and writes a picked command into the focused pane's
+/// session — wrapped in bracketed-paste markers when the inner app has
+/// the mode on (per the pane's vt100 screen), so multi-line commands
+/// land in TUIs like Claude Code as a single paste. Callers redraw
+/// their view (plus `draw_mosaic_palette` while the overlay is open)
+/// afterwards. Shared by the group and stack mosaic loops.
+async fn handle_palette_overlay_key(
+    key: KeyEvent,
+    palette_ov: &mut Option<MosaicPaletteState>,
+    panes: &[Pane],
+    focused: usize,
+    send_tx: &mpsc::Sender<String>,
+    cfg: &DashboardCliConfig,
+) -> Result<()> {
+    let mut close = false;
+    let mut paste: Option<String> = None;
+    let mut dirty = false;
+    {
+        let Some(pv) = palette_ov.as_mut() else {
+            return Ok(());
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let entry_slot = |entries: &[PaletteEntryDto], slot: u8| -> Option<usize> {
+            entries.iter().position(|e| e.slot == slot)
+        };
+        let swap_slots = |entries: &mut Vec<PaletteEntryDto>, a: u8, b: u8| {
+            for e in entries.iter_mut() {
+                if e.slot == a {
+                    e.slot = b;
+                } else if e.slot == b {
+                    e.slot = a;
+                }
+            }
+            entries.sort_by_key(|e| e.slot);
+        };
+        match &mut pv.mode {
+            PaletteMode::Browse => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => close = true,
+                KeyCode::Char('c') if ctrl => close = true,
+                KeyCode::Up if shift => {
+                    if entry_slot(&pv.entries, pv.selected).is_some() && pv.selected > 1 {
+                        swap_slots(&mut pv.entries, pv.selected, pv.selected - 1);
+                        pv.selected -= 1;
+                        dirty = true;
+                    }
+                }
+                KeyCode::Down if shift => {
+                    if entry_slot(&pv.entries, pv.selected).is_some() && pv.selected < 9 {
+                        swap_slots(&mut pv.entries, pv.selected, pv.selected + 1);
+                        pv.selected += 1;
+                        dirty = true;
+                    }
+                }
+                KeyCode::Up => {
+                    if pv.selected > 1 {
+                        pv.selected -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    if pv.selected < 9 {
+                        pv.selected += 1;
+                    }
+                }
+                KeyCode::Char(c @ '1'..='9') => {
+                    let slot = c as u8 - b'0';
+                    match entry_slot(&pv.entries, slot) {
+                        Some(i) => {
+                            paste = Some(pv.entries[i].command.clone());
+                            close = true;
+                        }
+                        None => pv.selected = slot,
+                    }
+                }
+                KeyCode::Enter => match entry_slot(&pv.entries, pv.selected) {
+                    Some(i) => {
+                        paste = Some(pv.entries[i].command.clone());
+                        close = true;
+                    }
+                    None => {
+                        pv.mode = PaletteMode::Edit {
+                            slot: pv.selected,
+                            label: String::new(),
+                            command: String::new(),
+                            field: 0,
+                        };
+                    }
+                },
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    let free = if entry_slot(&pv.entries, pv.selected).is_none() {
+                        Some(pv.selected)
+                    } else {
+                        (1..=9u8).find(|s| entry_slot(&pv.entries, *s).is_none())
+                    };
+                    if let Some(slot) = free {
+                        pv.selected = slot;
+                        pv.mode = PaletteMode::Edit {
+                            slot,
+                            label: String::new(),
+                            command: String::new(),
+                            field: 0,
+                        };
+                    }
+                }
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    if let Some(i) = entry_slot(&pv.entries, pv.selected) {
+                        pv.mode = PaletteMode::Edit {
+                            slot: pv.entries[i].slot,
+                            label: pv.entries[i].label.clone().unwrap_or_default(),
+                            command: pv.entries[i].command.clone(),
+                            field: 1,
+                        };
+                    }
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => {
+                    let sel = pv.selected;
+                    if entry_slot(&pv.entries, sel).is_some() {
+                        pv.entries.retain(|e| e.slot != sel);
+                        dirty = true;
+                    }
+                }
+                _ => {}
+            },
+            PaletteMode::Edit {
+                slot,
+                label,
+                command,
+                field,
+            } => match key.code {
+                KeyCode::Esc => pv.mode = PaletteMode::Browse,
+                KeyCode::Char('c') if ctrl => pv.mode = PaletteMode::Browse,
+                KeyCode::Tab | KeyCode::Up | KeyCode::Down => *field = (*field + 1) % 2,
+                KeyCode::Enter => {
+                    let cmd = command.trim().to_string();
+                    if cmd.is_empty() {
+                        *field = 1;
+                    } else {
+                        let lbl = label.trim().to_string();
+                        let slot = *slot;
+                        pv.entries.retain(|e| e.slot != slot);
+                        pv.entries.push(PaletteEntryDto {
+                            slot,
+                            label: if lbl.is_empty() { None } else { Some(lbl) },
+                            command: cmd,
+                        });
+                        pv.entries.sort_by_key(|e| e.slot);
+                        pv.mode = PaletteMode::Browse;
+                        dirty = true;
+                    }
+                }
+                KeyCode::Backspace => {
+                    if *field == 0 {
+                        label.pop();
+                    } else {
+                        command.pop();
+                    }
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    if *field == 0 {
+                        if label.chars().count() < 60 {
+                            label.push(c);
+                        }
+                    } else if command.chars().count() < 4000 {
+                        command.push(c);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    if dirty {
+        let entries = &palette_ov.as_ref().unwrap().entries;
+        let body = serde_json::json!({ "commands": entries });
+        let _ = put_json(cfg, "/api/cli/palette", &body).await;
+    }
+    if close {
+        *palette_ov = None;
+    }
+    if let Some(cmd) = paste {
+        if let Some(pane) = panes.get(focused) {
+            if let Some(session) = &pane.session {
+                let text = if pane.parser.screen().bracketed_paste() {
+                    format!("\x1b[200~{cmd}\x1b[201~")
+                } else {
+                    cmd
+                };
+                send_ws(send_tx, client_input_msg(session, &text)).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn draw_mosaic_palette(stdout: &mut Stdout, pv: &MosaicPaletteState) -> Result<()> {
