@@ -22,6 +22,7 @@ import { useSearchParams } from "next/navigation";
 import { TerminalPane } from "@/components/terminal/TerminalPane";
 import { CommandRunner } from "@/components/terminal/CommandRunner";
 import { GroupMenu } from "@/components/terminal/GroupMenu";
+import { ImageUploadButton } from "@/components/terminal/ImageUploadButton";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
 import { useServers, useSessions } from "@/lib/hooks/useApi";
@@ -61,6 +62,12 @@ function TerminalPage() {
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
+  // Per-tab "send image" triggers registered by each TerminalPane (null
+  // once a pane unmounts). The tab bar's image button acts on the
+  // active tab's entry.
+  const [sendImageByTab, setSendImageByTab] = useState<
+    Record<string, ((file: File) => void) | null>
+  >({});
 
   // The first-render bootstrap is one-shot: we set up tabs from URL params
   // (or auto-restore live sessions) exactly once, then never again. Without
@@ -190,6 +197,9 @@ function TerminalPage() {
                 );
                 refetchSessions();
               }}
+              onSendImageReady={(send) => {
+                setSendImageByTab((prev) => ({ ...prev, [tab.id]: send }));
+              }}
             />
             {isActive && (
               <GroupMenu
@@ -243,6 +253,15 @@ function TerminalPage() {
             ))}
           </div>
           <div className="flex items-center gap-1 px-2">
+            <ImageUploadButton
+              disabled={!activeTabId || !sendImageByTab[activeTabId]}
+              onPick={(file) => {
+                const send = activeTabId ? sendImageByTab[activeTabId] : null;
+                send?.(file);
+              }}
+              className="p-2 rounded-lg text-mg-text-secondary hover:text-mg-text hover:bg-mg-bg-hover disabled:opacity-40 disabled:cursor-not-allowed transition-all duration-200"
+              title="Send an image to this terminal (uploads to the host, pastes its path — Ctrl+V on the terminal works too)"
+            />
             <Button
               variant="ghost"
               size="sm"

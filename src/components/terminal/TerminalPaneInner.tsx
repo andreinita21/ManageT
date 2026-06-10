@@ -34,6 +34,13 @@ interface TerminalPaneProps {
    *  cramped pane in a 6-up layout can be bumped up without changing
    *  the user's global preference. */
   fontSize?: number;
+  /** Called with this pane's "send image" function once the terminal is
+   *  mounted (and with null on unmount). The function uploads the image
+   *  to the session's host and pastes the resulting remote path into the
+   *  PTY — which is how Claude Code & friends pick it up as an attached
+   *  image. Parents use it to drive a toolbar/menu-bar button; the pane
+   *  itself also accepts Ctrl+V image paste and drag-and-drop directly. */
+  onSendImageReady?: (send: ((file: File) => void) | null) => void;
 }
 
 export default function TerminalPaneInner({
@@ -42,6 +49,7 @@ export default function TerminalPaneInner({
   className = "",
   onSessionReady,
   fontSize,
+  onSendImageReady,
 }: TerminalPaneProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   // Appearance (theme + font) is shared via context so user preference
@@ -106,6 +114,18 @@ export default function TerminalPaneInner({
   useEffect(() => {
     onSessionReadyRef.current = onSessionReady;
   }, [onSessionReady]);
+  const onSendImageReadyRef = useRef(onSendImageReady);
+  useEffect(() => {
+    onSendImageReadyRef.current = onSendImageReady;
+  }, [onSendImageReady]);
+
+  // Transient feedback for the image-upload flow. Rendered as a pill in
+  // the same corner stack as the connection status — never written into
+  // the xterm grid.
+  const [imageNote, setImageNote] = useState<{
+    kind: "uploading" | "error";
+    text: string;
+  } | null>(null);
 
   // Freeze `initialSessionId` at mount. Without this, the create flow
   // tears itself down: we send `session:create`, the server replies with
@@ -305,6 +325,107 @@ export default function TerminalPaneInner({
       return;
     }
 
+    // ---- Image → terminal ("screenshot paste") ----
+    // Upload the image to the session's host via the dashboard, then
+    // paste the remote file path into the PTY. term.paste() honours
+    // bracketed-paste mode, so Claude Code (and anything else that
+    // resolves pasted image paths) treats it exactly like an image
+    // dragged onto a local terminal. A literal remote Ctrl+V can't work
+    // on headless hosts — there's no clipboard to read — so the path is
+    // the transport.
+    let noteTimer: ReturnType<typeof setTimeout> | null = null;
+    const flashImageError = (text: string) => {
+      if (!mounted) return;
+      setImageNote({ kind: "error", text });
+      if (noteTimer) clearTimeout(noteTimer);
+      noteTimer = setTimeout(() => {
+        if (mounted) setImageNote(null);
+      }, 5000);
+    };
+    const sendImage = async (file: File) => {
+      // `sessionId` is the effect-scoped mutable variable — for a tab
+      // that's still waiting on session:create it's null and we bail
+      // with feedback instead of uploading to nowhere.
+      if (!sessionId) {
+        flashImageError("Terminal isn't ready yet — try again in a second.");
+        return;
+      }
+      if (mounted) setImageNote({ kind: "uploading", text: "Sending image…" });
+      try {
+        const fd = new FormData();
+        fd.append("file", file, file.name || "image");
+        const res = await fetch(`/api/sessions/${sessionId}/image`, {
+          method: "POST",
+          body: fd,
+        });
+        const json: unknown = await res.json().catch(() => null);
+        if (!res.ok) {
+          const apiErr = (json as { error?: string } | null)?.error;
+          throw new Error(apiErr ?? `Upload failed (HTTP ${res.status})`);
+        }
+        const remotePath = (json as { data?: { remotePath?: string } } | null)
+          ?.data?.remotePath;
+        if (typeof remotePath !== "string") {
+          throw new Error("Upload response missing remotePath");
+        }
+        // The pane may have unmounted while the upload was in flight —
+        // pasting into a disposed xterm throws.
+        if (!mounted) return;
+        // Trailing space matches what terminals append after a
+        // drag-dropped path and nudges path-detection in TUIs.
+        term?.paste(remotePath + " ");
+        term?.focus();
+        setImageNote(null);
+      } catch (err) {
+        flashImageError(err instanceof Error ? err.message : String(err));
+      }
+    };
+
+    // Ctrl+V with an image on the clipboard: intercept before xterm's
+    // own paste handler (capture phase on the container — xterm listens
+    // on its inner textarea). Text-only pastes fall through untouched.
+    const onImagePaste = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      for (const item of Array.from(items)) {
+        if (item.kind === "file" && item.type.startsWith("image/")) {
+          const f = item.getAsFile();
+          if (f) {
+            e.preventDefault();
+            e.stopPropagation();
+            void sendImage(f);
+            return;
+          }
+        }
+      }
+    };
+    // Drag-and-drop an image file onto the terminal. Only claims drags
+    // that carry files, so the group mosaic's pane-reorder drag (which
+    // carries text/plain) is untouched.
+    const onImageDragOver = (e: DragEvent) => {
+      if (e.dataTransfer?.types.includes("Files")) {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "copy";
+      }
+    };
+    const onImageDrop = (e: DragEvent) => {
+      const files = e.dataTransfer?.files;
+      if (!files?.length) return;
+      const img = Array.from(files).find((f) => f.type.startsWith("image/"));
+      if (img) {
+        e.preventDefault();
+        e.stopPropagation();
+        void sendImage(img);
+      }
+    };
+    container.addEventListener("paste", onImagePaste, true);
+    container.addEventListener("dragover", onImageDragOver);
+    container.addEventListener("drop", onImageDrop);
+    // Hand the parent a stable trigger for its toolbar button.
+    onSendImageReadyRef.current?.((file) => {
+      void sendImage(file);
+    });
+
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     const wsUrl = `${proto}//${window.location.host}/api/ws`;
 
@@ -440,6 +561,11 @@ export default function TerminalPaneInner({
         connectTimer = null;
       }
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (noteTimer) clearTimeout(noteTimer);
+      onSendImageReadyRef.current?.(null);
+      container.removeEventListener("paste", onImagePaste, true);
+      container.removeEventListener("dragover", onImageDragOver);
+      container.removeEventListener("drop", onImageDrop);
       observer?.disconnect();
       ws?.close();
       term?.dispose();
@@ -466,36 +592,53 @@ export default function TerminalPaneInner({
         style={containerStyle}
       />
 
-      {/* Status pill — only shown when not connected. All transient
-          terminal-state messaging lives here so we never write a line
-          into the xterm grid that would visually displace the agent's
-          scrollback replay. */}
-      {status !== "connected" && !errorMessage && (
-        <div className="absolute top-2 right-2 z-10 flex items-center gap-2 bg-mg-bg-secondary/90 border border-mg-border rounded-md px-3 py-1.5">
-          {status === "connecting" || status === "reconnecting" ? (
-            <>
-              <div className="w-3 h-3 border-2 border-mg-accent border-t-transparent rounded-full animate-spin" />
-              <span className="text-xs text-mg-text-secondary">
-                {status === "reconnecting" ? "Reconnecting..." : "Connecting..."}
-              </span>
-            </>
-          ) : status === "lost" ? (
-            <>
-              <div className="w-2 h-2 rounded-full bg-mg-warning" />
-              <span className="text-xs text-mg-warning">
-                Session lost{statusDetail ? `: ${statusDetail}` : ""}
-              </span>
-            </>
-          ) : (
-            <>
-              <div className="w-2 h-2 rounded-full bg-mg-danger" />
-              <span className="text-xs text-mg-danger">
-                {status === "error" ? "Error" : "Disconnected"}
-              </span>
-            </>
-          )}
-        </div>
-      )}
+      {/* Corner pill stack — connection status + image-upload feedback.
+          All transient terminal-state messaging lives here so we never
+          write a line into the xterm grid that would visually displace
+          the agent's scrollback replay. */}
+      <div className="absolute top-2 right-2 z-10 flex flex-col items-end gap-2 pointer-events-none">
+        {status !== "connected" && !errorMessage && (
+          <div className="flex items-center gap-2 bg-mg-bg-secondary/90 border border-mg-border rounded-md px-3 py-1.5">
+            {status === "connecting" || status === "reconnecting" ? (
+              <>
+                <div className="w-3 h-3 border-2 border-mg-accent border-t-transparent rounded-full animate-spin" />
+                <span className="text-xs text-mg-text-secondary">
+                  {status === "reconnecting" ? "Reconnecting..." : "Connecting..."}
+                </span>
+              </>
+            ) : status === "lost" ? (
+              <>
+                <div className="w-2 h-2 rounded-full bg-mg-warning" />
+                <span className="text-xs text-mg-warning">
+                  Session lost{statusDetail ? `: ${statusDetail}` : ""}
+                </span>
+              </>
+            ) : (
+              <>
+                <div className="w-2 h-2 rounded-full bg-mg-danger" />
+                <span className="text-xs text-mg-danger">
+                  {status === "error" ? "Error" : "Disconnected"}
+                </span>
+              </>
+            )}
+          </div>
+        )}
+        {imageNote && (
+          <div className="flex items-center gap-2 bg-mg-bg-secondary/90 border border-mg-border rounded-md px-3 py-1.5">
+            {imageNote.kind === "uploading" ? (
+              <>
+                <div className="w-3 h-3 border-2 border-mg-accent border-t-transparent rounded-full animate-spin" />
+                <span className="text-xs text-mg-text-secondary">{imageNote.text}</span>
+              </>
+            ) : (
+              <>
+                <div className="w-2 h-2 rounded-full bg-mg-danger" />
+                <span className="text-xs text-mg-danger">{imageNote.text}</span>
+              </>
+            )}
+          </div>
+        )}
+      </div>
 
       {/* Fatal-error overlay when the terminal couldn't even initialise. */}
       {errorMessage && (

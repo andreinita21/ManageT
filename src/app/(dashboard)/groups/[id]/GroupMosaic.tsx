@@ -36,6 +36,7 @@ import React, {
 } from "react";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 
+import { ImageUploadButton } from "@/components/terminal/ImageUploadButton";
 import { TerminalPane } from "@/components/terminal/TerminalPane";
 import {
   getGroupLayout,
@@ -635,6 +636,14 @@ function MosaicCell({
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
 
+  // "Send image" trigger registered by this cell's TerminalPane. The
+  // functional setState wrapper is load-bearing: the registered value is
+  // itself a function, and a bare `setSendImage(send)` would invoke it
+  // as an updater.
+  const [sendImage, setSendImage] = useState<((file: File) => void) | null>(
+    null
+  );
+
   const beginRename = () => {
     setDraft(member.sessionName);
     setEditing(true);
@@ -749,6 +758,13 @@ function MosaicCell({
           )}
         </div>
         <div className="flex items-center gap-1 shrink-0">
+          <ImageUploadButton
+            disabled={!sendImage}
+            onPick={(file) => sendImage?.(file)}
+            className="w-5 h-5 flex items-center justify-center rounded text-mg-text-secondary hover:text-mg-text hover:bg-mg-bg-hover disabled:opacity-40 disabled:cursor-not-allowed"
+            iconClassName="w-3.5 h-3.5"
+            title="Send an image to this terminal (uploads to the host, pastes its path)"
+          />
           <button
             type="button"
             onClick={(e) => {
@@ -813,6 +829,7 @@ function MosaicCell({
           sessionId={member.id}
           className="h-full"
           fontSize={fontSize}
+          onSendImageReady={(send) => setSendImage(() => send)}
         />
       </div>
 
