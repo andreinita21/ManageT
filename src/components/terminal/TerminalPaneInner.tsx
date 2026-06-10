@@ -34,13 +34,21 @@ interface TerminalPaneProps {
    *  cramped pane in a 6-up layout can be bumped up without changing
    *  the user's global preference. */
   fontSize?: number;
-  /** Called with this pane's "send image" function once the terminal is
-   *  mounted (and with null on unmount). The function uploads the image
-   *  to the session's host and pastes the resulting remote path into the
-   *  PTY — which is how Claude Code & friends pick it up as an attached
-   *  image. Parents use it to drive a toolbar/menu-bar button; the pane
-   *  itself also accepts Ctrl+V image paste and drag-and-drop directly. */
-  onSendImageReady?: (send: ((file: File) => void) | null) => void;
+  /** Called with this pane's action handle once the terminal is mounted
+   *  (and with null on unmount). Parents use it to drive toolbar /
+   *  menu-bar buttons:
+   *    - sendImage uploads the file to the session's host and pastes
+   *      the resulting remote path into the PTY (how Claude Code picks
+   *      it up as an attached image). The pane itself also accepts
+   *      Ctrl+V image paste and drag-and-drop directly.
+   *    - pasteText pastes arbitrary text into the PTY via bracketed
+   *      paste (no trailing Enter) — used by the command palette. */
+  onPaneReady?: (handle: TerminalPaneHandle | null) => void;
+}
+
+export interface TerminalPaneHandle {
+  sendImage: (file: File) => void;
+  pasteText: (text: string) => void;
 }
 
 export default function TerminalPaneInner({
@@ -49,7 +57,7 @@ export default function TerminalPaneInner({
   className = "",
   onSessionReady,
   fontSize,
-  onSendImageReady,
+  onPaneReady,
 }: TerminalPaneProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   // Appearance (theme + font) is shared via context so user preference
@@ -114,10 +122,10 @@ export default function TerminalPaneInner({
   useEffect(() => {
     onSessionReadyRef.current = onSessionReady;
   }, [onSessionReady]);
-  const onSendImageReadyRef = useRef(onSendImageReady);
+  const onPaneReadyRef = useRef(onPaneReady);
   useEffect(() => {
-    onSendImageReadyRef.current = onSendImageReady;
-  }, [onSendImageReady]);
+    onPaneReadyRef.current = onPaneReady;
+  }, [onPaneReady]);
 
   // Transient feedback for the image-upload flow. Rendered as a pill in
   // the same corner stack as the connection status — never written into
@@ -425,9 +433,19 @@ export default function TerminalPaneInner({
     container.addEventListener("paste", onImagePaste, true);
     container.addEventListener("dragover", onImageDragOver);
     container.addEventListener("drop", onImageDrop);
-    // Hand the parent a stable trigger for its toolbar button.
-    onSendImageReadyRef.current?.((file) => {
-      void sendImage(file);
+    // Hand the parent a stable action handle for its toolbar buttons.
+    onPaneReadyRef.current?.({
+      sendImage: (file) => {
+        void sendImage(file);
+      },
+      pasteText: (text) => {
+        try {
+          term?.paste(text);
+          term?.focus();
+        } catch {
+          /* disposed mid-paste — nothing to do */
+        }
+      },
     });
 
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -644,7 +662,7 @@ export default function TerminalPaneInner({
       if (redrawTimer) clearTimeout(redrawTimer);
       if (jiggleTimer) clearTimeout(jiggleTimer);
       if (noteTimer) clearTimeout(noteTimer);
-      onSendImageReadyRef.current?.(null);
+      onPaneReadyRef.current?.(null);
       container.removeEventListener("paste", onImagePaste, true);
       container.removeEventListener("dragover", onImageDragOver);
       container.removeEventListener("drop", onImageDrop);

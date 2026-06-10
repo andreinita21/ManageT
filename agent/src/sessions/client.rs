@@ -259,7 +259,8 @@ pub async fn run_attach(id: String) -> Result<()> {
     });
 
     // 5. Pipe stdin → socket and socket → stdout. The detach state
-    //    machine watches stdin for `Ctrl-A d` and `Ctrl-A g` (group prompt).
+    //    machine watches stdin for `Ctrl-A d`, `Ctrl-A g` (group prompt)
+    //    and `Ctrl-A p` (command palette).
     let pipe_result = pipe_attach(reader, wr, &_raw, resolved_id.clone()).await;
 
     resize_task.abort();
@@ -316,6 +317,14 @@ async fn pipe_attach(
     const DETACH_KEY: u8 = b'd';
     let mut state = EscState::Normal;
 
+    // Whether the app inside the PTY currently has bracketed paste
+    // (DECSET 2004) on — tracked by watching its output. Used by the
+    // Ctrl-A P command palette so a pasted command is wrapped exactly
+    // like a real terminal paste: TUIs like Claude Code then treat it
+    // as one paste (multi-line commands don't submit early), while a
+    // plain shell without the mode gets the raw bytes.
+    let mut bracketed_paste = false;
+
     let mut sock_buf = [0u8; 4096];
     let mut stdin_buf = [0u8; 4096];
 
@@ -327,6 +336,7 @@ async fn pipe_attach(
                     Ok(0) => return Ok(None),
                     Err(e) => return Err(anyhow!("socket read: {e}")),
                     Ok(n) => {
+                        scan_bracketed_paste(&sock_buf[..n], &mut bracketed_paste);
                         stdout.write_all(&sock_buf[..n]).await?;
                         stdout.flush().await?;
                     }
@@ -392,6 +402,39 @@ async fn pipe_attach(
                                         // redraws its prompt cleanly.
                                         let (r, c) = local_term_size().unwrap_or((24, 80));
                                         let _ = send_resize(&session_id, r, c).await;
+                                    } else if b == b'p' || b == b'P' {
+                                        // Ctrl-A P: command palette. Same
+                                        // suspend/prompt/resume dance as
+                                        // Ctrl-A G; on pick, the chosen
+                                        // command is pasted into the PTY.
+                                        state = EscState::Normal;
+                                        if !out.is_empty() {
+                                            socket_writer.write_all(&out).await?;
+                                            socket_writer.flush().await?;
+                                            out.clear();
+                                        }
+                                        raw.suspend();
+                                        let _ = stdout.write_all(b"\r\n").await;
+                                        let _ = stdout.flush().await;
+                                        let picked = crate::cli_dashboard::run_attach_palette()
+                                            .await
+                                            .ok()
+                                            .flatten();
+                                        raw.resume();
+                                        // Repaint the inner app first so the
+                                        // pasted text lands on a clean prompt.
+                                        let (r, c) = local_term_size().unwrap_or((24, 80));
+                                        let _ = send_resize(&session_id, r, c).await;
+                                        if let Some(cmd) = picked {
+                                            if bracketed_paste {
+                                                socket_writer.write_all(b"\x1b[200~").await?;
+                                                socket_writer.write_all(cmd.as_bytes()).await?;
+                                                socket_writer.write_all(b"\x1b[201~").await?;
+                                            } else {
+                                                socket_writer.write_all(cmd.as_bytes()).await?;
+                                            }
+                                            socket_writer.flush().await?;
+                                        }
                                     } else if b == CTRL_A {
                                         // Literal Ctrl-A — emit one and
                                         // stay in Escape so user can do
@@ -438,6 +481,28 @@ async fn send_resize(id: &str, rows: u16, cols: u16) -> Result<()> {
     let mut buf = String::new();
     reader.read_line(&mut buf).await?;
     Ok(())
+}
+
+/// Track bracketed-paste mode (DECSET/DECRST 2004) by scanning the PTY
+/// output stream. Best-effort: a marker split across two reads is
+/// missed, but apps toggle the mode rarely (startup/shutdown) and the
+/// next toggle self-corrects, so the tracked state converges. Used by
+/// the Ctrl-A P palette paste.
+fn scan_bracketed_paste(buf: &[u8], state: &mut bool) {
+    const ON: &[u8] = b"\x1b[?2004h";
+    const OFF: &[u8] = b"\x1b[?2004l";
+    let mut i = 0;
+    while i + ON.len() <= buf.len() {
+        if &buf[i..i + ON.len()] == ON {
+            *state = true;
+            i += ON.len();
+        } else if &buf[i..i + OFF.len()] == OFF {
+            *state = false;
+            i += OFF.len();
+        } else {
+            i += 1;
+        }
+    }
 }
 
 async fn round_trip(req: &Request) -> Result<Response> {

@@ -11,7 +11,7 @@
  * only ever evaluated in a browser context.
  */
 import dynamic from "next/dynamic";
-import type { TerminalPaneProps } from "./TerminalPaneInner";
+import type { TerminalPaneHandle, TerminalPaneProps } from "./TerminalPaneInner";
 
 export const TerminalPane = dynamic(() => import("./TerminalPaneInner"), {
   ssr: false,
@@ -25,4 +25,4 @@ export const TerminalPane = dynamic(() => import("./TerminalPaneInner"), {
   ),
 });
 
-export type { TerminalPaneProps };
+export type { TerminalPaneHandle, TerminalPaneProps };

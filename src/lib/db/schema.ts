@@ -2,7 +2,7 @@
  * Drizzle ORM schema definitions for ManageT.
  * All tables for the application database.
  */
-import { sqliteTable, text, integer, real, index } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, integer, real, index, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const users = sqliteTable("users", {
   id: text("id").primaryKey(),
@@ -386,6 +386,32 @@ export const userPreferences = sqliteTable("user_preferences", {
   mosaicCustomThemes: text("mosaic_custom_themes"),
   updatedAt: integer("updated_at").notNull(),
 });
+
+/**
+ * Per-user command palette: up to 9 saved commands bound to slots 1-9,
+ * pasteable into any terminal from the web UI overlay or the CLI's
+ * Ctrl-A P overlay. Global across servers (the workspace is shared but
+ * the palette is personal), synced through /api/palette and
+ * /api/cli/palette.
+ */
+export const paletteCommands = sqliteTable(
+  "palette_commands",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** 1-9; doubles as the hotkey that pastes the command. */
+    slot: integer("slot").notNull(),
+    /** Optional short display name; the overlay falls back to a
+     *  truncated command when absent. */
+    label: text("label"),
+    command: text("command").notNull(),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (t) => [uniqueIndex("palette_commands_user_slot_idx").on(t.userId, t.slot)]
+);
 
 export const alerts = sqliteTable("alerts", {
   id: text("id").primaryKey(),

@@ -1158,6 +1158,420 @@ fn prompt_group_choice(groups: &[(String, String)]) -> Option<GroupChoice> {
     result
 }
 
+// ---------------------------------------------------------------------------
+// Command palette (Ctrl-A P in attach)
+// ---------------------------------------------------------------------------
+
+/// One saved palette command. Wire-compatible with /api/cli/palette
+/// (which shares storage with the web overlay's /api/palette).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PaletteEntryDto {
+    slot: u8,
+    #[serde(default)]
+    label: Option<String>,
+    command: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PalettePayload {
+    commands: Vec<PaletteEntryDto>,
+}
+
+enum PaletteAction {
+    Paste(String),
+    Save(PaletteEntryDto),
+    Delete(u8),
+    Move(u8, i8),
+    Quit,
+}
+
+/// Ctrl-A P entry point, called from the attach loop with raw mode
+/// suspended. Shows the user's saved commands (slots 1-9), lets them
+/// add/edit/delete/reorder, and returns `Some(command)` when one is
+/// picked so the caller can write it into the PTY. Mutations are
+/// persisted to the dashboard immediately, so the web overlay sees the
+/// same list.
+pub async fn run_attach_palette() -> Result<Option<String>> {
+    let cfg = match load_config() {
+        Ok(c) => c,
+        Err(_) => {
+            println!("\r\nNot logged in — run `managet login` first.");
+            return Ok(None);
+        }
+    };
+    let mut entries = match get_json::<PalettePayload>(&cfg, "/api/cli/palette").await {
+        Ok(p) => p.commands,
+        Err(e) => {
+            println!("\r\nCould not reach the dashboard: {e}");
+            return Ok(None);
+        }
+    };
+    entries.sort_by_key(|e| e.slot);
+
+    let mut selected: u8 = entries.first().map(|e| e.slot).unwrap_or(1);
+    loop {
+        let action = prompt_palette(&entries, selected);
+        match action {
+            PaletteAction::Paste(cmd) => return Ok(Some(cmd)),
+            PaletteAction::Quit => return Ok(None),
+            PaletteAction::Save(entry) => {
+                selected = entry.slot;
+                entries.retain(|e| e.slot != entry.slot);
+                entries.push(entry);
+                entries.sort_by_key(|e| e.slot);
+            }
+            PaletteAction::Delete(slot) => {
+                selected = slot;
+                entries.retain(|e| e.slot != slot);
+            }
+            PaletteAction::Move(slot, delta) => {
+                let target = slot as i16 + delta as i16;
+                if !(1..=9).contains(&target) {
+                    continue;
+                }
+                let target = target as u8;
+                for e in entries.iter_mut() {
+                    if e.slot == slot {
+                        e.slot = target;
+                    } else if e.slot == target {
+                        e.slot = slot;
+                    }
+                }
+                entries.sort_by_key(|e| e.slot);
+                selected = target;
+            }
+        }
+        // Everything except Paste/Quit mutated the list — persist it.
+        let body = serde_json::json!({ "commands": entries });
+        if let Err(e) = put_json(&cfg, "/api/cli/palette", &body).await {
+            println!("\r\n{} saving palette: {e}", "✗".red());
+            // Re-sync so the next draw shows what's actually stored.
+            if let Ok(p) = get_json::<PalettePayload>(&cfg, "/api/cli/palette").await {
+                entries = p.commands;
+                entries.sort_by_key(|e| e.slot);
+            }
+        }
+    }
+}
+
+enum PaletteMode {
+    Browse,
+    Edit {
+        slot: u8,
+        label: String,
+        command: String,
+        /// 0 = label field, 1 = command field.
+        field: usize,
+    },
+}
+
+/// Render + drive one round of the palette overlay. Inline (no
+/// alt-screen) raw-mode repaint-in-place, same approach as
+/// `prompt_group_choice`. Returns on any action that ends the round —
+/// paste/quit end the overlay; save/delete/move are applied + persisted
+/// by `run_attach_palette`, which then re-enters with the fresh list.
+fn prompt_palette(entries: &[PaletteEntryDto], initial: u8) -> PaletteAction {
+    let mut stdout = std::io::stdout();
+    if enable_raw_mode().is_err() {
+        return PaletteAction::Quit;
+    }
+
+    let mut selected: u8 = initial.clamp(1, 9);
+    let mut mode = PaletteMode::Browse;
+    let mut prev_lines: u16 = 0;
+    let width = terminal::size().map(|(c, _)| c as usize).unwrap_or(80);
+
+    let result = loop {
+        prev_lines = draw_palette(&mut stdout, entries, selected, &mode, prev_lines, width);
+        let ev = match event::read() {
+            Ok(ev) => ev,
+            Err(_) => break PaletteAction::Quit,
+        };
+        let Event::Key(key) = ev else { continue };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+        match &mut mode {
+            PaletteMode::Browse => {
+                let entry_at = |slot: u8| entries.iter().find(|e| e.slot == slot);
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => break PaletteAction::Quit,
+                    KeyCode::Char('c') if ctrl => break PaletteAction::Quit,
+                    KeyCode::Up if shift => {
+                        if entry_at(selected).is_some() && selected > 1 {
+                            break PaletteAction::Move(selected, -1);
+                        }
+                    }
+                    KeyCode::Down if shift => {
+                        if entry_at(selected).is_some() && selected < 9 {
+                            break PaletteAction::Move(selected, 1);
+                        }
+                    }
+                    KeyCode::Up => {
+                        if selected > 1 {
+                            selected -= 1;
+                        }
+                    }
+                    KeyCode::Down => {
+                        if selected < 9 {
+                            selected += 1;
+                        }
+                    }
+                    KeyCode::Char(c @ '1'..='9') => {
+                        let slot = c as u8 - b'0';
+                        if let Some(e) = entry_at(slot) {
+                            break PaletteAction::Paste(e.command.clone());
+                        }
+                        selected = slot;
+                    }
+                    KeyCode::Enter => match entry_at(selected) {
+                        Some(e) => break PaletteAction::Paste(e.command.clone()),
+                        None => {
+                            mode = PaletteMode::Edit {
+                                slot: selected,
+                                label: String::new(),
+                                command: String::new(),
+                                field: 0,
+                            };
+                        }
+                    },
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        // Add at the selected slot if free, else the first
+                        // free slot; ignore when all 9 are taken.
+                        let free = if entry_at(selected).is_none() {
+                            Some(selected)
+                        } else {
+                            (1..=9u8).find(|s| entry_at(*s).is_none())
+                        };
+                        if let Some(slot) = free {
+                            selected = slot;
+                            mode = PaletteMode::Edit {
+                                slot,
+                                label: String::new(),
+                                command: String::new(),
+                                field: 0,
+                            };
+                        }
+                    }
+                    KeyCode::Char('e') | KeyCode::Char('E') => {
+                        if let Some(e) = entry_at(selected) {
+                            mode = PaletteMode::Edit {
+                                slot: e.slot,
+                                label: e.label.clone().unwrap_or_default(),
+                                command: e.command.clone(),
+                                field: 1,
+                            };
+                        }
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => {
+                        if entry_at(selected).is_some() {
+                            break PaletteAction::Delete(selected);
+                        }
+                    }
+                    KeyCode::Char('[') => {
+                        if entry_at(selected).is_some() && selected > 1 {
+                            break PaletteAction::Move(selected, -1);
+                        }
+                    }
+                    KeyCode::Char(']') => {
+                        if entry_at(selected).is_some() && selected < 9 {
+                            break PaletteAction::Move(selected, 1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            PaletteMode::Edit {
+                slot,
+                label,
+                command,
+                field,
+            } => match key.code {
+                KeyCode::Esc => mode = PaletteMode::Browse,
+                KeyCode::Char('c') if ctrl => mode = PaletteMode::Browse,
+                KeyCode::Tab | KeyCode::Up | KeyCode::Down => *field = (*field + 1) % 2,
+                KeyCode::Enter => {
+                    let cmd = command.trim();
+                    if !cmd.is_empty() {
+                        let lbl = label.trim();
+                        break PaletteAction::Save(PaletteEntryDto {
+                            slot: *slot,
+                            label: if lbl.is_empty() {
+                                None
+                            } else {
+                                Some(lbl.to_string())
+                            },
+                            command: cmd.to_string(),
+                        });
+                    }
+                    // Empty command — jump to the command field instead.
+                    *field = 1;
+                }
+                KeyCode::Backspace => {
+                    if *field == 0 {
+                        label.pop();
+                    } else {
+                        command.pop();
+                    }
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    if *field == 0 {
+                        if label.chars().count() < 60 {
+                            label.push(c);
+                        }
+                    } else if command.chars().count() < 4000 {
+                        command.push(c);
+                    }
+                }
+                _ => {}
+            },
+        }
+    };
+
+    let _ = disable_raw_mode();
+    println!("\r");
+    result
+}
+
+/// Truncate to `max` visible chars with a trailing ellipsis.
+fn palette_truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
+        t.push('…');
+        t
+    }
+}
+
+fn draw_palette(
+    stdout: &mut Stdout,
+    entries: &[PaletteEntryDto],
+    selected: u8,
+    mode: &PaletteMode,
+    prev: u16,
+    width: usize,
+) -> u16 {
+    let _ = if prev > 0 {
+        queue!(
+            stdout,
+            MoveUp(prev),
+            MoveToColumn(0),
+            Clear(ClearType::FromCursorDown)
+        )
+    } else {
+        queue!(stdout, MoveToColumn(0), Clear(ClearType::FromCursorDown))
+    };
+
+    let mut lines = 0u16;
+    let _ = queue!(
+        stdout,
+        Print("Command palette".white().bold()),
+        Print(
+            "   ↑/↓ · Enter/1-9 paste · a add · e edit · d delete · [ ] move · Esc close"
+                .dark_grey()
+        ),
+        Print("\r\n")
+    );
+    lines += 1;
+
+    let editing_slot = match mode {
+        PaletteMode::Edit { slot, .. } => Some(*slot),
+        PaletteMode::Browse => None,
+    };
+    // Width available for the command preview after " › [n] " and label.
+    let preview_max = width.saturating_sub(12).max(20);
+
+    for slot in 1..=9u8 {
+        let entry = entries.iter().find(|e| e.slot == slot);
+        let is_sel = slot == selected;
+        let marker = if is_sel { "›".green() } else { " ".stylize() };
+        let num = if entry.is_some() {
+            format!("[{slot}]").white().bold()
+        } else {
+            format!("[{slot}]").dark_grey()
+        };
+        let _ = queue!(stdout, Print(" "), Print(marker), Print(" "), Print(num), Print(" "));
+        match entry {
+            None => {
+                let hint = if editing_slot == Some(slot) {
+                    "(adding…)".to_string().green()
+                } else {
+                    "(empty)".to_string().dark_grey()
+                };
+                let _ = queue!(stdout, Print(hint));
+            }
+            Some(e) => {
+                let mut budget = preview_max;
+                if let Some(lbl) = e.label.as_deref().filter(|l| !l.is_empty()) {
+                    let shown = palette_truncate(lbl, 30);
+                    budget = budget.saturating_sub(shown.chars().count() + 3);
+                    let styled = if is_sel {
+                        shown.white().bold()
+                    } else {
+                        shown.stylize()
+                    };
+                    let _ = queue!(stdout, Print(styled), Print(" — ".dark_grey()));
+                }
+                let cmd = palette_truncate(&e.command, budget.max(10));
+                let _ = queue!(stdout, Print(cmd.dark_grey()));
+            }
+        }
+        let _ = queue!(stdout, Print("\r\n"));
+        lines += 1;
+    }
+
+    if let PaletteMode::Edit {
+        slot,
+        label,
+        command,
+        field,
+    } = mode
+    {
+        let _ = queue!(
+            stdout,
+            Print(format!(" Edit [{slot}]").white().bold()),
+            Print("   Tab next field · Enter save · Esc cancel".dark_grey()),
+            Print("\r\n")
+        );
+        lines += 1;
+        let cursor0 = if *field == 0 { "▌".grey() } else { "".stylize() };
+        let cursor1 = if *field == 1 { "▌".grey() } else { "".stylize() };
+        let label_shown = palette_truncate(label, width.saturating_sub(14).max(10));
+        let _ = queue!(
+            stdout,
+            Print("   Label:   ".dark_grey()),
+            Print(label_shown.as_str().stylize()),
+            Print(cursor0),
+            Print("\r\n")
+        );
+        lines += 1;
+        // Show the tail of long commands so the caret area is always
+        // what the user is editing.
+        let cmd_budget = width.saturating_sub(14).max(10);
+        let cmd_shown: String = if command.chars().count() > cmd_budget {
+            let tail: String = command
+                .chars()
+                .skip(command.chars().count() - (cmd_budget - 1))
+                .collect();
+            format!("…{tail}")
+        } else {
+            command.clone()
+        };
+        let _ = queue!(
+            stdout,
+            Print("   Command: ".dark_grey()),
+            Print(cmd_shown.as_str().stylize()),
+            Print(cursor1),
+            Print("\r\n")
+        );
+        lines += 1;
+    }
+
+    let _ = stdout.flush();
+    lines
+}
+
 pub async fn run_group_list() -> Result<()> {
     let cfg = load_config()?;
     let payload = fetch_group_list_payload(&cfg).await?;

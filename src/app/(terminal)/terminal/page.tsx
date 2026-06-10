@@ -20,6 +20,8 @@
 import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { TerminalPane } from "@/components/terminal/TerminalPane";
+import type { TerminalPaneHandle } from "@/components/terminal/TerminalPane";
+import { CommandPaletteButton } from "@/components/terminal/CommandPalette";
 import { CommandRunner } from "@/components/terminal/CommandRunner";
 import { GroupMenu } from "@/components/terminal/GroupMenu";
 import { ImageUploadButton } from "@/components/terminal/ImageUploadButton";
@@ -62,11 +64,11 @@ function TerminalPage() {
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
-  // Per-tab "send image" triggers registered by each TerminalPane (null
-  // once a pane unmounts). The tab bar's image button acts on the
+  // Per-tab action handles registered by each TerminalPane (null once a
+  // pane unmounts). The tab bar's image + palette buttons act on the
   // active tab's entry.
-  const [sendImageByTab, setSendImageByTab] = useState<
-    Record<string, ((file: File) => void) | null>
+  const [paneByTab, setPaneByTab] = useState<
+    Record<string, TerminalPaneHandle | null>
   >({});
 
   // The first-render bootstrap is one-shot: we set up tabs from URL params
@@ -197,8 +199,8 @@ function TerminalPage() {
                 );
                 refetchSessions();
               }}
-              onSendImageReady={(send) => {
-                setSendImageByTab((prev) => ({ ...prev, [tab.id]: send }));
+              onPaneReady={(handle) => {
+                setPaneByTab((prev) => ({ ...prev, [tab.id]: handle }));
               }}
             />
             {isActive && (
@@ -253,11 +255,19 @@ function TerminalPage() {
             ))}
           </div>
           <div className="flex items-center gap-1 px-2">
+            <CommandPaletteButton
+              onPaste={
+                activeTabId && paneByTab[activeTabId]
+                  ? (cmd) => paneByTab[activeTabId]?.pasteText(cmd)
+                  : null
+              }
+              className="p-2 rounded-lg text-mg-text-secondary hover:text-mg-text hover:bg-mg-bg-hover disabled:opacity-40 disabled:cursor-not-allowed transition-all duration-200"
+            />
             <ImageUploadButton
-              disabled={!activeTabId || !sendImageByTab[activeTabId]}
+              disabled={!activeTabId || !paneByTab[activeTabId]}
               onPick={(file) => {
-                const send = activeTabId ? sendImageByTab[activeTabId] : null;
-                send?.(file);
+                const handle = activeTabId ? paneByTab[activeTabId] : null;
+                handle?.sendImage(file);
               }}
               className="p-2 rounded-lg text-mg-text-secondary hover:text-mg-text hover:bg-mg-bg-hover disabled:opacity-40 disabled:cursor-not-allowed transition-all duration-200"
               title="Send an image to this terminal (uploads to the host, pastes its path — Ctrl+V on the terminal works too)"
