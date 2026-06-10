@@ -261,6 +261,20 @@ async function handleAttachLifecycle(
     return;
   }
 
+  // The browser may have disconnected during the agent round-trip above.
+  // handleDisconnect would already have run; if we proceed, the forwarded
+  // agent stream would stay open forever and wsAttachments would pin a dead
+  // socket. Tear it all down and bail.
+  if (ws.readyState !== WS_OPEN) {
+    try {
+      handle.stream.destroy();
+    } catch {
+      /* ignore */
+    }
+    handleDisconnect(ws);
+    return;
+  }
+
   const state: AttachState = {
     sessionId,
     serverId,
@@ -297,16 +311,45 @@ async function handleAttachLifecycle(
     }
   }
 
+  // Backpressure: a flooding PTY (e.g. `yes`, `cat bigfile`) can outrun a
+  // slow client (phone on bad Wi-Fi behind the tunnel). ws buffers unsent
+  // data unboundedly, so without this the Node heap grows until OOM, killing
+  // every session. When the socket's send buffer crosses the high-water mark
+  // we pause the agent stream and poll until it drains.
+  const HIGH_WATER_BYTES = 8 * 1024 * 1024;
+  let drainTimer: NodeJS.Timeout | undefined;
+
   // Pipe live agent output → browser. Attaching the listener auto-
   // resumes the stream (paused during handshake) so anything that
   // arrived in between sits in the internal buffer and now flows.
   handle.stream.on("data", (chunk: Buffer) => {
     const text = decoder.write(chunk);
-    if (text.length === 0) return; // chunk ended mid-codepoint
-    sendJson(ws, { type: "terminal:output", sessionId, data: text });
+    if (text.length > 0) {
+      sendJson(ws, { type: "terminal:output", sessionId, data: text });
+    }
+    if (!drainTimer && ws.bufferedAmount > HIGH_WATER_BYTES) {
+      handle.stream.pause();
+      drainTimer = setInterval(() => {
+        if (ws.readyState !== WS_OPEN) {
+          clearInterval(drainTimer);
+          drainTimer = undefined;
+          return;
+        }
+        if (ws.bufferedAmount < HIGH_WATER_BYTES / 2) {
+          clearInterval(drainTimer);
+          drainTimer = undefined;
+          handle.stream.resume();
+        }
+      }, 50);
+      drainTimer.unref?.();
+    }
   });
 
   handle.stream.on("close", () => {
+    if (drainTimer) {
+      clearInterval(drainTimer);
+      drainTimer = undefined;
+    }
     // Flush any trailing bytes from the decoder. In practice this is
     // never visible output (a partial UTF-8 sequence at EOF is
     // invalid), but it stops the decoder from holding onto bytes.

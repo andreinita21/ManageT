@@ -3,11 +3,19 @@
  * Provides one-shot command execution on remote servers via the connection pool.
  * Supports both positional and object-style argument forms for backward compatibility.
  */
+import type { ClientChannel } from "ssh2";
 import { connectionPool } from "./connection-pool";
 import type { ExecCommandRequest, ExecCommandResponse } from "@/types";
 
 /** Default command timeout in milliseconds */
 const DEFAULT_TIMEOUT_MS = 30000;
+
+/**
+ * Cap on captured stdout/stderr per stream. A verbose command (or a hostile
+ * one) could otherwise balloon the dashboard's heap before the timeout fires.
+ * Output past this is dropped and flagged with a truncation marker.
+ */
+const MAX_OUTPUT_BYTES = 5 * 1024 * 1024;
 
 /**
  * Execute a command on a remote server via SSH (positional arguments form).
@@ -79,22 +87,46 @@ export async function executeCommand(
   const startTime = Date.now();
 
   return new Promise<ExecCommandResponse>((resolve, reject) => {
+    let channel: ClientChannel | undefined;
+    let settled = false;
+    // Single exit point so timeout / close / error can't double-settle, and
+    // so we always clear the timer.
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
+
     const timer = setTimeout(() => {
-      reject(
-        new Error(
-          `[SSH] Command timed out after ${effectiveTimeout}ms on server ${serverId}: ${command}`
+      // Close the channel so the remote command doesn't keep running and the
+      // SSH channel doesn't leak for the command's lifetime. Note: the
+      // command string is deliberately NOT included in the message — it can
+      // carry sensitive arguments (e.g. an installer's sudo invocation).
+      try {
+        channel?.close();
+      } catch {
+        /* already torn down */
+      }
+      settle(() =>
+        reject(
+          new Error(
+            `[SSH] Command timed out after ${effectiveTimeout}ms on server ${serverId}`
+          )
         )
       );
     }, effectiveTimeout);
 
     client.exec(fullCommand, (err, stream) => {
       if (err) {
-        clearTimeout(timer);
-        reject(
-          new Error(`[SSH] exec failed on server ${serverId}: ${err.message}`)
+        settle(() =>
+          reject(
+            new Error(`[SSH] exec failed on server ${serverId}: ${err.message}`)
+          )
         );
         return;
       }
+      channel = stream;
 
       // If the caller supplied stdin (e.g. a sudo password), write it to the
       // remote process before we close the stream. End() signals EOF so the
@@ -106,31 +138,43 @@ export async function executeCommand(
 
       let stdout = "";
       let stderr = "";
+      let truncated = false;
 
       stream.on("data", (data: Buffer) => {
-        stdout += data.toString("utf-8");
+        if (stdout.length < MAX_OUTPUT_BYTES) {
+          stdout += data.toString("utf-8");
+        } else {
+          truncated = true;
+        }
       });
 
       stream.stderr.on("data", (data: Buffer) => {
-        stderr += data.toString("utf-8");
+        if (stderr.length < MAX_OUTPUT_BYTES) {
+          stderr += data.toString("utf-8");
+        } else {
+          truncated = true;
+        }
       });
 
       stream.on("close", (code: number | null) => {
-        clearTimeout(timer);
         const durationMs = Date.now() - startTime;
-        resolve({
-          stdout,
-          stderr,
-          exitCode: code ?? -1,
-          durationMs,
-        });
+        const marker = "\n[managet] output truncated]";
+        settle(() =>
+          resolve({
+            stdout: truncated ? stdout + marker : stdout,
+            stderr,
+            exitCode: code ?? -1,
+            durationMs,
+          })
+        );
       });
 
       stream.on("error", (streamErr: Error) => {
-        clearTimeout(timer);
-        reject(
-          new Error(
-            `[SSH] Stream error on server ${serverId}: ${streamErr.message}`
+        settle(() =>
+          reject(
+            new Error(
+              `[SSH] Stream error on server ${serverId}: ${streamErr.message}`
+            )
           )
         );
       });

@@ -21,6 +21,14 @@ interface ConnectionPoolEvents {
  */
 export class ConnectionPool extends EventEmitter<ConnectionPoolEvents> {
   private readonly connections = new Map<string, Client>();
+  /**
+   * In-flight dials keyed by server id. Without this, two near-simultaneous
+   * `connect()` calls (e.g. a terminal attach racing the monitor loop after a
+   * drop) both see no existing client and both dial; the loser's client is
+   * orphaned — connected and keepalive'd forever but unreachable via the map.
+   * Sharing the pending promise means concurrent callers get the same dial.
+   */
+  private readonly pending = new Map<string, Promise<Client>>();
 
   /**
    * Ensure an SSH connection exists for a server, returning the existing
@@ -49,7 +57,13 @@ export class ConnectionPool extends EventEmitter<ConnectionPoolEvents> {
       return Promise.resolve(existing);
     }
 
-    return new Promise<Client>((resolve, reject) => {
+    // Coalesce concurrent dials for the same server onto one promise.
+    const inflight = this.pending.get(server.id);
+    if (inflight) {
+      return inflight;
+    }
+
+    const dial = new Promise<Client>((resolve, reject) => {
       const client = new Client();
 
       client.on("ready", () => {
@@ -114,6 +128,17 @@ export class ConnectionPool extends EventEmitter<ConnectionPoolEvents> {
 
       client.connect(connectConfig);
     });
+
+    this.pending.set(server.id, dial);
+    // Clear the in-flight marker once settled — but only if it's still ours,
+    // so we don't wipe a newer dial that started after this one resolved.
+    const clearPending = () => {
+      if (this.pending.get(server.id) === dial) {
+        this.pending.delete(server.id);
+      }
+    };
+    dial.then(clearPending, clearPending);
+    return dial;
   }
 
   /**
