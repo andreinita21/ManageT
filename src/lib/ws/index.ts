@@ -224,6 +224,21 @@ function getAttachments(ws: WebSocket): Map<string, AttachState> {
   return map;
 }
 
+/**
+ * Last rows/cols this dashboard pushed to each session's PTY (via attach
+ * dims or terminal:resize). Used at attach time to tell the browser
+ * whether its grid differs from the shape the PTY had until now —
+ * i.e. whether the scrollback replay it's about to render was painted
+ * for a different width and the client should schedule a clear +
+ * forced repaint once the replay flushes. In-memory only: after a
+ * dashboard restart the first attach reports "no change" (safe default
+ * — a needless clear would blank plain-shell sessions that don't
+ * repaint on SIGWINCH).
+ */
+const lastPtySize = new Map<string, { rows: number; cols: number }>();
+const ptyKey = (serverId: string, sessionId: string) =>
+  `${serverId}:${sessionId}`;
+
 /** Resolve the server id for a session. Tries the per-WS map first; falls
  *  back to a DB lookup. */
 async function resolveServerId(
@@ -247,8 +262,25 @@ async function handleAttachLifecycle(
   serverId: string,
   sessionId: string,
   rows?: number,
-  cols?: number
+  cols?: number,
+  /** True when this attach immediately follows session:create — a brand
+   * new PTY has no old-width scrollback, so never flag it as resized. */
+  freshlyCreated = false
 ): Promise<void> {
+  // Detect a shape change BEFORE we update the registry: the scrollback
+  // the agent is about to replay was rendered at the old size, and the
+  // browser uses this flag to decide whether to clear + force-repaint
+  // after the replay settles.
+  let resized = false;
+  if (rows && cols) {
+    const known = lastPtySize.get(ptyKey(serverId, sessionId));
+    resized =
+      !freshlyCreated &&
+      known !== undefined &&
+      (known.rows !== rows || known.cols !== cols);
+    lastPtySize.set(ptyKey(serverId, sessionId), { rows, cols });
+  }
+
   // Don't double-attach the same WS to the same session — produces double
   // input. If a previous attach is open, close it first.
   const map = getAttachments(ws);
@@ -398,7 +430,7 @@ async function handleAttachLifecycle(
     status: "active",
     retryCount: 0,
   };
-  sendJson(ws, { type: "session:state", session: snapshot });
+  sendJson(ws, { type: "session:state", session: snapshot, resized });
 }
 
 // ---------------------------------------------------------------------------
@@ -469,7 +501,8 @@ async function handleMessage(ws: WebSocket, raw: string): Promise<void> {
           msg.serverId,
           created.sessionId,
           msg.rows,
-          msg.cols
+          msg.cols,
+          true
         );
       } catch (err) {
         const m = err instanceof Error ? err.message : String(err);
@@ -537,6 +570,7 @@ async function handleMessage(ws: WebSocket, raw: string): Promise<void> {
           map!.delete(msg.sessionId);
         }
         await killSession(msg.serverId, msg.sessionId);
+        lastPtySize.delete(ptyKey(msg.serverId, msg.sessionId));
       } catch (err) {
         const m = err instanceof Error ? err.message : String(err);
         console.error(`[WS] kill failed: ${m}`);
@@ -565,6 +599,10 @@ async function handleMessage(ws: WebSocket, raw: string): Promise<void> {
       }
       try {
         await resizeSession(serverId, msg.sessionId, msg.rows, msg.cols);
+        lastPtySize.set(ptyKey(serverId, msg.sessionId), {
+          rows: msg.rows,
+          cols: msg.cols,
+        });
       } catch (err) {
         const m = err instanceof Error ? err.message : String(err);
         // Resize is best-effort — not worth disconnecting the client over.

@@ -400,7 +400,7 @@ export type ClientMessage =
 
 export type ServerMessage =
   | { type: "terminal:output"; sessionId: string; data: string }
-  | { type: "session:state"; session: SessionSnapshot }
+  | { type: "session:state"; session: SessionSnapshot; resized?: boolean }
   | { type: "session:recovered"; sessionId: string; method: "reattach" | "recreate"; command?: string; cwd?: string }
   | { type: "session:lost"; sessionId: string; reason: string }
   | { type: "metrics:update"; serverId: string; metrics: MetricSnapshot }

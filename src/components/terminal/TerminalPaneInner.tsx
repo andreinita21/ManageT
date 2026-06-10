@@ -182,6 +182,10 @@ export default function TerminalPaneInner({
     // drops and we try again.
     let sessionId: string | null = mountInitialSessionId ?? null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    // Timers for the post-attach cleanup repaint (see the `resized`
+    // handling in ws.onmessage).
+    let redrawTimer: ReturnType<typeof setTimeout> | null = null;
+    let jiggleTimer: ReturnType<typeof setTimeout> | null = null;
     // True once we've had at least one open socket. On a *reconnect* the
     // server replays the full scrollback again; without clearing first the
     // replay would append to the existing buffer (the duplicated prompt /
@@ -528,6 +532,42 @@ export default function TerminalPaneInner({
                 })
               );
             }
+            // `resized` means we attached at a different shape than the
+            // PTY had until now — so the scrollback the agent just
+            // replayed was painted for another grid and renders as
+            // mangled, interleaved text. Inline TUIs (Claude Code) never
+            // clear that debris; they only repaint their own block. Once
+            // the replay has flushed, wipe the grid and nudge the PTY
+            // with a one-column resize jiggle: the two SIGWINCHes make
+            // the running app repaint everything onto the clean screen —
+            // exactly what the browser zoom-in/out workaround did, minus
+            // the user. When the shape didn't change this is skipped
+            // entirely and the (correctly-shaped) scrollback is kept.
+            if (msg.resized === true) {
+              if (redrawTimer) clearTimeout(redrawTimer);
+              redrawTimer = setTimeout(() => {
+                if (!mounted || !term) return;
+                try { term.reset(); } catch {}
+                const sendSize = (cols: number) => {
+                  if (ws?.readyState === WebSocket.OPEN && sessionId && term) {
+                    ws.send(
+                      JSON.stringify({
+                        type: "terminal:resize",
+                        sessionId,
+                        cols,
+                        rows: term.rows,
+                        serverId,
+                      })
+                    );
+                  }
+                };
+                sendSize(Math.max(8, term.cols - 1));
+                if (jiggleTimer) clearTimeout(jiggleTimer);
+                jiggleTimer = setTimeout(() => {
+                  if (mounted && term) sendSize(term.cols);
+                }, 120);
+              }, 900);
+            }
           } else if (msg.type === "session:lost") {
             if (mounted) {
               setStatus("lost");
@@ -601,6 +641,8 @@ export default function TerminalPaneInner({
         connectTimer = null;
       }
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (redrawTimer) clearTimeout(redrawTimer);
+      if (jiggleTimer) clearTimeout(jiggleTimer);
       if (noteTimer) clearTimeout(noteTimer);
       onSendImageReadyRef.current?.(null);
       container.removeEventListener("paste", onImagePaste, true);
