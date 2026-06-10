@@ -3294,12 +3294,110 @@ pub async fn run_stack_open(
     let mut escape = false;
     let mut resize: Option<ResizeState> = None;
     let mut palette_ov: Option<MosaicPaletteState> = None;
+    let mut layout_picker: Option<LayoutPickerState> = None;
+    let mut swap: Option<SwapState> = None;
     loop {
         tokio::select! {
             maybe_event = event_rx.recv() => {
                 let Some(ev) = maybe_event else { break; };
                 match ev {
                     Event::Key(key) => {
+                        // Swap mode (Ctrl-A S): same controls as the group
+                        // view — arrows move the highlight, Enter picks the
+                        // source then the destination, Esc cancels.
+                        if let Some(mut sw) = swap {
+                            let mut close = false;
+                            let mut do_swap: Option<(usize, usize)> = None;
+                            match key.code {
+                                KeyCode::Esc => close = true,
+                                KeyCode::Left | KeyCode::Char('h') => {
+                                    sw.cursor = swap_nav(&panes, sw.cursor, SwapDir::Left);
+                                }
+                                KeyCode::Right | KeyCode::Char('l') => {
+                                    sw.cursor = swap_nav(&panes, sw.cursor, SwapDir::Right);
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    sw.cursor = swap_nav(&panes, sw.cursor, SwapDir::Up);
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    sw.cursor = swap_nav(&panes, sw.cursor, SwapDir::Down);
+                                }
+                                KeyCode::Char(c) if c.is_ascii_digit() => {
+                                    let slot = c.to_digit(10).unwrap_or(0) as usize;
+                                    if slot >= 1 && slot <= panes.len() {
+                                        sw.cursor = slot - 1;
+                                    }
+                                }
+                                KeyCode::Enter => match sw.source {
+                                    None => sw.source = Some(sw.cursor),
+                                    Some(src) => {
+                                        do_swap = Some((src, sw.cursor));
+                                        close = true;
+                                    }
+                                },
+                                _ => {}
+                            }
+                            swap = if close { None } else { Some(sw) };
+                            if let Some((src, dst)) = do_swap {
+                                perform_stack_swap(
+                                    src,
+                                    dst,
+                                    &mut panes,
+                                    &send_tx,
+                                    &cfg,
+                                    &stack_id,
+                                    &mut current_detail,
+                                )
+                                .await?;
+                            }
+                            draw_stack(&mut stdout, &stack_title, &panes, focused)?;
+                            if let Some(sw) = swap.as_ref() {
+                                draw_swap_overlay(&mut stdout, &panes, sw)?;
+                            }
+                            continue;
+                        }
+
+                        // Layout overlay (Ctrl-A V): arrows move the
+                        // selection, Enter applies + persists, Esc cancels.
+                        if layout_picker.is_some() {
+                            let lp = layout_picker.as_mut().unwrap();
+                            match key.code {
+                                KeyCode::Left | KeyCode::Up | KeyCode::Char('h') | KeyCode::Char('k') => {
+                                    if lp.selected > 0 { lp.selected -= 1; }
+                                }
+                                KeyCode::Right | KeyCode::Down | KeyCode::Char('l') | KeyCode::Char('j') => {
+                                    if lp.selected + 1 < lp.options.len() { lp.selected += 1; }
+                                }
+                                KeyCode::Home => lp.selected = 0,
+                                KeyCode::End => lp.selected = lp.options.len().saturating_sub(1),
+                                KeyCode::Enter => {
+                                    let lp = layout_picker.take().unwrap();
+                                    if let Some(partition) = lp.options.get(lp.selected).cloned() {
+                                        let new_layout = layout_for_partition(&partition);
+                                        current_layout = new_layout.clone();
+                                        current_partition = partition;
+                                        let (c, r) = terminal::size().unwrap_or((120, 36));
+                                        apply_resize(&mut panes, &current_layout, &current_partition, c, r);
+                                        for pane in &panes {
+                                            if let Some(session) = &pane.session {
+                                                let (h, w) = pane_inner_size(pane.rect);
+                                                send_ws(&send_tx, client_resize_msg(session, h, w)).await?;
+                                            }
+                                        }
+                                        // Persist for the browser too (best-effort).
+                                        let _ = save_stack_layout(&cfg, &stack_id, &current_layout).await;
+                                    }
+                                }
+                                KeyCode::Esc => { layout_picker = None; }
+                                _ => {}
+                            }
+                            draw_stack(&mut stdout, &stack_title, &panes, focused)?;
+                            if let Some(lp) = layout_picker.as_ref() {
+                                draw_layout_overlay(&mut stdout, lp)?;
+                            }
+                            continue;
+                        }
+
                         // Command-palette overlay (Ctrl-A P): same overlay as
                         // the group mosaic; pastes into the focused pane.
                         if palette_ov.is_some() {
@@ -3421,6 +3519,41 @@ pub async fn run_stack_open(
                             continue;
                         }
 
+                        // Ctrl-A S opens the swap-windows overlay (needs at
+                        // least two panes to have something to swap).
+                        if escape && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) {
+                            escape = false;
+                            if panes.len() >= 2 {
+                                swap = Some(SwapState {
+                                    source: None,
+                                    cursor: focused.min(panes.len() - 1),
+                                });
+                                draw_stack(&mut stdout, &stack_title, &panes, focused)?;
+                                if let Some(sw) = swap.as_ref() {
+                                    draw_swap_overlay(&mut stdout, &panes, sw)?;
+                                }
+                            }
+                            continue;
+                        }
+
+                        // Ctrl-A V opens the layout-arrangement overlay.
+                        if escape && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')) {
+                            escape = false;
+                            let options = allowed_partitions(panes.len());
+                            if !options.is_empty() {
+                                let selected = options
+                                    .iter()
+                                    .position(|p| p == &current_partition)
+                                    .unwrap_or(0);
+                                layout_picker = Some(LayoutPickerState { options, selected });
+                                draw_stack(&mut stdout, &stack_title, &panes, focused)?;
+                                if let Some(lp) = layout_picker.as_ref() {
+                                    draw_layout_overlay(&mut stdout, lp)?;
+                                }
+                            }
+                            continue;
+                        }
+
                         let focused_session = panes
                             .get(focused.min(panes.len().saturating_sub(1)))
                             .and_then(|p| p.session.clone());
@@ -3479,8 +3612,13 @@ pub async fn run_stack_open(
                 let Ok(latest) = fetch_stack_detail(&cfg, &stack_id).await else {
                     continue;
                 };
-                // Don't disturb the panes mid-resize; refresh once it's done.
-                if resize.is_some() {
+                // Don't disturb the panes while any overlay is up — a
+                // rebuild would shift indices under the user's selection.
+                if resize.is_some()
+                    || swap.is_some()
+                    || layout_picker.is_some()
+                    || palette_ov.is_some()
+                {
                     continue;
                 }
                 if stack_state_changed(&panes, &latest, filter_id.as_deref()) {
@@ -3535,7 +3673,7 @@ fn draw_stack_status_bar(
     let running = panes.iter().filter(|p| p.session.is_some()).count();
     let total = panes.len();
     let active_text = format!("{running}/{total} running · focus {active_slot}:{active_name}");
-    let hints = "Ctrl-A D detach · 1-6 focus · [/] cycle · R resize · P palette";
+    let hints = "Ctrl-A D detach · 1-6 focus · [/] cycle · S swap · V layout · R resize · P palette";
 
     let t = theme();
     let segments: [(&str, Color, bool); 7] = [
@@ -6023,6 +6161,72 @@ async fn perform_swap(
         .members
         .sort_by_key(|m| ids.iter().position(|id| id == &m.id).unwrap_or(usize::MAX));
     Ok(())
+}
+
+/// Stack twin of `perform_swap`: swap two panes in place, resize the
+/// moved sessions, persist the service order, and keep the in-memory
+/// detail sorted like the panes so the runtime poll doesn't see a
+/// phantom reorder and rebuild everything. `slot_key` is the service id
+/// for stack panes, so the order list is built from it (placeholder
+/// panes for stopped services included). When a server filter hides
+/// some services, the hidden ones keep their relative order after the
+/// visible ones are renumbered.
+async fn perform_stack_swap(
+    i: usize,
+    j: usize,
+    panes: &mut [Pane],
+    send_tx: &mpsc::Sender<String>,
+    cfg: &DashboardCliConfig,
+    stack_id: &str,
+    current_detail: &mut CliStackDetail,
+) -> Result<()> {
+    if i == j || i >= panes.len() || j >= panes.len() {
+        return Ok(());
+    }
+    let ri = panes[i].rect;
+    let rj = panes[j].rect;
+    panes.swap(i, j);
+    panes[i].rect = ri;
+    panes[j].rect = rj;
+    for k in [i, j] {
+        if let Some(s) = panes[k].session.clone() {
+            let (h, w) = pane_inner_size(panes[k].rect);
+            send_ws(send_tx, client_resize_msg(&s, h, w)).await?;
+        }
+    }
+    let mut ids: Vec<String> = panes.iter().map(|p| p.slot_key.clone()).collect();
+    let mut hidden: Vec<&StackServiceDto> = current_detail
+        .stack
+        .services
+        .iter()
+        .filter(|s| !ids.contains(&s.id))
+        .collect();
+    hidden.sort_by_key(|s| s.order_index);
+    ids.extend(hidden.iter().map(|s| s.id.clone()));
+    let _ = save_stack_order(cfg, stack_id, &ids).await;
+    for svc in current_detail.stack.services.iter_mut() {
+        if let Some(pos) = ids.iter().position(|id| id == &svc.id) {
+            svc.order_index = pos;
+        }
+    }
+    current_detail
+        .stack
+        .services
+        .sort_by_key(|s| s.order_index);
+    Ok(())
+}
+
+async fn save_stack_order(
+    cfg: &DashboardCliConfig,
+    stack_id: &str,
+    service_ids: &[String],
+) -> Result<()> {
+    put_json(
+        cfg,
+        &format!("/api/cli/stacks/{stack_id}/order"),
+        &serde_json::json!({ "serviceIds": service_ids }),
+    )
+    .await
 }
 
 /// Redraw the swap-mode chrome on top of the freshly-drawn panes: a banner

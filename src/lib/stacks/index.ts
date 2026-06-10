@@ -65,6 +65,39 @@ export async function replaceServicesForStack(
 }
 
 /**
+ * Reorder a stack's services: rewrite orderIndex to match the array
+ * order. `serviceIds` must equal the current service-id set exactly —
+ * a stale client (service added/removed since its last fetch) gets an
+ * error instead of silently corrupting the order. Shared by the
+ * browser and CLI order routes (swap overlay / drag-reorder).
+ */
+export async function reorderStackServices(
+  stackId: string,
+  serviceIds: string[]
+): Promise<Stack | null> {
+  const rows = await db
+    .select({ id: stackServices.id })
+    .from(stackServices)
+    .where(eq(stackServices.stackId, stackId));
+  const current = new Set(rows.map((r) => r.id));
+  if (
+    current.size !== serviceIds.length ||
+    serviceIds.some((id) => !current.has(id))
+  ) {
+    throw new Error(
+      "serviceIds must match the stack's current services exactly"
+    );
+  }
+  for (let i = 0; i < serviceIds.length; i += 1) {
+    await db
+      .update(stackServices)
+      .set({ orderIndex: i })
+      .where(eq(stackServices.id, serviceIds[i]));
+  }
+  return getStack(stackId);
+}
+
+/**
  * List live (non-trash) stacks with their ordered services. Shared by the
  * browser `GET /api/stacks` and the CLI `GET /api/cli/stacks` so both agree
  * on shape and trash-filtering.

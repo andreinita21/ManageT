@@ -596,6 +596,46 @@ export async function saveGroupLayout(
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
 }
 
+// --- Stack mosaic (terminals page) ---
+
+export async function reorderStack(
+  stackId: string,
+  serviceIds: string[]
+): Promise<Stack> {
+  const res = await fetch(`${API_BASE}/stacks/${stackId}/order`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ serviceIds }),
+  });
+  handleUnauthorized(res);
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
+  return (json.data ?? json) as Stack;
+}
+
+export async function getStackLayout(
+  stackId: string
+): Promise<GroupLayout | null> {
+  const res = await fetch(`${API_BASE}/stacks/${stackId}/layout`);
+  handleUnauthorized(res);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const json = await res.json();
+  return (json.data ?? null) as GroupLayout | null;
+}
+
+export async function saveStackLayout(
+  stackId: string,
+  layout: GroupLayout
+): Promise<void> {
+  const res = await fetch(`${API_BASE}/stacks/${stackId}/layout`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(layout),
+  });
+  handleUnauthorized(res);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+}
+
 // --- Command execution ---
 
 export async function execCommand(serverId: string, data: ExecCommandRequest): Promise<ExecCommandResponse> {
