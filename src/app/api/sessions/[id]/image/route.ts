@@ -17,7 +17,7 @@ import { randomUUID } from "node:crypto";
 import { NextResponse } from "next/server";
 import { eq } from "drizzle-orm";
 
-import { auth } from "@/lib/auth";
+import { requireRole } from "@/lib/auth/guard";
 import { db } from "@/lib/db";
 import { sessions } from "@/lib/db/schema";
 import { writeRemoteFile } from "@/lib/ssh/sftp-write";
@@ -55,10 +55,10 @@ export async function POST(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const session = await auth();
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  // Writes a file to a managed host and feeds terminal input — same
+  // privilege tier as the other session-mutating routes.
+  const gate = await requireRole("operator");
+  if (gate instanceof NextResponse) return gate;
 
   const { id } = await params;
   const rows = await db
