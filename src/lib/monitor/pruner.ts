@@ -11,7 +11,7 @@
 
 import { and, lt, gte, sql } from "drizzle-orm";
 import { db } from "@/lib/db";
-import { metricSnapshots } from "@/lib/db/schema";
+import { metricSnapshots, alerts } from "@/lib/db/schema";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -50,6 +50,11 @@ async function pruneOnce(): Promise<void> {
 
   // 3. Down-sample 24h – 7d window to one per minute
   await downsample(now - SEVEN_DAYS, now - ONE_DAY, ONE_MINUTE);
+
+  // 4. Prune old alerts. The alerts table had no retention at all, so it
+  //    grew unbounded (especially before edge-triggered alerting). Keep the
+  //    same 30-day horizon as metrics.
+  await db.delete(alerts).where(lt(alerts.triggeredAt, now - THIRTY_DAYS));
 }
 
 /**
@@ -67,15 +72,20 @@ async function downsample(
   // Strategy:
   //   - For each row in the window compute a bucket key
   //     (capturedAt / bucketMs rounded down).
-  //   - For each (serverId, bucket) keep the MIN(id) — the earliest
-  //     inserted row — and delete the rest.
+  //   - For each (serverId, bucket) keep the earliest-inserted row and
+  //     delete the rest.
+  //
+  // We key the survivor on MIN(rowid), not MIN(id): `id` is a random UUID
+  // text column, so MIN(id) keeps a lexicographically-random row rather than
+  // the oldest. SQLite's implicit integer `rowid` is monotonic with insertion
+  // order, which is the "earliest sample in the bucket" we actually want.
 
   await db.run(sql`
     DELETE FROM metric_snapshots
     WHERE captured_at >= ${start}
       AND captured_at < ${end}
-      AND id NOT IN (
-        SELECT MIN(id)
+      AND rowid NOT IN (
+        SELECT MIN(rowid)
         FROM metric_snapshots
         WHERE captured_at >= ${start}
           AND captured_at < ${end}

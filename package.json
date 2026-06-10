@@ -9,6 +9,7 @@
     "start": "NODE_ENV=production npx tsx server.ts",
     "start:next": "next start",
     "lint": "eslint",
+    "test": "tsx --test \"src/**/*.test.ts\"",
     "build:agent": "bash agent/scripts/build-release.sh"
   },
   "dependencies": {

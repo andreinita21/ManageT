@@ -75,6 +75,19 @@ class AlertEngine extends EventEmitter {
   private thresholds: AlertThresholds;
   private listening = false;
 
+  /**
+   * Edge-trigger state: `${serverId}:${metric}` → timestamp it last fired.
+   * A breach only inserts an alert on the rising edge (first breach) or once
+   * the cooldown has elapsed; the entry is cleared when the metric recovers
+   * below threshold so the next breach fires again. Without this, a server
+   * sitting above threshold inserts an alert row on every ~10s heartbeat —
+   * thousands of rows/day and an unusable alert list during an incident.
+   */
+  private readonly firing = new Map<string, number>();
+
+  /** Minimum gap between repeat alerts for the same server+metric. */
+  private static readonly COOLDOWN_MS = 5 * 60_000;
+
   private constructor(thresholds?: Partial<AlertThresholds>) {
     super();
     this.thresholds = { ...DEFAULT_THRESHOLDS, ...thresholds };
@@ -218,7 +231,24 @@ class AlertEngine extends EventEmitter {
       });
     }
 
+    // Edge-trigger + cooldown. Clear recovered metrics first so a future
+    // breach re-arms, then fire only on a rising edge or past the cooldown.
+    const ALL_METRICS = ["cpuPercent", "memoryPercent", "diskUsedPercent", "load1m"];
+    const breached = new Set(checks.map((c) => c.metric));
+    for (const metric of ALL_METRICS) {
+      if (!breached.has(metric)) {
+        this.firing.delete(`${snapshot.serverId}:${metric}`);
+      }
+    }
+
+    const now = Date.now();
     for (const check of checks) {
+      const key = `${snapshot.serverId}:${check.metric}`;
+      const lastFired = this.firing.get(key);
+      if (lastFired !== undefined && now - lastFired < AlertEngine.COOLDOWN_MS) {
+        continue; // already firing and within the cooldown window
+      }
+      this.firing.set(key, now);
       await this.createAlert(snapshot.serverId, check.metric, check.threshold, check.value);
     }
   }
