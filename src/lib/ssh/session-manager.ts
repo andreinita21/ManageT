@@ -41,8 +41,10 @@ import type { Session } from "@/types";
 import {
   agentRequest,
   openAgentAttach,
+  openAgentTail,
   type AgentSessionInfo,
   type AttachedHandle,
+  type TailHandle,
 } from "./agent-socket";
 
 /** Detach a session from any group it belongs to and auto-delete that
@@ -169,6 +171,26 @@ export async function attachSession(
       await detachFromGroupOnClose(sessionId);
       return null;
     }
+    throw err;
+  }
+}
+
+/**
+ * Open a tail (timestamped log line) channel to the agent for the stacks
+ * debugger view. Unlike `attachSession` this doesn't touch the DB row —
+ * tailing is a passive read and shouldn't flip a session's status. Returns
+ * null when the session is unknown to the agent (stale row) so the caller
+ * can render the column as "not running" instead of erroring.
+ */
+export async function tailSession(
+  serverId: string,
+  sessionId: string
+): Promise<TailHandle | null> {
+  try {
+    return await openAgentTail(serverId, sessionId);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/no session matches/i.test(msg)) return null;
     throw err;
   }
 }

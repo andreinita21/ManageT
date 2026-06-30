@@ -34,10 +34,23 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
-use super::protocol::SessionInfo;
+use super::protocol::{LogLine, SessionInfo};
 
 /// Hold the most recent N bytes of output for replay on attach.
 const SCROLLBACK_BYTES: usize = 4 * 1024 * 1024;
+/// Hold the most recent N timestamped log lines for the debugger-view
+/// `Tail` replay. Independent of the byte scrollback above: that one
+/// feeds xterm/vt100 (raw bytes, partial lines, escape sequences); this
+/// one feeds the time-aligned table (clean text, one entry per line).
+const LOG_RING_LINES: usize = 5000;
+/// A line with no terminating `\n`/`\r` (e.g. a shell prompt) is flushed
+/// into the log ring once it's been idle this long, so it still appears
+/// in the debugger view instead of waiting forever for a newline.
+const LINE_IDLE_FLUSH_MS: u64 = 200;
+/// Hard cap on an un-terminated line's length before we flush it anyway,
+/// so a newline-less stream (rare) can't grow the pending buffer without
+/// bound between idle ticks.
+const LINE_MAX_BYTES: usize = 8192;
 /// Backpressure on the live broadcast channel before we start dropping.
 const OUTPUT_CHAN_CAP: usize = 256;
 /// Backpressure on the per-session input channel.
@@ -64,6 +77,16 @@ const DETACH_MARKER: &[u8] = b"\x1b]7777;MANAGET_DETACH\x07";
 /// payload can't be re-interpreted by the user's `$IFS`/`$PS1`/etc.
 const DETACH_MARKER_PRINTF: &str = r"\033]7777;MANAGET_DETACH\007";
 
+/// The not-yet-terminated tail of the output stream, awaiting a newline
+/// (or an idle flush). `started_ms` is when its first byte arrived — that
+/// becomes the line's timestamp, so a line is dated by when it *began*
+/// printing rather than when it happened to end.
+#[derive(Default)]
+struct LinePending {
+    buf: Vec<u8>,
+    started_ms: u64,
+}
+
 pub struct Session {
     pub id: String,
     /// Display name shown by `managet list` / `managet attach <name>` and
@@ -75,6 +98,21 @@ pub struct Session {
 
     /// Bounded ring of recent output bytes for replay on attach.
     scrollback: Mutex<VecDeque<u8>>,
+
+    /// Bounded ring of recent timestamped log lines for the debugger
+    /// view's `Tail` replay. Populated alongside `scrollback` from the
+    /// PTY reader, but line-split and control-stripped.
+    log_ring: Mutex<VecDeque<LogLine>>,
+
+    /// Live log-line broadcast — every `Tail` client subscribes here and
+    /// receives each line as it's completed.
+    log_tx: broadcast::Sender<LogLine>,
+
+    /// The in-progress output line not yet terminated by `\n`/`\r`. The
+    /// PTY reader appends bytes here; a completed line moves to `log_ring`
+    /// + `log_tx`. The idle flusher empties it when output goes quiet so a
+    /// trailing prompt still shows up in the debugger view.
+    log_pending: Mutex<LinePending>,
 
     /// Live output broadcast — every attached client gets a `subscribe()`
     /// receiver and reads new bytes from there.
@@ -152,6 +190,95 @@ impl Session {
 
     pub fn snapshot_scrollback(&self) -> Vec<u8> {
         self.scrollback.lock().unwrap().iter().copied().collect()
+    }
+
+    /// Snapshot the whole log ring for replay when a `Tail` client
+    /// connects, oldest line first.
+    pub fn snapshot_log(&self) -> Vec<LogLine> {
+        self.log_ring.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// Subscribe to live log lines (used by `Tail` after the ring replay).
+    pub fn log_receiver(&self) -> broadcast::Receiver<LogLine> {
+        self.log_tx.subscribe()
+    }
+
+    /// Feed a chunk of already-DETACH_MARKER-stripped PTY output into the
+    /// line log. Splits on `\n`/`\r`, control-strips each completed line,
+    /// and pushes it to the ring + broadcast. Treating `\r` as a line
+    /// break (as well as `\n`) means a carriage-return redraw — a
+    /// progress bar, a `\r`-terminated status line — lands as its own
+    /// timestamped row instead of accumulating forever in `pending`.
+    /// Lines that strip down to nothing (pure escape sequences) are
+    /// dropped so the debugger view has no blank rows.
+    pub fn ingest_log_bytes(&self, data: &[u8]) {
+        let now = now_ms();
+        let mut completed: Vec<LogLine> = Vec::new();
+        {
+            let mut pending = self.log_pending.lock().unwrap();
+            for &b in data {
+                if b == b'\n' || b == b'\r' {
+                    if !pending.buf.is_empty() {
+                        let text = strip_ansi_to_string(&pending.buf);
+                        let t = pending.started_ms;
+                        pending.buf.clear();
+                        if !text.is_empty() {
+                            completed.push(LogLine { t, line: text });
+                        }
+                    }
+                } else {
+                    if pending.buf.is_empty() {
+                        pending.started_ms = now;
+                    }
+                    pending.buf.push(b);
+                }
+            }
+            if pending.buf.len() > LINE_MAX_BYTES {
+                let text = strip_ansi_to_string(&pending.buf);
+                let t = pending.started_ms;
+                pending.buf.clear();
+                if !text.is_empty() {
+                    completed.push(LogLine { t, line: text });
+                }
+            }
+        }
+        for line in completed {
+            self.push_log_line(line);
+        }
+    }
+
+    /// Flush a pending (newline-less) line into the log once it's been
+    /// idle for `idle_ms`. Called on a timer so a trailing prompt that
+    /// never gets a newline still reaches the debugger view.
+    pub fn flush_pending_log(&self, idle_ms: u64) {
+        let now = now_ms();
+        let line = {
+            let mut pending = self.log_pending.lock().unwrap();
+            if pending.buf.is_empty() || now.saturating_sub(pending.started_ms) < idle_ms {
+                return;
+            }
+            let text = strip_ansi_to_string(&pending.buf);
+            let t = pending.started_ms;
+            pending.buf.clear();
+            if text.is_empty() {
+                return;
+            }
+            LogLine { t, line: text }
+        };
+        self.push_log_line(line);
+    }
+
+    fn push_log_line(&self, line: LogLine) {
+        {
+            let mut ring = self.log_ring.lock().unwrap();
+            if ring.len() >= LOG_RING_LINES {
+                ring.pop_front();
+            }
+            ring.push_back(line.clone());
+        }
+        // Err when no Tail clients are subscribed — harmless, the ring
+        // still holds it for the next connection's replay.
+        let _ = self.log_tx.send(line);
     }
 
     pub fn input_sender(&self) -> mpsc::Sender<Bytes> {
@@ -435,9 +562,27 @@ impl SessionManager {
         // if the cwd is inaccessible to the target user (or has been
         // deleted between `managet new` and exec) — they keep their
         // default starting directory instead of getting a hard failure.
+        //
+        // macOS TCC caveat: `chdir` into a privacy-protected folder
+        // (~/Desktop, ~/Documents, ~/Downloads, iCloud Drive…) is NOT
+        // gated, so the `cd` *succeeds* — but the first `readdir` the
+        // interactive shell does there (prompt vcs info, a glob, plain
+        // `ls`) then blocks forever on a TCC decision that never arrives
+        // for a headless root daemon without Full Disk Access. The result
+        // is a dead session: bar shows, no prompt, keystrokes echo but
+        // nothing runs. Detect that hang with a short, killable probe and
+        // fall back to $HOME plus a one-line notice instead of shipping a
+        // wedged shell. `cwd_read_hangs` is a no-op (always false) off
+        // macOS, so other platforms keep the exact old behaviour.
+        let mut cwd_banner = String::new();
         let cd_prefix = match cwd.as_deref() {
             Some(p) if !p.is_empty() => {
-                format!("cd {} 2>/dev/null || true; ", shell_single_quote(p))
+                if cwd_read_hangs(p) {
+                    cwd_banner = unreadable_cwd_banner(p);
+                    String::new()
+                } else {
+                    format!("cd {} 2>/dev/null || true; ", shell_single_quote(p))
+                }
             }
             _ => String::new(),
         };
@@ -550,13 +695,14 @@ impl SessionManager {
         // shell). After 200 instant failures we surface a clear
         // message and exit; the session is then cleaned up normally.
         let wrapped = format!(
-            "i=0; while :; do ({body}); printf '{marker}'; \
+            "{banner}i=0; while :; do ({body}); printf '{marker}'; \
              i=$((i+1)); \
              if [ $i -gt 200 ]; then \
                  printf '\\n[managet] inner shell respawned 200 times in a row — giving up\\n'; \
                  exit 1; \
              fi; \
              done",
+            banner = cwd_banner,
             body = session_body,
             marker = DETACH_MARKER_PRINTF,
         );
@@ -621,6 +767,10 @@ impl SessionManager {
         let root_pid = child.process_id();
 
         let (output_tx, _) = broadcast::channel::<Bytes>(OUTPUT_CHAN_CAP);
+        // Log-line broadcast for the debugger view. Sized like the byte
+        // output channel — Tail clients that lag past it just miss live
+        // lines (the ring still has them on the next replay).
+        let (log_tx, _) = broadcast::channel::<LogLine>(OUTPUT_CHAN_CAP);
         let (input_tx, mut input_rx) = mpsc::channel::<Bytes>(INPUT_CHAN_CAP);
         let (resize_tx, mut resize_rx) = mpsc::channel::<(u16, u16)>(8);
         // Small capacity is fine — pulses are fired once per event,
@@ -636,6 +786,9 @@ impl SessionManager {
             command: command_label.clone(),
             created_at_ms: now_ms(),
             scrollback: Mutex::new(VecDeque::new()),
+            log_ring: Mutex::new(VecDeque::new()),
+            log_tx: log_tx.clone(),
+            log_pending: Mutex::new(LinePending::default()),
             output_tx: output_tx.clone(),
             detach_pulse_tx: detach_pulse_tx.clone(),
             shutdown_pulse_tx,
@@ -775,6 +928,29 @@ impl SessionManager {
             });
         }
 
+        // Idle flusher: a newline-less trailing line (a shell prompt, a
+        // `read -p` question) would otherwise sit in `log_pending` forever
+        // and never reach the debugger view. Tick a few times a second and
+        // flush it once it's gone quiet. Exits once the shell is dead and
+        // nothing's left pending, so it doesn't outlive the session.
+        {
+            let session = session.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(
+                    std::time::Duration::from_millis(LINE_IDLE_FLUSH_MS),
+                );
+                loop {
+                    tick.tick().await;
+                    session.flush_pending_log(LINE_IDLE_FLUSH_MS);
+                    if !session.running.load(Ordering::SeqCst)
+                        && session.log_pending.lock().unwrap().buf.is_empty()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+
         info!(id = %id, name = %name, command = %command_label, "session created");
 
         self.sessions
@@ -821,6 +997,11 @@ fn emit_bytes(session: &Arc<Session>, data: &[u8]) {
     }
     let bytes: Bytes = Bytes::copy_from_slice(data);
     session.append_scrollback(&bytes);
+    // Same bytes feed the debugger-view line log (split + timestamped +
+    // control-stripped there). Done before the broadcast so a line's
+    // timestamp reflects when it was read, not when a slow subscriber
+    // drained it.
+    session.ingest_log_bytes(data);
     // Broadcast send returns Err when no receivers are subscribed
     // (e.g. detached session). That's fine — scrollback still has it.
     let _ = session.output_tx.send(bytes);
@@ -876,8 +1057,131 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Strip terminal control sequences from one raw PTY line, returning
+/// readable text for the debugger log. We deliberately discard colour and
+/// cursor movement rather than translate it: the debugger view is a
+/// time-aligned table, so a clean plain-text line is what aligns. Handles:
+///   * CSI    — `ESC [` … final byte in `0x40..=0x7E` (colours, cursor,
+///              erase),
+///   * OSC    — `ESC ]` … terminated by BEL (`0x07`) or ST (`ESC \`)
+///              (window titles, hyperlinks),
+///   * other  — a two-byte `ESC <x>` escape (charset selects, etc.),
+///   * stray control bytes (`< 0x20`, `0x7F`), keeping only `\t`.
+/// Invalid UTF-8 is replaced lossily so a mid-character byte split across
+/// PTY reads can't panic.
+fn strip_ansi_to_string(data: &[u8]) -> String {
+    let mut out: Vec<u8> = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        let b = data[i];
+        if b == 0x1b {
+            match data.get(i + 1) {
+                Some(b'[') => {
+                    // CSI: consume params/intermediates up to the final byte.
+                    i += 2;
+                    while i < data.len() && !(0x40..=0x7e).contains(&data[i]) {
+                        i += 1;
+                    }
+                    if i < data.len() {
+                        i += 1; // the final byte itself
+                    }
+                }
+                Some(b']') => {
+                    // OSC: run until BEL or ST (`ESC \`).
+                    i += 2;
+                    while i < data.len() {
+                        if data[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if data[i] == 0x1b && data.get(i + 1) == Some(&b'\\') {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                Some(_) => i += 2, // ESC + one byte (e.g. charset select)
+                None => i += 1,    // lone trailing ESC
+            }
+        } else if b == b'\t' {
+            out.push(b'\t');
+            i += 1;
+        } else if b < 0x20 || b == 0x7f {
+            i += 1; // drop other control bytes
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+}
+
+/// macOS only: does *reading* `dir` block past a short deadline?
+///
+/// That hang is the signature of a TCC-protected location (~/Desktop,
+/// ~/Documents, ~/Downloads, iCloud Drive…) when the agent lacks Full Disk
+/// Access — `chdir` succeeds but `readdir` wedges forever waiting on a
+/// privacy decision no one can answer in a headless daemon. We probe with a
+/// throwaway `/bin/ls` we can *kill*, so a directory that would hang the
+/// session shell is detected without hanging the agent. A fast exit (dir
+/// readable, missing, or plainly permission-denied) returns false — those
+/// cases are already handled cleanly by `cd … 2>/dev/null || true`. We probe
+/// as the agent's own uid; TCC keys on the responsible process (the daemon),
+/// not the uid, so the result matches what the su'd session shell would hit.
+#[cfg(target_os = "macos")]
+fn cwd_read_hangs(dir: &str) -> bool {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let mut child = match Command::new("/bin/ls")
+        .args(["-1A", "--", dir])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        // Couldn't even spawn the probe — don't withhold the cd on a guess.
+        Err(_) => return false,
+    };
+    let deadline = Instant::now() + Duration::from_millis(1200);
+    loop {
+        match child.try_wait() {
+            // Exited before the deadline → not a TCC hang.
+            Ok(Some(_)) => return false,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cwd_read_hangs(_dir: &str) -> bool {
+    false
+}
+
+/// `printf` snippet shown once at session start when the requested cwd could
+/// not be read and we fell back to $HOME. The directory is passed as a `%s`
+/// *argument* (single-quoted), never spliced into the format string, so a
+/// path containing `%` or `\` can't reinterpret the format. Plain ASCII only
+/// so every shell's `printf` renders it identically.
+fn unreadable_cwd_banner(dir: &str) -> String {
+    let fmt = "\\r\\n\\033[1;33m[managet] could not read %s - starting in your \
+               home directory.\\033[0m\\r\\n\\033[1;33m[managet] macOS: grant \
+               Full Disk Access to /usr/local/bin/managet-agent, then run: \
+               managet restart\\033[0m\\r\\n\\r\\n";
+    format!("printf '{fmt}' {dir}; ", fmt = fmt, dir = shell_single_quote(dir))
 }
 
 fn su_login_command(user: &str, payload: &str) -> String {
@@ -918,7 +1222,9 @@ fn shell_single_quote(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::build_su_login_command;
+    use super::{build_su_login_command, unreadable_cwd_banner};
+    #[cfg(not(target_os = "macos"))]
+    use super::cwd_read_hangs;
 
     #[test]
     fn builds_linux_su_command_with_session_command() {
@@ -942,5 +1248,33 @@ mod tests {
             build_su_login_command("o'brien", "echo 'hi'", false),
             "su -l 'o'\\''brien' -c 'echo '\\''hi'\\'''"
         );
+    }
+
+    #[test]
+    fn cwd_banner_passes_dir_as_quoted_printf_arg() {
+        let b = unreadable_cwd_banner("/Users/andrei/Desktop/biletly");
+        // printf format up front, directory as a *single-quoted argument*
+        // (never interpolated into the format string), trailing `; `.
+        assert!(b.starts_with("printf '"));
+        assert!(b.contains("'/Users/andrei/Desktop/biletly'"));
+        assert!(b.contains("Full Disk Access"));
+        assert!(b.contains("%s"));
+        assert!(b.ends_with("; "));
+    }
+
+    #[test]
+    fn cwd_banner_escapes_single_quotes_in_dir() {
+        // A path with an apostrophe must stay safely quoted so it can't
+        // break out of the printf argument.
+        let b = unreadable_cwd_banner("/Users/o'brien/Desktop");
+        assert!(b.contains(r"'/Users/o'\''brien/Desktop'"));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn cwd_read_hangs_is_a_noop_off_macos() {
+        // Off macOS there is no TCC, so we never withhold the cd — even for
+        // a path that does not exist.
+        assert!(!cwd_read_hangs("/no/such/dir/anywhere"));
     }
 }

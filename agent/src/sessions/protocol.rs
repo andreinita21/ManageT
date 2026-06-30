@@ -71,6 +71,17 @@ pub enum Request {
     /// older agents reply with `Response::Error` for an unknown op,
     /// which the dashboard treats as "name updated locally only".
     Rename { id: String, name: String },
+    /// Begin streaming a session's output as timestamped, control-stripped
+    /// log lines — one `LogLine` JSON object per newline-terminated wire
+    /// line. Powers the stacks "debugger view", which aligns multiple
+    /// services' output on a shared server-time axis. Unlike `Attach`,
+    /// the connection stays in newline-delimited JSON for its whole life
+    /// (it never switches to a raw byte stream). The agent first replays
+    /// its bounded line ring (so prior history is visible), then streams
+    /// live lines as the PTY produces them. Added after `Rename`; older
+    /// agents reply `Response::Error` for the unknown op, which callers
+    /// treat as "this host can't tail" and fall back to the plain mosaic.
+    Tail { id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +97,19 @@ pub enum Response {
     Ok,
     /// Anything that went wrong.
     Error { message: String },
+}
+
+/// One timestamped, control-stripped output line streamed in response to
+/// a `Tail` request. `t` is the wall-clock instant the agent finished
+/// reading the line off the PTY, in milliseconds since the Unix epoch —
+/// i.e. *server* time, captured before any network hop, so a client can
+/// align several sessions' output on one axis. `line` has had terminal
+/// escape sequences and stray control bytes removed so it renders cleanly
+/// in a table; it carries no trailing newline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogLine {
+    pub t: u64,
+    pub line: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

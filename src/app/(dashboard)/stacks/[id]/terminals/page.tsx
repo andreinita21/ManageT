@@ -35,6 +35,7 @@ import {
 } from "@/lib/hooks/useApi";
 import { TerminalPane } from "@/components/terminal/TerminalPane";
 import { LayoutPicker } from "../../../groups/[id]/GroupHeaderWidgets";
+import { StackDebugger, type DebuggerColumn } from "./StackDebugger";
 import type {
   GroupLayout,
   Server,
@@ -43,6 +44,14 @@ import type {
 } from "@/types";
 
 const LAYOUT_DEBOUNCE_MS = 350;
+
+/** How often this page refetches stack runtime. Faster than the default so a
+ *  stack you stop elsewhere flips its panes to "not running" promptly. */
+const RUNTIME_POLL_MS = 4000;
+/** How long a service must stay inactive before a pinned (sticky) terminal
+ *  pane is dropped. Must exceed one `RUNTIME_POLL_MS` so a single transient
+ *  inactive poll (respawn gap / blip) can't close a live pane. */
+const PIN_CLEAR_MS = 6000;
 
 /** Stacks default to one row of everything — that's what the page always
  *  rendered before the arrangement picker existed, so saved-layout-less
@@ -98,7 +107,7 @@ export default function StackTerminalsPage({
     refetch: refetchStack,
   } = useStack(stackId);
   const { data: servers } = useServers();
-  const { data: runtimeMap } = useStackRuntimes();
+  const { data: runtimeMap } = useStackRuntimes(RUNTIME_POLL_MS);
 
   const serversById = useMemo(() => {
     const m = new Map<string, Server>();
@@ -119,6 +128,25 @@ export default function StackTerminalsPage({
     [stack?.services]
   );
   const serviceCount = services.length;
+
+  // ---- Debugger view (time-aligned log table) toggle ----
+  const [debugMode, setDebugMode] = useState(false);
+  const debuggerColumns = useMemo<DebuggerColumn[]>(
+    () =>
+      services.map((svc) => {
+        const rt = runtimeByService.get(svc.id);
+        return {
+          serviceId: svc.id,
+          name: svc.name,
+          serverId: svc.serverId,
+          serverName:
+            serversById.get(svc.serverId)?.name ?? svc.serverId.slice(0, 6),
+          sessionId:
+            rt?.status === "active" ? rt.sessionId ?? null : null,
+        };
+      }),
+    [services, runtimeByService, serversById]
+  );
 
   // ---- Persisted layout (same storage the CLI's Ctrl-A R/V writes) ----
   const [layoutState, setLayoutState] = useState<{
@@ -358,23 +386,41 @@ export default function StackTerminalsPage({
           </span>
         </div>
         <div className="flex items-center gap-3">
-          <p className="text-xs text-mg-text-tertiary hidden md:block">
-            Drag a title bar onto another pane to swap • dividers resize
-          </p>
-          <LayoutPicker
-            memberCount={serviceCount}
-            current={activePartition}
-            onPick={pickPartition}
-          />
+          {!debugMode && (
+            <p className="text-xs text-mg-text-tertiary hidden md:block">
+              Drag a title bar onto another pane to swap • dividers resize
+            </p>
+          )}
+          <button
+            type="button"
+            onClick={() => setDebugMode((v) => !v)}
+            title="Toggle the time-aligned log table (server timestamps, one column per service)"
+            className={`text-xs px-2 py-1 rounded border transition-colors ${
+              debugMode
+                ? "border-mg-accent text-mg-accent bg-mg-accent/10"
+                : "border-mg-border text-mg-text-tertiary hover:text-mg-text hover:border-mg-text-tertiary"
+            }`}
+          >
+            Debugger
+          </button>
+          {!debugMode && (
+            <LayoutPicker
+              memberCount={serviceCount}
+              current={activePartition}
+              onPick={pickPartition}
+            />
+          )}
         </div>
       </div>
 
-      {/* Mosaic */}
+      {/* Mosaic — or, in debugger mode, the time-aligned log table. */}
       <div className="flex-1 min-h-0">
         {serviceCount === 0 ? (
           <div className="flex items-center justify-center h-full text-sm text-mg-text-tertiary">
             This stack has no services.
           </div>
+        ) : debugMode ? (
+          <StackDebugger columns={debuggerColumns} />
         ) : !layout ? (
           <div className="flex items-center justify-center h-full text-sm text-mg-text-tertiary">
             Restoring layout…
@@ -432,24 +478,47 @@ function TerminalPanel({
 
   // Sticky session id: once we've seen a live sessionId for this service,
   // keep the TerminalPane mounted on that id even if the next runtime poll
-  // briefly shows "inactive" (network blip, agent heartbeat lag). The
-  // agent keeps the PTY + scrollback alive regardless of our DB row's
-  // current status, so an unnecessary unmount throws away the in-xterm
-  // scrollback buffer and forces a re-attach (with another scrollback
-  // replay) which the user perceives as the terminal "blinking" and
-  // forgetting state. We only swap the pinned id when runtime hands us a
-  // genuinely different sessionId — that's the "session was respawned"
-  // case where a fresh xterm is correct. State (not a ref) because the
+  // briefly shows "inactive" (network blip, agent heartbeat lag, or the
+  // short gap while a session respawns). The agent keeps the PTY +
+  // scrollback alive across those, so an unnecessary unmount throws away
+  // the in-xterm scrollback and forces a re-attach (blink). We swap the
+  // pin when runtime hands us a genuinely different sessionId (respawn).
+  //
+  // BUT a *stopped* stack is a permanent inactive, not a blip — leaving the
+  // dead terminal pinned forever is wrong. So when the service stays
+  // inactive past a short window (longer than one runtime poll, so a single
+  // transient inactive can't trip it), drop the pin and let the pane fall
+  // back to the "not running" placeholder. State (not a ref) because the
   // value feeds the render below.
   const [pinnedSessionId, setPinnedSessionId] = useState<string | null>(null);
+  const clearPinTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     if (runtime?.sessionId) {
+      if (clearPinTimer.current) {
+        clearTimeout(clearPinTimer.current);
+        clearPinTimer.current = null;
+      }
       // setState bails out when the value is unchanged, so this only
       // re-renders on a genuine session swap.
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setPinnedSessionId(runtime.sessionId);
+    } else if (
+      runtime?.status === "inactive" &&
+      pinnedSessionId &&
+      !clearPinTimer.current
+    ) {
+      clearPinTimer.current = setTimeout(() => {
+        clearPinTimer.current = null;
+        setPinnedSessionId(null);
+      }, PIN_CLEAR_MS);
     }
-  }, [runtime?.sessionId]);
+  }, [runtime?.sessionId, runtime?.status, pinnedSessionId]);
+  useEffect(
+    () => () => {
+      if (clearPinTimer.current) clearTimeout(clearPinTimer.current);
+    },
+    []
+  );
   const effectiveSessionId = runtime?.sessionId ?? pinnedSessionId;
   const showTerminal = effectiveSessionId !== null;
 

@@ -30,7 +30,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, info};
 
 use super::manager::{Session, SessionManager};
-use super::protocol::{Request, Response};
+use super::protocol::{LogLine, Request, Response};
 
 /// Default path for the agent's local control socket. Linux + macOS
 /// both honour `/var/run/managet/agent.sock` since the agent runs as
@@ -371,7 +371,78 @@ async fn handle_client(stream: UnixStream, manager: Arc<SessionManager>) -> Resu
 
             stream_attached(reader, wr, sess).await
         }
+        Request::Tail { id } => {
+            let sess = match manager.resolve(&id) {
+                Ok(s) => s,
+                Err(e) => {
+                    send_resp(
+                        &mut wr,
+                        &Response::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            // Ack, then switch this connection to a one-way stream of
+            // newline-delimited LogLine JSON (ring replay, then live).
+            send_resp(&mut wr, &Response::Ok).await?;
+            stream_tail(wr, sess).await
+        }
     }
+}
+
+/// One-way stream of timestamped log lines for the debugger view. Replays
+/// the session's bounded line ring (so history is visible the instant a
+/// client connects), then forwards every newly-completed line. Each line
+/// is one newline-terminated `LogLine` JSON object — the same framing the
+/// pre-attach protocol uses, so the client reads it with a plain line
+/// reader. Read side is ignored: a `Tail` client never sends input.
+async fn stream_tail(
+    mut wr: tokio::net::unix::OwnedWriteHalf,
+    sess: Arc<Session>,
+) -> Result<()> {
+    async fn write_line(
+        wr: &mut tokio::net::unix::OwnedWriteHalf,
+        line: &LogLine,
+    ) -> bool {
+        match serde_json::to_string(line) {
+            Ok(mut s) => {
+                s.push('\n');
+                wr.write_all(s.as_bytes()).await.is_ok()
+            }
+            // A line that won't serialize (shouldn't happen for a String)
+            // is skipped rather than killing the whole stream.
+            Err(_) => true,
+        }
+    }
+
+    // Subscribe before snapshotting the ring so a line completed in the
+    // gap between the two still arrives live (a duplicate is far better
+    // than a dropped line; the client tolerates it).
+    let mut rx = sess.log_receiver();
+    for line in sess.snapshot_log() {
+        if !write_line(&mut wr, &line).await {
+            return Ok(());
+        }
+    }
+    loop {
+        match rx.recv().await {
+            Ok(line) => {
+                if !write_line(&mut wr, &line).await {
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+            // Lagged: the client fell behind the live channel. The ring
+            // still holds the lines; rather than reconcile here we just
+            // keep streaming from the current position. A reconnect
+            // replays the ring in full.
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+        }
+    }
+    Ok(())
 }
 
 /// Bidirectional pipe between a client connection and a session.

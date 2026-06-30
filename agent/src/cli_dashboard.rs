@@ -7,7 +7,7 @@
 //! user-scoped dashboard login, group metadata/layout REST calls, and a
 //! small managet-owned multi-pane terminal view over the dashboard WS.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{IsTerminal, Stdout, Write};
 use std::path::PathBuf;
@@ -608,7 +608,24 @@ struct Pane {
     /// host temp from the server's latest metric snapshot). `None` for
     /// group panes, which don't surface per-pane stats.
     stats: Option<PaneStats>,
+    /// Timestamped log lines for the debugger view (Ctrl-A L). Populated
+    /// from `session:log` frames while a tail is active; persists across
+    /// reconciles (and even a respawn of the slot's session) so the
+    /// time-aligned table keeps a continuous history per service.
+    logs: VecDeque<LogRow>,
 }
+
+/// One line in a pane's debugger-view log buffer: the agent's server-side
+/// timestamp (ms since the Unix epoch) and the control-stripped text.
+#[derive(Clone)]
+struct LogRow {
+    t: u64,
+    text: String,
+}
+
+/// Cap on a pane's debugger log buffer. ~4k lines per service is plenty of
+/// scrollback for spotting a crash without unbounded growth.
+const DEBUG_LOG_CAP: usize = 4000;
 
 /// Compact per-pane resource readout shown on the bottom border of a stack
 /// pane. All fields optional — an older agent or a host with no sensor
@@ -3035,6 +3052,7 @@ fn build_stack_panes(
                 parser: vt100::Parser::new(inner_rows, inner_cols, 0),
                 lost: None,
                 stats: service_stats(detail, &svc.id),
+                logs: VecDeque::new(),
             }
         })
         .collect()
@@ -3138,14 +3156,15 @@ async fn reconcile_stack_after_fetch(
         rows,
     );
 
-    let mut preserved: HashMap<String, (Option<String>, vt100::Parser)> = HashMap::new();
+    let mut preserved: HashMap<String, (Option<String>, vt100::Parser, VecDeque<LogRow>)> =
+        HashMap::new();
     for old in panes.drain(..) {
         let sid = old.session.as_ref().map(|s| s.id.clone());
-        preserved.insert(old.slot_key.clone(), (sid, old.parser));
+        preserved.insert(old.slot_key.clone(), (sid, old.parser, old.logs));
     }
     let mut rebuilt = Vec::with_capacity(fresh.len());
     for mut p in fresh {
-        if let Some((old_sid, parser)) = preserved.remove(&p.slot_key) {
+        if let Some((old_sid, parser, logs)) = preserved.remove(&p.slot_key) {
             let new_sid = p.session.as_ref().map(|s| s.id.clone());
             // Only reuse scrollback when the slot still points at the same
             // session (or is still a placeholder). A respawned session
@@ -3156,6 +3175,10 @@ async fn reconcile_stack_after_fetch(
                 reused.set_size(h, w);
                 p.parser = reused;
             }
+            // Keep the debugger log timeline for this slot regardless of a
+            // session respawn — the table is meant to span the whole
+            // debugging session, not reset when a service restarts.
+            p.logs = logs;
         }
         rebuilt.push(p);
     }
@@ -3296,12 +3319,73 @@ pub async fn run_stack_open(
     let mut palette_ov: Option<MosaicPaletteState> = None;
     let mut layout_picker: Option<LayoutPickerState> = None;
     let mut swap: Option<SwapState> = None;
+    // Debugger view (Ctrl-A L): a time-aligned table of every service's
+    // output instead of the mosaic. `debug_scroll` is rows scrolled up
+    // from the live bottom (0 = following). `tailed` tracks which sessions
+    // we've opened a `session:tail` for so reconciles don't re-replay.
+    let mut debug_view = false;
+    let mut debug_scroll: usize = 0;
+    let mut tailed: HashSet<String> = HashSet::new();
     loop {
         tokio::select! {
             maybe_event = event_rx.recv() => {
                 let Some(ev) = maybe_event else { break; };
                 match ev {
                     Event::Key(key) => {
+                        // Debugger view owns all keys while it's up: a small
+                        // control set (toggle off, detach, scroll) instead of
+                        // the mosaic's overlays. Handled first so none of the
+                        // pane-editing shortcuts fire underneath the table.
+                        if debug_view {
+                            let mut quit = false;
+                            if escape {
+                                escape = false;
+                                match key.code {
+                                    KeyCode::Char('l') | KeyCode::Char('L') => {
+                                        debug_view = false;
+                                        debug_scroll = 0;
+                                        sync_debug_tails(false, &panes, &mut tailed, &send_tx).await?;
+                                    }
+                                    KeyCode::Char('d') | KeyCode::Char('D') => quit = true,
+                                    _ => {}
+                                }
+                            } else if key.modifiers.contains(KeyModifiers::CONTROL)
+                                && key.code == KeyCode::Char('a')
+                            {
+                                escape = true;
+                            } else {
+                                match key.code {
+                                    KeyCode::Char('q') => quit = true,
+                                    KeyCode::Up | KeyCode::Char('k') => {
+                                        debug_scroll = debug_scroll.saturating_add(1);
+                                    }
+                                    KeyCode::Down | KeyCode::Char('j') => {
+                                        debug_scroll = debug_scroll.saturating_sub(1);
+                                    }
+                                    KeyCode::PageUp => {
+                                        debug_scroll = debug_scroll.saturating_add(10);
+                                    }
+                                    KeyCode::PageDown => {
+                                        debug_scroll = debug_scroll.saturating_sub(10);
+                                    }
+                                    KeyCode::Home | KeyCode::Char('g') => {
+                                        debug_scroll = usize::MAX;
+                                    }
+                                    KeyCode::End | KeyCode::Char('G') => debug_scroll = 0,
+                                    _ => {}
+                                }
+                            }
+                            if quit {
+                                break;
+                            }
+                            if debug_view {
+                                draw_stack_debug(&mut stdout, &stack_title, &panes, &mut debug_scroll)?;
+                            } else {
+                                draw_stack(&mut stdout, &stack_title, &panes, focused)?;
+                            }
+                            continue;
+                        }
+
                         // Swap mode (Ctrl-A S): same controls as the group
                         // view — arrows move the highlight, Enter picks the
                         // source then the destination, Esc cancels.
@@ -3536,6 +3620,25 @@ pub async fn run_stack_open(
                             continue;
                         }
 
+                        // Ctrl-A L toggles the debugger view — a time-aligned
+                        // table of every service's output. Opens a tail on each
+                        // running session; the table renders from the frames
+                        // those produce.
+                        if escape && matches!(key.code, KeyCode::Char('l') | KeyCode::Char('L')) {
+                            escape = false;
+                            debug_view = true;
+                            debug_scroll = 0;
+                            // Start each debug session clean: the tails about to
+                            // open replay each session's ring, so any lines left
+                            // from a previous toggle would otherwise double up.
+                            for p in panes.iter_mut() {
+                                p.logs.clear();
+                            }
+                            sync_debug_tails(true, &panes, &mut tailed, &send_tx).await?;
+                            draw_stack_debug(&mut stdout, &stack_title, &panes, &mut debug_scroll)?;
+                            continue;
+                        }
+
                         // Ctrl-A V opens the layout-arrangement overlay.
                         if escape && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')) {
                             escape = false;
@@ -3580,7 +3683,11 @@ pub async fn run_stack_open(
                                 ).await?;
                             }
                         }
-                        draw_stack(&mut stdout, &stack_title, &panes, focused)?;
+                        if debug_view {
+                            draw_stack_debug(&mut stdout, &stack_title, &panes, &mut debug_scroll)?;
+                        } else {
+                            draw_stack(&mut stdout, &stack_title, &panes, focused)?;
+                        }
                         if let Some(rs) = resize.as_ref() {
                             draw_resize_overlay(&mut stdout, &panes, rs)?;
                         }
@@ -3606,14 +3713,18 @@ pub async fn run_stack_open(
                 match maybe_msg {
                     Some(Ok(Message::Text(text))) => {
                         handle_server_msg(&mut panes, text.as_str(), &send_tx).await;
-                        if !modal_open {
+                        if debug_view {
+                            draw_stack_debug(&mut stdout, &stack_title, &panes, &mut debug_scroll)?;
+                        } else if !modal_open {
                             draw_stack(&mut stdout, &stack_title, &panes, focused)?;
                         }
                     }
                     Some(Ok(Message::Binary(bytes))) => {
                         if let Ok(text) = std::str::from_utf8(&bytes) {
                             handle_server_msg(&mut panes, text, &send_tx).await;
-                            if !modal_open {
+                            if debug_view {
+                                draw_stack_debug(&mut stdout, &stack_title, &panes, &mut debug_scroll)?;
+                            } else if !modal_open {
                                 draw_stack(&mut stdout, &stack_title, &panes, focused)?;
                             }
                         }
@@ -3663,7 +3774,15 @@ pub async fn run_stack_open(
                     current_detail = latest;
                     update_stack_pane_stats(&mut panes, &current_detail);
                 }
-                draw_stack(&mut stdout, &stack_title, &panes, focused)?;
+                if debug_view {
+                    // A reconcile may have flipped services live/dead — open
+                    // tails for newcomers (and drop the gone) so the table
+                    // keeps every running column flowing.
+                    sync_debug_tails(true, &panes, &mut tailed, &send_tx).await?;
+                    draw_stack_debug(&mut stdout, &stack_title, &panes, &mut debug_scroll)?;
+                } else {
+                    draw_stack(&mut stdout, &stack_title, &panes, focused)?;
+                }
             }
         }
     }
@@ -3684,6 +3803,197 @@ fn draw_stack(stdout: &mut Stdout, stack_name: &str, panes: &[Pane], focused: us
     Ok(())
 }
 
+/// Format an epoch-ms timestamp as local `HH:MM:SS.mmm` for the debugger
+/// table. Falls back to raw epoch seconds if libc can't break the time
+/// down (never expected on a healthy host).
+fn fmt_clock(t_ms: u64) -> String {
+    let secs = (t_ms / 1000) as libc::time_t;
+    let mut tmv: libc::tm = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::localtime_r(&secs, &mut tmv) };
+    if ok.is_null() {
+        return format!("{}", t_ms / 1000);
+    }
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        tmv.tm_hour,
+        tmv.tm_min,
+        tmv.tm_sec,
+        t_ms % 1000
+    )
+}
+
+/// Clip `s` to `w` characters (tabs → spaces so they don't blow the column
+/// width). No padding — the table clears the screen each repaint, so a
+/// shorter cell can't leave stale glyphs behind.
+fn clip_cell(s: &str, w: usize) -> String {
+    s.chars()
+        .map(|c| if c == '\t' { ' ' } else { c })
+        .take(w)
+        .collect()
+}
+
+/// A distinct-ish color per service column so adjacent columns read apart.
+/// Purely cosmetic; cycles through theme roles.
+fn column_color(t: &Theme, idx: usize) -> Color {
+    let palette = [
+        t.status_running,
+        t.info,
+        t.accent,
+        t.server_label,
+        t.warning,
+        t.name,
+    ];
+    palette[idx % palette.len()]
+}
+
+/// Render the debugger view: a time-aligned table of every pane's output.
+/// Column 0 is the agent-side timestamp (HH:MM:SS.mmm); each service gets
+/// its own column, and a row carries a line only in the column that
+/// produced it — the other columns stay blank, so reading top to bottom is
+/// the exact chronological interleave and a service going quiet while
+/// another keeps logging is visible as a run of blanks.
+///
+/// `scroll` is rows back from the live bottom (0 = following live output)
+/// and is clamped here to the available history.
+fn draw_stack_debug(
+    stdout: &mut Stdout,
+    stack_name: &str,
+    panes: &[Pane],
+    scroll: &mut usize,
+) -> Result<()> {
+    let t = theme();
+    let (cols, rows) = terminal::size().unwrap_or((120, 36));
+    queue!(stdout, Hide, MoveTo(0, 0), Clear(ClearType::All))?;
+
+    // Status bar (row 0).
+    let running = panes.iter().filter(|p| p.session.is_some()).count();
+    let total = panes.len();
+    let active_text = format!("{running}/{total} running · debugger view");
+    let hints =
+        "Ctrl-A L mosaic · Ctrl-A D detach · ↑/↓ PgUp/PgDn scroll · g top · G live";
+    let segments: [(&str, Color, bool); 7] = [
+        ("managet stack:", t.heading, true),
+        (" ", t.name, false),
+        (stack_name, t.name, true),
+        ("  │  ", t.separator, false),
+        (active_text.as_str(), t.info, false),
+        ("  │  ", t.separator, false),
+        (hints, t.hint, false),
+    ];
+    render_status_segments(stdout, &segments, cols)?;
+
+    if panes.is_empty() || cols < 24 || rows < 4 {
+        stdout.flush()?;
+        return Ok(());
+    }
+
+    // Column geometry: a fixed timestamp column, then equal service columns.
+    let time_w: u16 = 12; // "HH:MM:SS.mmm"
+    let n = panes.len() as u16;
+    let avail = cols.saturating_sub(time_w + 1);
+    let col_w = (avail / n).max(6);
+
+    // Header row (row 1).
+    queue!(
+        stdout,
+        MoveTo(0, 1),
+        SetForegroundColor(t.hint),
+        Print(clip_cell("time", time_w as usize)),
+        ResetColor
+    )?;
+    for (i, pane) in panes.iter().enumerate() {
+        let x = time_w + 1 + (i as u16) * col_w;
+        if x >= cols {
+            break;
+        }
+        let w = col_w.min(cols - x) as usize;
+        let color = column_color(t, i);
+        let bullet = if pane.session.is_some() { "●" } else { "○" };
+        let label = format!("{bullet} {} ({})", pane.title, pane.server_label);
+        queue!(
+            stdout,
+            MoveTo(x, 1),
+            SetForegroundColor(color),
+            SetAttribute(Attribute::Bold),
+            Print(clip_cell(&label, w)),
+            SetAttribute(Attribute::Reset)
+        )?;
+    }
+    queue!(stdout, ResetColor)?;
+
+    // Merge every pane's lines onto one time axis.
+    let mut merged: Vec<(u64, usize, &str)> = Vec::new();
+    for (i, pane) in panes.iter().enumerate() {
+        for row in &pane.logs {
+            merged.push((row.t, i, row.text.as_str()));
+        }
+    }
+    merged.sort_by_key(|(ts, _, _)| *ts);
+
+    let body_top: u16 = 2;
+    let body_h = rows.saturating_sub(body_top) as usize;
+
+    if merged.is_empty() {
+        queue!(
+            stdout,
+            MoveTo(0, body_top + 1),
+            SetForegroundColor(t.hint),
+            Print("  Waiting for output… lines appear here as services log."),
+            ResetColor
+        )?;
+        stdout.flush()?;
+        return Ok(());
+    }
+
+    // Window the last `body_h` rows, offset up by `scroll`.
+    let total_rows = merged.len();
+    let max_scroll = total_rows.saturating_sub(body_h);
+    if *scroll > max_scroll {
+        *scroll = max_scroll;
+    }
+    let start = total_rows.saturating_sub(body_h + *scroll);
+    let end = (start + body_h).min(total_rows);
+
+    let mut y = body_top;
+    let mut last_sec: Option<u64> = None;
+    for &(ts, pane_idx, text) in &merged[start..end] {
+        if y >= rows {
+            break;
+        }
+        // Dim the timestamp when it repeats the previous row's second, so a
+        // burst within one second reads as a visual group.
+        let sec = ts / 1000;
+        let time_color = if Some(sec) == last_sec {
+            t.separator
+        } else {
+            t.hint
+        };
+        last_sec = Some(sec);
+        queue!(
+            stdout,
+            MoveTo(0, y),
+            SetForegroundColor(time_color),
+            Print(clip_cell(&fmt_clock(ts), time_w as usize)),
+            ResetColor
+        )?;
+        let x = time_w + 1 + (pane_idx as u16) * col_w;
+        if x < cols {
+            let w = col_w.min(cols - x) as usize;
+            queue!(
+                stdout,
+                MoveTo(x, y),
+                SetForegroundColor(column_color(t, pane_idx)),
+                Print(clip_cell(text, w)),
+                ResetColor
+            )?;
+        }
+        y += 1;
+    }
+
+    stdout.flush()?;
+    Ok(())
+}
+
 fn draw_stack_status_bar(
     stdout: &mut Stdout,
     stack_name: &str,
@@ -3696,7 +4006,7 @@ fn draw_stack_status_bar(
     let running = panes.iter().filter(|p| p.session.is_some()).count();
     let total = panes.len();
     let active_text = format!("{running}/{total} running · focus {active_slot}:{active_name}");
-    let hints = "Ctrl-A D detach · 1-6 focus · [/] cycle · S swap · V layout · R resize · P palette";
+    let hints = "Ctrl-A D detach · 1-6 focus · [/] cycle · L debug · S swap · V layout · R resize · P palette";
 
     let t = theme();
     let segments: [(&str, Color, bool); 7] = [
@@ -5114,6 +5424,29 @@ async fn handle_server_msg(panes: &mut [Pane], text: &str, send_tx: &mpsc::Sende
                 .find(|p| p.session.as_ref().map(|s| s.id.as_str()) == Some(session_id))
             {
                 pane.parser.process(data.as_bytes());
+            }
+        }
+        Some("session:log") => {
+            let Some(session_id) = value.get("sessionId").and_then(|v| v.as_str()) else {
+                return;
+            };
+            let Some(t) = value.get("t").and_then(|v| v.as_u64()) else {
+                return;
+            };
+            let Some(line) = value.get("line").and_then(|v| v.as_str()) else {
+                return;
+            };
+            if let Some(pane) = panes
+                .iter_mut()
+                .find(|p| p.session.as_ref().map(|s| s.id.as_str()) == Some(session_id))
+            {
+                pane.logs.push_back(LogRow {
+                    t,
+                    text: line.to_string(),
+                });
+                while pane.logs.len() > DEBUG_LOG_CAP {
+                    pane.logs.pop_front();
+                }
             }
         }
         Some("session:lost") => {
@@ -6593,6 +6926,7 @@ fn build_panes(
                 parser: vt100::Parser::new(inner_rows, inner_cols, 0),
                 lost: None,
                 stats: None,
+                logs: VecDeque::new(),
             }
         })
         .collect()
@@ -7002,6 +7336,66 @@ fn client_input_msg(session: &GroupSession, data: &str) -> String {
         "data": data,
     })
     .to_string()
+}
+
+fn client_tail_msg(session: &GroupSession) -> String {
+    serde_json::json!({
+        "type": "session:tail",
+        "sessionId": session.id,
+        "serverId": session.server_id,
+    })
+    .to_string()
+}
+
+fn client_untail_msg(session_id: &str) -> String {
+    serde_json::json!({
+        "type": "session:untail",
+        "sessionId": session_id,
+    })
+    .to_string()
+}
+
+/// Reconcile the set of tailed sessions with what the debugger view needs.
+/// When `on`, tail every running session not already tailed and untail any
+/// that vanished (a stopped or respawned service). When `off`, untail
+/// everything. Sending a tail only for newly-seen sessions avoids a
+/// duplicate ring replay on every reconcile.
+async fn sync_debug_tails(
+    on: bool,
+    panes: &[Pane],
+    tailed: &mut HashSet<String>,
+    send_tx: &mpsc::Sender<String>,
+) -> Result<()> {
+    if !on {
+        for id in tailed.drain() {
+            send_ws(send_tx, client_untail_msg(&id)).await?;
+        }
+        return Ok(());
+    }
+    let live: HashSet<&str> = panes
+        .iter()
+        .filter_map(|p| p.session.as_ref().map(|s| s.id.as_str()))
+        .collect();
+    // Tail newcomers.
+    for pane in panes {
+        if let Some(s) = &pane.session {
+            if !tailed.contains(&s.id) {
+                send_ws(send_tx, client_tail_msg(s)).await?;
+                tailed.insert(s.id.clone());
+            }
+        }
+    }
+    // Untail sessions that are gone.
+    let gone: Vec<String> = tailed
+        .iter()
+        .filter(|id| !live.contains(id.as_str()))
+        .cloned()
+        .collect();
+    for id in gone {
+        tailed.remove(&id);
+        send_ws(send_tx, client_untail_msg(&id)).await?;
+    }
+    Ok(())
 }
 
 fn normalize_api_url(raw: String) -> Result<String> {

@@ -552,20 +552,27 @@ export default function TerminalPaneInner({
             }
             // `resized` means we attached at a different shape than the
             // PTY had until now — so the scrollback the agent just
-            // replayed was painted for another grid and renders as
-            // mangled, interleaved text. Inline TUIs (Claude Code) never
-            // clear that debris; they only repaint their own block. Once
-            // the replay has flushed, wipe the grid and nudge the PTY
-            // with a one-column resize jiggle: the two SIGWINCHes make
-            // the running app repaint everything onto the clean screen —
-            // exactly what the browser zoom-in/out workaround did, minus
-            // the user. When the shape didn't change this is skipped
-            // entirely and the (correctly-shaped) scrollback is kept.
+            // replayed was painted for another grid and renders a bit
+            // mangled. We nudge the PTY with a one-column resize jiggle
+            // (two SIGWINCHes) so the running app repaints at the right
+            // size — the browser zoom-in/out workaround, minus the user.
+            //
+            // We only `reset()` (wipe the grid) when the app owns the
+            // screen — the *alternate* buffer (vim/htop/full-screen TUIs),
+            // where the contents aren't user history and the app repaints
+            // on the jiggle. In the *normal* buffer the grid IS the user's
+            // scrollback: a stale-width replay rewraps slightly, but
+            // deleting it (the old unconditional reset) made history vanish
+            // on every layout change / re-attach at a new size — far worse
+            // than minor rewrap. So there we keep it and let the jiggle
+            // settle the live region.
             if (msg.resized === true) {
               if (redrawTimer) clearTimeout(redrawTimer);
               redrawTimer = setTimeout(() => {
                 if (!mounted || !term) return;
-                try { term.reset(); } catch {}
+                try {
+                  if (term.buffer.active.type === "alternate") term.reset();
+                } catch {}
                 const sendSize = (cols: number) => {
                   if (ws?.readyState === WebSocket.OPEN && sessionId && term) {
                     ws.send(

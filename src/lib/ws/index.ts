@@ -23,9 +23,12 @@
  *     {type:"session:kill",   sessionId}
  *     {type:"terminal:input",  sessionId, data}
  *     {type:"terminal:resize", sessionId, rows, cols}
+ *     {type:"session:tail",    sessionId, serverId}   // debugger view
+ *     {type:"session:untail",  sessionId}
  *   server → client:
  *     {type:"session:state", session: SessionSnapshot}
  *     {type:"terminal:output", sessionId, data}
+ *     {type:"session:log",    sessionId, t, line}     // one log line
  *     {type:"session:lost",   sessionId, reason}
  *
  * Note: `session:attach` carries an explicit `serverId` now. The previous
@@ -47,6 +50,7 @@ import {
   createSession,
   killSession,
   resizeSession,
+  tailSession,
 } from "@/lib/ssh/session-manager";
 
 /** Server states that block terminal interactions from the browser.
@@ -97,7 +101,18 @@ interface AttachState {
   stream: Duplex;
 }
 
+/** Per-WS state for a debugger-view tail. Separate from `AttachState`
+ *  because a session can be both attached (a live mosaic pane) and tailed
+ *  (a debugger-view column) at once — different streams, keyed in
+ *  different maps so neither tears the other down. */
+interface TailState {
+  sessionId: string;
+  serverId: string;
+  stream: Duplex;
+}
+
 const wsAttachments = new Map<WebSocket, Map<string, AttachState>>();
+const wsTails = new Map<WebSocket, Map<string, TailState>>();
 const wsToUser = new Map<WebSocket, string>();
 
 // `tsx` loads server.ts (and this file) as its own ESM copy of the
@@ -192,13 +207,24 @@ interface IncomingResize {
    * cached which server hosts the session yet. */
   serverId?: string;
 }
+interface IncomingTail {
+  type: "session:tail";
+  sessionId: string;
+  serverId: string;
+}
+interface IncomingUntail {
+  type: "session:untail";
+  sessionId: string;
+}
 type IncomingMsg =
   | IncomingCreate
   | IncomingAttach
   | IncomingDetach
   | IncomingKill
   | IncomingInput
-  | IncomingResize;
+  | IncomingResize
+  | IncomingTail
+  | IncomingUntail;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -220,6 +246,15 @@ function getAttachments(ws: WebSocket): Map<string, AttachState> {
   if (!map) {
     map = new Map();
     wsAttachments.set(ws, map);
+  }
+  return map;
+}
+
+function getTails(ws: WebSocket): Map<string, TailState> {
+  let map = wsTails.get(ws);
+  if (!map) {
+    map = new Map();
+    wsTails.set(ws, map);
   }
   return map;
 }
@@ -433,6 +468,81 @@ async function handleAttachLifecycle(
   sendJson(ws, { type: "session:state", session: snapshot, resized });
 }
 
+/**
+ * Open (or replace) a debugger-view tail for one session and forward each
+ * timestamped log line to the browser as a `session:log` frame. The agent
+ * sends newline-delimited `AgentLogLine` JSON (ring replay first, then
+ * live); we split on newlines here — a JSON object can straddle TCP
+ * chunks — and forward each as it completes.
+ */
+async function handleTailLifecycle(
+  ws: WebSocket,
+  serverId: string,
+  sessionId: string
+): Promise<void> {
+  const map = getTails(ws);
+  const existing = map.get(sessionId);
+  if (existing) {
+    try {
+      existing.stream.destroy();
+    } catch {
+      /* ignore */
+    }
+    map.delete(sessionId);
+  }
+
+  const handle = await tailSession(serverId, sessionId);
+  if (!handle) {
+    // Stale row / session gone. Tell the browser so the column can show
+    // "not running" rather than waiting forever for lines.
+    sendJson(ws, {
+      type: "session:lost",
+      sessionId,
+      reason: "Session no longer exists on the agent",
+    });
+    return;
+  }
+
+  // Browser may have vanished during the agent round-trip.
+  if (ws.readyState !== WS_OPEN) {
+    try {
+      handle.stream.destroy();
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
+
+  const state: TailState = { sessionId, serverId, stream: handle.stream };
+  map.set(sessionId, state);
+
+  // `openAgentTail` already splits the stream into complete `AgentLogLine`
+  // JSON lines and buffers any that arrived before this `start` call (the
+  // front of the ring replay), so we just parse + forward each. A malformed
+  // line is skipped rather than killing the tail.
+  handle.start((line) => {
+    let parsed: { t: number; line: string };
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      return;
+    }
+    sendJson(ws, {
+      type: "session:log",
+      sessionId,
+      t: parsed.t,
+      line: parsed.line,
+    });
+  });
+  handle.stream.on("close", () => {
+    const m = wsTails.get(ws);
+    if (m && m.get(sessionId) === state) m.delete(sessionId);
+  });
+  handle.stream.on("error", (e: Error) => {
+    console.error(`[WS] tail stream error for ${sessionId}: ${e.message}`);
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Top-level message handler
 // ---------------------------------------------------------------------------
@@ -557,6 +667,42 @@ async function handleMessage(ws: WebSocket, raw: string): Promise<void> {
       }
       break;
     }
+    case "session:tail": {
+      try {
+        const gate = await serverGate(msg.serverId);
+        if (gate && TERMINAL_BLOCKED_STATUSES.includes(gate.agentStatus)) {
+          sendJson(ws, {
+            type: "session:lost",
+            sessionId: msg.sessionId,
+            reason: blockedReason(gate.agentStatus),
+          });
+          break;
+        }
+        await handleTailLifecycle(ws, msg.serverId, msg.sessionId);
+      } catch (err) {
+        const m = err instanceof Error ? err.message : String(err);
+        console.error(`[WS] tail failed: ${m}`);
+        sendJson(ws, {
+          type: "session:lost",
+          sessionId: msg.sessionId,
+          reason: `Failed to tail: ${m}`,
+        });
+      }
+      break;
+    }
+    case "session:untail": {
+      const map = wsTails.get(ws);
+      const state = map?.get(msg.sessionId);
+      if (state) {
+        try {
+          state.stream.destroy();
+        } catch {
+          /* ignore */
+        }
+        map!.delete(msg.sessionId);
+      }
+      break;
+    }
     case "session:kill": {
       try {
         const map = wsAttachments.get(ws);
@@ -624,6 +770,17 @@ function handleDisconnect(ws: WebSocket): void {
       }
     }
     wsAttachments.delete(ws);
+  }
+  const tails = wsTails.get(ws);
+  if (tails) {
+    for (const state of tails.values()) {
+      try {
+        state.stream.destroy();
+      } catch {
+        /* ignore */
+      }
+    }
+    wsTails.delete(ws);
   }
   wsToUser.delete(ws);
 }

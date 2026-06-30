@@ -55,6 +55,12 @@ export type AgentRequest =
       user?: string;
     }
   | { op: "attach"; id: string; rows?: number; cols?: number }
+  /** Stream a session's output as timestamped, control-stripped log lines
+   *  (newline-delimited `LogLine` JSON) for the stacks debugger view.
+   *  Like `attach` it's long-lived, but the stream stays JSON the whole
+   *  time and never carries input. Older agents reply `Response::Error`
+   *  for the unknown op; the caller treats that as "this host can't tail". */
+  | { op: "tail"; id: string }
   | { op: "kill"; id: string }
   | { op: "resize"; id: string; rows: number; cols: number }
   /** Update a session's display name in place. The dashboard fires this
@@ -285,6 +291,135 @@ export async function openAgentAttach(
     stream,
     initialBytes: leftover,
   };
+}
+
+/** One timestamped log line, as emitted by the agent's `Tail` stream.
+ *  Mirrors `LogLine` in agent/src/sessions/protocol.rs. */
+export interface AgentLogLine {
+  /** ms since the Unix epoch, on the agent host's clock. */
+  t: number;
+  /** control-stripped line text, no trailing newline. */
+  line: string;
+}
+
+export interface TailHandle {
+  /** The agent's confirmed session id. */
+  sessionId: string;
+  /** Underlying duplex. Close it to stop the tail (never affects the PTY). */
+  stream: Duplex;
+  /**
+   * Register the per-line consumer. Call exactly once. Any lines the agent
+   * sent between the handshake and this call — the leading burst of the
+   * ring replay — were buffered and are delivered synchronously here first,
+   * then every subsequent line as it arrives. Each `line` is one complete
+   * `AgentLogLine` JSON string (no trailing newline).
+   */
+  start(onLine: (line: string) => void): void;
+}
+
+/**
+ * Open a tail connection: ask the agent to stream a session's timestamped
+ * log lines. After the one-line `{"result":"ok"}` handshake the stream is a
+ * newline-delimited sequence of `AgentLogLine` JSON objects — first the
+ * replay of the session's bounded line ring, then live lines.
+ *
+ * Unlike `openAgentAttach`, this keeps a SINGLE persistent `data` listener
+ * for the connection's whole life and never hands the stream off. The
+ * attach path's "read the handshake, drop the listener, let the caller
+ * reattach" dance loses data on ssh2's forwarded Unix-socket streams (the
+ * same flowing-state quirk its own comments call out) — tolerable for a few
+ * bytes of xterm scrollback, but here it silently dropped the front of
+ * large ring replays. Buffering lines parsed before the caller registers
+ * its consumer (`start`) closes that gap entirely.
+ *
+ * Closing the returned stream stops the tail; it never affects the PTY.
+ * Throws (with the agent's message) if the session is unknown or the agent
+ * is too old to know the `tail` op.
+ */
+export async function openAgentTail(
+  serverId: string,
+  sessionId: string
+): Promise<TailHandle> {
+  const client = await getSshClient(serverId);
+  const stream = await openForwardedSocket(client);
+
+  stream.write(
+    JSON.stringify({ op: "tail", id: sessionId } satisfies AgentRequest) + "\n"
+  );
+
+  return await new Promise<TailHandle>((resolve, reject) => {
+    let buf = "";
+    let handshakeSeen = false;
+    let settled = false;
+    let onLine: ((line: string) => void) | null = null;
+    const pending: string[] = [];
+
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      try {
+        stream.destroy();
+      } catch {
+        /* ignore */
+      }
+      reject(err);
+    };
+
+    const onData = (chunk: Buffer) => {
+      buf += chunk.toString("utf-8");
+      let nl = buf.indexOf("\n");
+      while (nl !== -1) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        nl = buf.indexOf("\n");
+        if (!handshakeSeen) {
+          handshakeSeen = true;
+          let parsed: AgentResponse;
+          try {
+            parsed = JSON.parse(line) as AgentResponse;
+          } catch {
+            fail(new Error(`agent-socket: bad tail handshake JSON: ${line}`));
+            return;
+          }
+          if (parsed.result === "error") {
+            fail(new Error(`agent: ${parsed.message}`));
+            return;
+          }
+          if (parsed.result !== "ok") {
+            fail(
+              new Error(
+                `agent-socket: unexpected tail handshake result "${parsed.result}"`
+              )
+            );
+            return;
+          }
+          settled = true;
+          // Listeners stay attached — the handle owns the stream now.
+          resolve({
+            sessionId,
+            stream,
+            start(cb) {
+              onLine = cb;
+              for (const l of pending) cb(l);
+              pending.length = 0;
+            },
+          });
+          continue;
+        }
+        if (!line) continue;
+        if (onLine) onLine(line);
+        else pending.push(line);
+      }
+    };
+
+    stream.on("data", onData);
+    stream.on("error", (e: Error) =>
+      fail(new Error(`agent-socket: tail stream error: ${e.message}`))
+    );
+    stream.on("close", () =>
+      fail(new Error("agent-socket: stream closed during tail handshake"))
+    );
+  });
 }
 
 /**
